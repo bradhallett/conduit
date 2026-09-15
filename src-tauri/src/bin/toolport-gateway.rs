@@ -1047,6 +1047,10 @@ static PROGRESS_ROUTES: std::sync::OnceLock<Arc<Mutex<ProgressRoutes>>> =
 /// explicit `subscriptions/listen` filter.
 static MODERN_STDIO_UPSTREAM: AtomicBool = AtomicBool::new(false);
 
+/// True when this process is the host daemon (`--daemon`). Gates the internal
+/// `/host/identity` route so the user-facing HTTP bridge never exposes it.
+static DAEMON_MODE: AtomicBool = AtomicBool::new(false);
+
 /// Whether the raw-stdio peer has finished the MCP handshake, so the server may
 /// put its own traffic on stdout.
 ///
@@ -14208,6 +14212,15 @@ fn handle_http_with_headers(
         return HttpOut::new(204, "text/plain", String::new());
     }
 
+    // Internal rendezvous identity. Daemon mode only, so the user-facing bridge
+    // never exposes the compat fingerprint or build; gated by the same bearer.
+    if DAEMON_MODE.load(Ordering::SeqCst) && path == conduit_lib::daemon::IDENTITY_PATH {
+        return match caller {
+            Some(_) => HttpOut::new(200, "application/json", daemon_identity_json()),
+            None => HttpOut::json_err(401, "unauthorized"),
+        };
+    }
+
     // Streamable-HTTP MCP endpoint (same port as OpenAPI).
     if path == "/mcp" || path.starts_with("/mcp?") {
         return handle_mcp_http(
@@ -14943,6 +14956,83 @@ fn http_allows_insecure_open(
     loopback && insecure_loopback && !auth_configured && registry_loaded
 }
 
+/// The daemon's identity payload, matching [`conduit_lib::daemon::DaemonIdentity`].
+fn daemon_identity_json() -> String {
+    let compat = registry::conduit_dir()
+        .map(|dir| {
+            conduit_lib::topology::CompatKey::new(
+                env!("CARGO_PKG_VERSION"),
+                dir.display().to_string(),
+            )
+        })
+        .map(|compat| compat.fingerprint())
+        .unwrap_or_default();
+    json!({
+        "compat": compat,
+        "protocol": conduit_lib::daemon::PROTOCOL_GENERATION,
+        "pid": std::process::id(),
+        "gatewayVersion": env!("CARGO_PKG_VERSION"),
+    })
+    .to_string()
+}
+
+/// Run the host daemon: one runtime for this host, served on an internal loopback
+/// endpoint with a random bearer and advertised through the rendezvous
+/// descriptor. Phase 2: reachable by an adapter or a manual probe; the stdio
+/// adapter speaks to it in the next slice, and the idle/lease lifecycle after that.
+fn serve_daemon(state: GatewayState) -> ! {
+    let Some(dir) = registry::conduit_dir() else {
+        eprintln!("toolport-gateway --daemon: no data directory could be resolved");
+        std::process::exit(1);
+    };
+    let compat =
+        conduit_lib::topology::CompatKey::new(env!("CARGO_PKG_VERSION"), dir.display().to_string());
+    let token = match conduit_lib::daemon::new_token() {
+        Ok(token) => token,
+        Err(error) => {
+            eprintln!("toolport-gateway --daemon: {error}");
+            std::process::exit(1);
+        }
+    };
+    let (server, _ingress, _) = match bind_deadline_http_server(
+        ("127.0.0.1", 0u16),
+        HttpReadDeadlines::default(),
+    ) {
+        Ok(bound) => bound,
+        Err(error) => {
+            eprintln!("toolport-gateway --daemon: could not bind the internal endpoint: {error}");
+            std::process::exit(1);
+        }
+    };
+    let Some(addr) = server.server_addr().to_ip() else {
+        eprintln!("toolport-gateway --daemon: the internal endpoint was not an IP socket");
+        std::process::exit(1);
+    };
+    let port = addr.port();
+    let descriptor_path = conduit_lib::daemon::descriptor_path(&dir, &compat);
+    let descriptor = conduit_lib::daemon::DaemonDescriptor::new(
+        format!("127.0.0.1:{port}"),
+        token.clone(),
+        &compat,
+    );
+    // Set the mode before publishing, so the first adapter to probe the
+    // descriptor already sees the identity route.
+    DAEMON_MODE.store(true, Ordering::SeqCst);
+    if let Err(error) = conduit_lib::daemon::write_descriptor(&descriptor_path, &descriptor) {
+        eprintln!("toolport-gateway --daemon: could not publish the descriptor: {error}");
+        std::process::exit(1);
+    }
+    glog(&format!(
+        "daemon: host runtime on http://127.0.0.1:{port} for {}",
+        compat.fingerprint()
+    ));
+    let search = Arc::new(SearchGuard::default());
+    let confirm = Arc::new(ConfirmGuard::new());
+    serve_http_loop(server, state, Some(token), search, confirm, false);
+    conduit_lib::daemon::clear_descriptor(&descriptor_path);
+    std::process::exit(0);
+}
+
 fn serve_http(state: GatewayState, port: u16) {
     let host = conduit_lib::brand::env_var("TOOLPORT_HTTP_HOST", "CONDUIT_HTTP_HOST")
         .filter(|s| !s.trim().is_empty())
@@ -15661,43 +15751,6 @@ fn detach_from_client_session() {
 #[cfg(not(unix))]
 fn detach_from_client_session() {}
 
-/// Run the host daemon role: publish a rendezvous descriptor and serve the
-/// internal identity handshake until the idle grace elapses. Phase 2 foundation:
-/// it does not own a router yet, so the default topology is unchanged and this
-/// role only runs when `--daemon` is passed explicitly.
-fn run_daemon_role() -> ! {
-    let Some(dir) = registry::conduit_dir() else {
-        eprintln!("toolport-gateway --daemon: no data directory could be resolved");
-        std::process::exit(1);
-    };
-    let compat =
-        conduit_lib::topology::CompatKey::new(env!("CARGO_PKG_VERSION"), dir.display().to_string());
-    let token = match conduit_lib::daemon::new_token() {
-        Ok(token) => token,
-        Err(error) => {
-            eprintln!("toolport-gateway --daemon: {error}");
-            std::process::exit(1);
-        }
-    };
-    let descriptor = conduit_lib::daemon::descriptor_path(&dir, &compat);
-    glog(&format!(
-        "daemon: serving host identity for {} in {}",
-        compat.fingerprint(),
-        dir.display()
-    ));
-    if let Err(error) = conduit_lib::daemon::serve_identity(
-        &descriptor,
-        &compat,
-        token,
-        None,
-        Some(conduit_lib::daemon::DAEMON_IDLE_GRACE),
-    ) {
-        eprintln!("toolport-gateway --daemon: {error}");
-        std::process::exit(1);
-    }
-    std::process::exit(0);
-}
-
 fn main() {
     // `--help`/`--version`/an unrecognized flag are decided before anything
     // else touches disk, the keychain, or stdin - see #605. Positional args
@@ -15775,11 +15828,6 @@ fn main() {
         // Share downstream 429 backoff windows across gateway processes
         // (issue #874) until the host daemon lands. Missing state = no backoff.
         conduit_lib::downstream_backoff::bind_data_dir(&dir);
-    }
-    // Host daemon role (Phase 2). Explicit flag only, so the default startup path
-    // is untouched; it serves the internal identity handshake and idle-exits.
-    if daemon_requested(&cli_args) {
-        run_daemon_role();
     }
     // Diagnostic: `toolport-gateway --selftest-secrets` reads every vaulted secret
     // from THIS (gateway) process and reports. Used to validate the macOS keychain
@@ -15865,7 +15913,8 @@ fn main() {
     if let Some(msg) = warning {
         eprintln!("{msg}");
     }
-    let http_mode = http_port_opt.is_some();
+    let daemon_mode = daemon_requested(&cli_args);
+    let http_mode = http_port_opt.is_some() || daemon_mode;
     glog("=== gateway start ===");
     glog(&format!(
         "cwd={:?} TOOLPORT_REGISTRY={:?} registry_path={:?} dir_resolution={:?} lazy={lazy} profile={env_profile:?} client_id={client_id:?}",
@@ -16184,6 +16233,12 @@ fn main() {
     // (Open WebUI and any OpenAPI consumer) with no external bridge. Standalone,
     // so it replaces the stdio loop; the background build + registry watcher
     // started above still keep the router and cache live underneath it.
+    // Host daemon transport: one runtime for this host, on an internal loopback
+    // endpoint advertised through the rendezvous descriptor. Explicit flag only.
+    if daemon_mode {
+        serve_daemon(state);
+    }
+
     if let Some(port) = http_port_opt {
         serve_http(state, port);
         return;
@@ -29292,6 +29347,31 @@ mod tests {
         assert!(daemon_requested(&["--daemon".to_string()]));
         assert!(!daemon_requested(&["--http".to_string()]));
         assert!(!daemon_requested(&[]));
+    }
+
+    #[test]
+    fn daemon_identity_matches_the_compat_key() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-daemon-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data = conduit_lib::registry::DataDirOverride::set(&dir);
+
+        let compat =
+            conduit_lib::topology::CompatKey::new(env!("CARGO_PKG_VERSION"), dir.display().to_string());
+        let identity: conduit_lib::daemon::DaemonIdentity =
+            serde_json::from_str(&daemon_identity_json()).unwrap();
+        assert!(identity.is_compatible_with(&compat));
+        assert_eq!(identity.pid, std::process::id());
+        assert_eq!(identity.protocol, conduit_lib::daemon::PROTOCOL_GENERATION);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
