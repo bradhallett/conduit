@@ -3362,6 +3362,27 @@ fn param_is_identifier(param: &str) -> bool {
         || param.ends_with("Secret")
 }
 
+/// `<team_id>`, `{{teamId}}`, `{{ teamId }}`: a template wrapper around one bare
+/// identifier-like token, which is what an LLM-invented placeholder looks like.
+/// Markup (`<p>...</p>`) and expressions (`{{ 1 + 1 }}`) do not match, so a real
+/// HTML field or template string is never refused.
+fn is_template_token(s: &str) -> bool {
+    let inner = s
+        .strip_prefix("{{")
+        .and_then(|rest| rest.strip_suffix("}}"))
+        .or_else(|| s.strip_prefix('<').and_then(|rest| rest.strip_suffix('>')));
+    match inner.map(str::trim) {
+        Some(inner) => {
+            !inner.is_empty()
+                && inner.len() <= 64
+                && inner
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        }
+        None => false,
+    }
+}
+
 /// True if a string argument value looks like an LLM-invented placeholder rather
 /// than a real value (e.g. "your_team_id", "<team_id>", "REPLACE_ME"). `param` is
 /// the argument's name: the collision-prone bare words ("string", "todo",
@@ -3373,15 +3394,18 @@ fn looks_like_placeholder(param: &str, v: &str) -> bool {
     if s.is_empty() {
         return false;
     }
-    // Unambiguous template forms: an LLM filled in a literal template. Never a
-    // real value, whatever the parameter is.
-    if (s.starts_with('<') && s.ends_with('>')) || (s.starts_with("{{") && s.ends_with("}}")) {
+    // A template wrapper around a single identifier is invented; a real value that
+    // merely contains a tag or delimiter (markup, a Jinja expression) is not. A
+    // dotted `{{ user.name }}` is a real Jinja attribute path, so it only counts as
+    // invented for an identifier-typed parameter.
+    if is_template_token(s)
+        && (!s.starts_with("{{") || !s.contains('.') || param_is_identifier(param))
+    {
         return true;
     }
     let low = s.to_ascii_lowercase();
     if low.starts_with("your_")
         || low.starts_with("your-")
-        || low.starts_with("your ")
         || low.ends_with("_here")
         || low.ends_with("-here")
         || matches!(
@@ -3395,6 +3419,11 @@ fn looks_like_placeholder(param: &str, v: &str) -> bool {
     // name or a JSON-schema type word instead of a real value). Only a giveaway
     // for an identifier-typed parameter; for content fields these are real values.
     if param_is_identifier(param) {
+        // "Your order ..." prose only reads as invented for an identifier field;
+        // for a body or message it is real content.
+        if low.starts_with("your ") {
+            return true;
+        }
         return matches!(
             low.as_str(),
             "string"
@@ -21879,6 +21908,8 @@ mod tests {
             ("teamId", "your_team_id"),
             ("teamId", "<team_id>"),
             ("teamId", "{{teamId}}"),
+            ("teamId", "{{ teamId }}"),
+            ("teamId", "{{ team.id }}"),
             ("apiKey", "REPLACE_ME"),
             ("teamId", "team_id_here"),
         ] {
@@ -21902,6 +21933,13 @@ mod tests {
             ("name", "example"),
             ("message", "xxx"),
             ("branch", "tbd"),
+            // Real content that merely contains a tag or delimiter (#871).
+            ("headText", "<p>Dear Sir or Madam,</p>"),
+            ("footText", "<div><p>Kind regards</p></div>"),
+            ("template", "{{ states('sun.sun') }}"),
+            ("template", "{{ 1 + 1 }}"),
+            ("template", "{{ user.name }}"),
+            ("body", "Your order has shipped"),
         ] {
             assert!(
                 !looks_like_placeholder(param, val),
