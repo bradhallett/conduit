@@ -35,6 +35,9 @@ const ELECTION_TIMEOUT: Duration = Duration::from_secs(15);
 /// Per-probe network budget for the authenticated handshake.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const READY_POLL: Duration = Duration::from_millis(50);
+/// Operational idle grace: the daemon exits after this long with no requests.
+/// A default, not a user setting, in the first release.
+pub const DAEMON_IDLE_GRACE: Duration = Duration::from_secs(300);
 
 /// Everything an adapter needs to reach and trust a running daemon. Written
 /// atomically into the data directory with user-only permissions.
@@ -246,6 +249,7 @@ pub fn serve_identity(
     compat: &CompatKey,
     token: String,
     ready: Option<std::sync::mpsc::Sender<DaemonDescriptor>>,
+    idle_timeout: Option<Duration>,
 ) -> Result<(), String> {
     let server = tiny_http::Server::http("127.0.0.1:0")
         .map_err(|e| format!("Could not bind the daemon endpoint: {e}"))?;
@@ -266,25 +270,40 @@ pub fn serve_identity(
         let _ = sender.send(descriptor);
     }
 
-    for request in server.incoming_requests() {
-        let is_identity = request.method() == &tiny_http::Method::Get
-            && request.url().split('?').next() == Some(IDENTITY_PATH);
-        let authorized = request.headers().iter().any(|header| {
-            header.field.equiv("Authorization")
-                && header.value.as_str() == format!("Bearer {token}")
-        });
-        let response = if !is_identity {
-            text_response(404, "not found")
-        } else if !authorized {
-            text_response(401, "unauthorized")
-        } else {
-            let body = serde_json::to_string(&identity).unwrap_or_else(|_| "{}".to_string());
-            tiny_http::Response::from_string(body)
-                .with_status_code(200)
-                .with_header(json_header())
-        };
-        let _ = request.respond(response);
+    // Poll so an idle daemon can exit without a request to wake it; a real
+    // request still returns immediately.
+    let mut last_activity = Instant::now();
+    loop {
+        match server.recv_timeout(Duration::from_millis(200)) {
+            Ok(Some(request)) => {
+                last_activity = Instant::now();
+                let is_identity = request.method() == &tiny_http::Method::Get
+                    && request.url().split('?').next() == Some(IDENTITY_PATH);
+                let authorized = request.headers().iter().any(|header| {
+                    header.field.equiv("Authorization")
+                        && header.value.as_str() == format!("Bearer {token}")
+                });
+                let response = if !is_identity {
+                    text_response(404, "not found")
+                } else if !authorized {
+                    text_response(401, "unauthorized")
+                } else {
+                    let body = serde_json::to_string(&identity).unwrap_or_else(|_| "{}".to_string());
+                    tiny_http::Response::from_string(body)
+                        .with_status_code(200)
+                        .with_header(json_header())
+                };
+                let _ = request.respond(response);
+            }
+            Ok(None) => {}
+            Err(_) => break,
+        }
+        if idle_timeout.is_some_and(|grace| last_activity.elapsed() >= grace) {
+            break;
+        }
     }
+    // Leave no stale pointer behind for the next rendezvous to trip over.
+    clear_descriptor(descriptor_path);
     Ok(())
 }
 
@@ -325,7 +344,7 @@ mod tests {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let compat = compat.clone();
         std::thread::spawn(move || {
-            let _ = serve_identity(&path, &compat, new_token().unwrap(), Some(ready_tx));
+            let _ = serve_identity(&path, &compat, new_token().unwrap(), Some(ready_tx), None);
         });
         ready_rx.recv_timeout(Duration::from_secs(5)).unwrap()
     }
@@ -441,6 +460,34 @@ mod tests {
             .unwrap();
         assert_ne!(descriptor.endpoint, "127.0.0.1:1");
         assert!(probe_identity(&descriptor).unwrap().is_compatible_with(&compat));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn idle_daemon_exits_and_clears_its_descriptor() {
+        let dir = temp_dir("idle");
+        let compat = compat("1.0.0", &dir);
+        let path = descriptor_path(&dir, &compat);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let thread_path = path.clone();
+        let thread_compat = compat.clone();
+        std::thread::spawn(move || {
+            let _ = serve_identity(
+                &thread_path,
+                &thread_compat,
+                new_token().unwrap(),
+                Some(ready_tx),
+                Some(Duration::from_millis(150)),
+            );
+            let _ = done_tx.send(());
+        });
+        let _ = ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(path.exists(), "the descriptor should exist while idle");
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("an idle daemon should exit after its grace period");
+        assert!(!path.exists(), "idle exit must clear the descriptor");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

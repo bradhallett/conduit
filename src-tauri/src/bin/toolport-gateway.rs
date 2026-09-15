@@ -14904,6 +14904,13 @@ fn insecure_loopback_requested(args: &[String]) -> bool {
     args.iter().any(|arg| arg == INSECURE_LOOPBACK_FLAG)
 }
 
+/// Whether the operator asked this process to be the host daemon (`--daemon`).
+/// Phase 2: the daemon role currently serves the internal identity handshake and
+/// exits after an idle grace; it does not own a router yet.
+fn daemon_requested(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--daemon")
+}
+
 /// Startup admission policy. The escape hatch is never valid for a non-loopback bind.
 ///
 /// `registry_loaded` is the boot `load_resolved` outcome (Ok=true, Err=false). A
@@ -15493,7 +15500,7 @@ fn handle_connection(
 /// place so `--help`'s usage text and the unknown-flag check in [`parse_args`]
 /// can't drift from the real parsers in `http_port`, `insecure_loopback_requested`,
 /// and `main`'s `--selftest-secrets` check.
-const KNOWN_FLAGS: &[&str] = &["--http", INSECURE_LOOPBACK_FLAG, "--selftest-secrets"];
+const KNOWN_FLAGS: &[&str] = &["--http", INSECURE_LOOPBACK_FLAG, "--daemon", "--selftest-secrets"];
 
 /// What the command line is asking `main` to do, decided purely from `args`
 /// (already excluding argv[0]) with no I/O - unit-testable without spawning a
@@ -15598,6 +15605,9 @@ fn usage() -> String {
          FLAGS:\n\
          \x20   --http [port]         Serve over HTTP instead of stdio (default port 8765)\n\
          \x20   {insecure}   Allow unauthenticated HTTP access on a loopback bind\n\
+         \x20   --daemon             Run as the host daemon for this host (Phase 2;\n\
+         \x20                        internal rendezvous endpoint, not the user HTTP\n\
+         \x20                        surface)\n\
          \x20   --selftest-secrets    Diagnostic: read every vaulted secret and report\n\
          \x20   --toolport-hook EVENT Record one agent lifecycle event and exit (installed\n\
          \x20                         into an agent's settings by Toolport; always exits 0)\n\
@@ -15650,6 +15660,43 @@ fn detach_from_client_session() {
 
 #[cfg(not(unix))]
 fn detach_from_client_session() {}
+
+/// Run the host daemon role: publish a rendezvous descriptor and serve the
+/// internal identity handshake until the idle grace elapses. Phase 2 foundation:
+/// it does not own a router yet, so the default topology is unchanged and this
+/// role only runs when `--daemon` is passed explicitly.
+fn run_daemon_role() -> ! {
+    let Some(dir) = registry::conduit_dir() else {
+        eprintln!("toolport-gateway --daemon: no data directory could be resolved");
+        std::process::exit(1);
+    };
+    let compat =
+        conduit_lib::topology::CompatKey::new(env!("CARGO_PKG_VERSION"), dir.display().to_string());
+    let token = match conduit_lib::daemon::new_token() {
+        Ok(token) => token,
+        Err(error) => {
+            eprintln!("toolport-gateway --daemon: {error}");
+            std::process::exit(1);
+        }
+    };
+    let descriptor = conduit_lib::daemon::descriptor_path(&dir, &compat);
+    glog(&format!(
+        "daemon: serving host identity for {} in {}",
+        compat.fingerprint(),
+        dir.display()
+    ));
+    if let Err(error) = conduit_lib::daemon::serve_identity(
+        &descriptor,
+        &compat,
+        token,
+        None,
+        Some(conduit_lib::daemon::DAEMON_IDLE_GRACE),
+    ) {
+        eprintln!("toolport-gateway --daemon: {error}");
+        std::process::exit(1);
+    }
+    std::process::exit(0);
+}
 
 fn main() {
     // `--help`/`--version`/an unrecognized flag are decided before anything
@@ -15728,6 +15775,11 @@ fn main() {
         // Share downstream 429 backoff windows across gateway processes
         // (issue #874) until the host daemon lands. Missing state = no backoff.
         conduit_lib::downstream_backoff::bind_data_dir(&dir);
+    }
+    // Host daemon role (Phase 2). Explicit flag only, so the default startup path
+    // is untouched; it serves the internal identity handshake and idle-exits.
+    if daemon_requested(&cli_args) {
+        run_daemon_role();
     }
     // Diagnostic: `toolport-gateway --selftest-secrets` reads every vaulted secret
     // from THIS (gateway) process and reports. Used to validate the macOS keychain
@@ -29233,6 +29285,13 @@ mod tests {
     #[test]
     fn parse_args_no_args_runs_normally() {
         assert_eq!(parse_args(&[]), ArgAction::Run);
+    }
+
+    #[test]
+    fn daemon_flag_selects_the_daemon_role() {
+        assert!(daemon_requested(&["--daemon".to_string()]));
+        assert!(!daemon_requested(&["--http".to_string()]));
+        assert!(!daemon_requested(&[]));
     }
 
     #[test]
