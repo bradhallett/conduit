@@ -3345,8 +3345,12 @@ fn looks_like_placeholder(param: &str, v: &str) -> bool {
         return false;
     }
     // A template wrapper around a single identifier is invented; a real value that
-    // merely contains a tag or delimiter (markup, a Jinja expression) is not.
-    if is_template_token(s) {
+    // merely contains a tag or delimiter (markup, a Jinja expression) is not. A
+    // dotted `{{ user.name }}` is a real Jinja attribute path, so it only counts as
+    // invented for an identifier-typed parameter.
+    if is_template_token(s)
+        && (!s.starts_with("{{") || !s.contains('.') || param_is_identifier(param))
+    {
         return true;
     }
     let low = s.to_ascii_lowercase();
@@ -21852,6 +21856,7 @@ mod tests {
             ("teamId", "<team_id>"),
             ("teamId", "{{teamId}}"),
             ("teamId", "{{ teamId }}"),
+            ("teamId", "{{ team.id }}"),
             ("apiKey", "REPLACE_ME"),
             ("teamId", "team_id_here"),
         ] {
@@ -21880,6 +21885,7 @@ mod tests {
             ("footText", "<div><p>Kind regards</p></div>"),
             ("template", "{{ states('sun.sun') }}"),
             ("template", "{{ 1 + 1 }}"),
+            ("template", "{{ user.name }}"),
             ("body", "Your order has shipped"),
         ] {
             assert!(
