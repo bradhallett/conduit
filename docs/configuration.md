@@ -32,6 +32,14 @@ gateway entry, written for you when you connect a client:
 Every `TOOLPORT_*` name still accepts the pre-rename `CONDUIT_*` alias (for example
 `CONDUIT_HTTP_TOKEN` continues to work). Prefer `TOOLPORT_*` in new configs.
 
+**Discovery mode per HTTP client.** The stdio gateway resolves one discovery mode for
+the client that spawned it. The headless HTTP/OpenAPI bridge serves several clients at
+once, so it also honors `clientDiscovery[<http-client-id>]` for the client its bearer
+token resolves to. Set `"full"` for a client that already has native tool search (Claude
+Code, Codex) and `"lazy"` for one that does not, in the same bridge process. Only `full`
+and `lazy` are per-client: `grouped` stays process-global, and a client without an entry
+inherits the process mode.
+
 **Code mode limits.** Execution, validation, and saved routines run Boa in a separate
 worker process. The parent enforces the 60-second wall-clock budget even during pure
 JavaScript and permits at most four simultaneous runs. Saved routines can set lower

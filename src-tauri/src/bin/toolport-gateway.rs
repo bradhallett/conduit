@@ -1823,6 +1823,18 @@ fn parse_mode(s: &str) -> Option<DiscoveryMode> {
     }
 }
 
+/// Per-HTTP-client discovery override from `clientDiscovery[<client id>]`. Only
+/// `full` and `lazy` are honored per client: grouped still depends on
+/// process-global publisher state, so a `grouped` value (or any unrecognized one)
+/// yields `None` and the request uses the process mode.
+fn http_client_discovery_override(reg: &Registry, client_id: &str) -> Option<DiscoveryMode> {
+    match reg.client_discovery_mode(client_id).and_then(parse_mode) {
+        Some(DiscoveryMode::Lazy) => Some(DiscoveryMode::Lazy),
+        Some(DiscoveryMode::Full) => Some(DiscoveryMode::Full),
+        _ => None,
+    }
+}
+
 /// Resolve this client's discovery mode from a loaded registry + env. See
 /// [`resolve_mode_from`] for the precedence.
 fn discovery_mode_for(reg: &Registry, client_id: Option<&str>) -> DiscoveryMode {
@@ -3826,6 +3838,11 @@ struct McpSessionOwner {
 struct HttpCaller {
     audit_label: Option<String>,
     session_owner: McpSessionOwner,
+    /// Per-client discovery override, when `clientDiscovery[<client id>]` sets one
+    /// (#868). `None` means the request uses the process mode, so one HTTP bridge
+    /// can still serve a native-search client the full catalog and a local model
+    /// the meta-tools at the same time.
+    discovery: Option<DiscoveryMode>,
 }
 
 /// Resolve authorization, routing scope, audit attribution, and MCP session
@@ -3844,7 +3861,6 @@ fn resolve_http_caller(
             ids
         })
     };
-
     // Legacy single token: sees the full connected set (back-compat).
     if let (Some(expected), Some(actual)) = (env_token, provided) {
         if ct_eq(expected.as_bytes(), actual.as_bytes()) {
@@ -3857,6 +3873,7 @@ fn resolve_http_caller(
                         identity: format!("legacy:{}", registry::sha256_hex(actual)),
                         scope: None,
                     },
+                    discovery: None,
                 },
             ));
         }
@@ -3887,6 +3904,7 @@ fn resolve_http_caller(
                     identity: format!("client:{}", client.id),
                     scope: owner_scope(&allowed),
                 },
+                discovery: http_client_discovery_override(reg, &client.id),
             },
         ));
     }
@@ -3914,6 +3932,7 @@ fn resolve_http_caller(
                     identity: "open".to_string(),
                     scope: None,
                 },
+                discovery: None,
             },
         ));
     }
@@ -12803,6 +12822,7 @@ fn handle_client_notification(state: &GatewayState, req: &Value) -> bool {
 /// One request in, one response out: wait for a cold cache / live router when
 /// the method needs it, self-heal an empty router on a call, then dispatch.
 /// Shared by the stdio loop and the HTTP server so they can't diverge.
+#[allow(clippy::too_many_arguments)]
 fn process_request(
     state: &GatewayState,
     req: &Value,
@@ -12812,6 +12832,7 @@ fn process_request(
     cancel: Option<downstream::CancelContext>,
     client: Option<&str>,
     client_name: Option<&str>,
+    discovery: DiscoveryMode,
 ) -> Option<Value> {
     let _transport = UpstreamTransportGuard::enter(if state.http {
         UpstreamTransport::Http
@@ -13058,7 +13079,7 @@ fn process_request(
         &reg,
         &router,
         &cache_snapshot.tools,
-        state.lazy,
+        discovery == DiscoveryMode::Lazy,
         profile_snapshot.as_deref(),
         guard,
         confirm,
@@ -13121,6 +13142,7 @@ fn handle_stdio_request(
             Some(cancel_context),
             None,
             None,
+            discovery_mode(),
         )
     }))
     .unwrap_or_else(|_| {
@@ -13253,6 +13275,7 @@ fn state_prefix_owners(state: &GatewayState) -> HashMap<String, String> {
 fn http_tool_defs(
     state: &GatewayState,
     allowed: Option<&std::collections::HashSet<String>>,
+    discovery: DiscoveryMode,
 ) -> Vec<Value> {
     let (allow_agent, allow_routine_writes, confirm_destructive) = {
         let r = state
@@ -13282,7 +13305,7 @@ fn http_tool_defs(
             cached.tools.clone()
         }
     };
-    if state.lazy {
+    if matches!(discovery, DiscoveryMode::Lazy) {
         let mut tools = vec![
             status_tool_def(),
             search_tool_def(),
@@ -13298,7 +13321,7 @@ fn http_tool_defs(
             tools.push(disable_server_tool_def());
         }
         tools
-    } else if grouped_discovery() {
+    } else if matches!(discovery, DiscoveryMode::Grouped) {
         // Grouped: the meta-tools plus a per-server help_<server> browse tool. Scope
         // the catalog to this client FIRST so the help tools (which read as meta-tools
         // to the later scope pass) can't leak an out-of-scope server's browse entry.
@@ -13337,10 +13360,11 @@ fn http_tool_defs(
 fn openapi_spec(
     state: &GatewayState,
     allowed: Option<&std::collections::HashSet<String>>,
+    discovery: DiscoveryMode,
 ) -> Value {
     // Scope the advertised tools to the client's allowed servers (no-op when
     // unscoped), so a registered client's spec never lists out-of-scope tools.
-    let all_defs = http_tool_defs(state, allowed);
+    let all_defs = http_tool_defs(state, allowed, discovery);
     // The bridge answers this before the router has connected anything, so the
     // registry-backed owner fallback (not the raw `server__` prefix) is what keeps
     // a colliding twin out of the spec on a cold cache (SBS-866).
@@ -13900,6 +13924,7 @@ fn handle_mcp_http(
     allowed: Option<&std::collections::HashSet<String>>,
     client: Option<&str>,
     client_name: Option<&str>,
+    discovery: DiscoveryMode,
     session_owner: Option<&McpSessionOwner>,
 ) -> HttpOut {
     let prefer_sse = mcp_prefers_sse(headers.accept);
@@ -14084,6 +14109,7 @@ fn handle_mcp_http(
                     None,
                     client,
                     client_name,
+                    discovery,
                 );
                 let out = HttpOut::new(202, "text/plain", String::new());
                 return match session_id.as_deref() {
@@ -14102,6 +14128,7 @@ fn handle_mcp_http(
                 None,
                 client,
                 client_name,
+                discovery,
             );
             match resp {
                 Some(resp) => {
@@ -14154,6 +14181,20 @@ fn handle_http_with_headers(
     let client = caller.map(|value| value.session_owner.identity.as_str());
     let client_name = caller.and_then(|value| value.audit_label.as_deref());
     let session_owner = caller.map(|value| &value.session_owner);
+    // Per-client discovery (#868): a caller whose client set clientDiscovery gets
+    // that mode; every other request keeps the process mode (including grouped,
+    // which stays process-global).
+    let discovery = caller
+        .and_then(|value| value.discovery)
+        .unwrap_or_else(|| {
+            if state.lazy {
+                DiscoveryMode::Lazy
+            } else if grouped_discovery() {
+                DiscoveryMode::Grouped
+            } else {
+                DiscoveryMode::Full
+            }
+        });
     if method == "OPTIONS" {
         return HttpOut::new(204, "text/plain", String::new());
     }
@@ -14170,6 +14211,7 @@ fn handle_http_with_headers(
             allowed,
             client,
             client_name,
+            discovery,
             session_owner,
         );
     }
@@ -14178,7 +14220,7 @@ fn handle_http_with_headers(
         ("GET", "/openapi.json") => HttpOut::new(
             200,
             "application/json",
-            openapi_spec(state, allowed).to_string(),
+            openapi_spec(state, allowed, discovery).to_string(),
         ),
         ("GET", "/") | ("GET", "/docs") => {
             let metrics_line = if conduit_lib::metrics::metrics_enabled() {
@@ -14230,6 +14272,7 @@ fn handle_http_with_headers(
                     allowed,
                     client,
                     client_name,
+                    discovery,
                     session_owner,
                 );
             }
@@ -14258,6 +14301,7 @@ fn handle_http_with_headers(
                 None,
                 client,
                 client_name,
+                discovery,
             ) {
                 Some(resp) => {
                     if let Some(err) = resp.get("error") {
@@ -16147,6 +16191,7 @@ fn main() {
                 None,
                 None,
                 None,
+                discovery_mode(),
             );
             continue;
         };
@@ -20098,7 +20143,7 @@ mod tests {
         set_discovery_mode(DiscoveryMode::Lazy);
         let state = http_state(true);
         *state.registry.lock().unwrap() = enabled;
-        let http_names: std::collections::HashSet<String> = http_tool_defs(&state, None)
+        let http_names: std::collections::HashSet<String> = http_tool_defs(&state, None, DiscoveryMode::Lazy)
             .iter()
             .filter_map(|tool| tool["name"].as_str().map(str::to_string))
             .collect();
@@ -20106,7 +20151,7 @@ mod tests {
         assert!(http_names.contains("toolport_list_routines"));
         assert!(http_names.contains("toolport_run_routine"));
 
-        let spec = openapi_spec(&state, None);
+        let spec = openapi_spec(&state, None, DiscoveryMode::Lazy);
         for expected in [
             "toolport_save_routine",
             "toolport_list_routines",
@@ -21869,7 +21914,7 @@ mod tests {
 
     #[test]
     fn openapi_exposes_meta_tools_as_post_paths() {
-        let spec = openapi_spec(&http_state(true), None);
+        let spec = openapi_spec(&http_state(true), None, DiscoveryMode::Lazy);
         let paths = spec.get("paths").unwrap().as_object().unwrap();
         // The lazy meta-tools are each a POST path.
         assert!(paths.contains_key("/toolport_search_tools"));
@@ -23149,6 +23194,7 @@ mod tests {
                 identity: identity.to_string(),
                 scope: scope.map(|s| s.iter().map(|v| v.to_string()).collect()),
             },
+            discovery: None,
         }
     }
 
@@ -24124,6 +24170,38 @@ mod tests {
         assert!(!server_in_allowed_scope("team_slack", &set));
     }
 
+    /// #868: a named HTTP client can pin its own discovery mode through
+    /// `clientDiscovery[id]`, so one bridge serves a full client and a lazy one.
+    #[test]
+    fn resolve_http_caller_carries_the_client_discovery_override() {
+        let mut reg = Registry::default();
+        reg.http_clients.push(registry::HttpClient {
+            id: "c-claude-code".into(),
+            label: "Claude Code".into(),
+            token_sha256: registry::sha256_hex("tok-cc"),
+            profile: String::new(),
+        });
+        let resolve = |reg: &Registry| {
+            resolve_http_caller(reg, None, Some("tok-cc"), false, true)
+                .unwrap()
+                .1
+                .discovery
+        };
+
+        reg.set_client_discovery("c-claude-code", Some("full"));
+        assert_eq!(resolve(&reg), Some(DiscoveryMode::Full));
+
+        reg.set_client_discovery("c-claude-code", Some("lazy"));
+        assert_eq!(resolve(&reg), Some(DiscoveryMode::Lazy));
+
+        // Grouped still depends on process-global publisher state, so it is not a
+        // per-client override, and neither is an unset client.
+        reg.set_client_discovery("c-claude-code", Some("grouped"));
+        assert_eq!(resolve(&reg), None);
+        reg.set_client_discovery("c-claude-code", None);
+        assert_eq!(resolve(&reg), None);
+    }
+
     /// SBS-866: route_of is authoritative; an override-renamed team tool must not
     /// pass a Personal allow-set just because the exposed name has no server prefix.
     #[test]
@@ -24229,7 +24307,7 @@ mod tests {
         *state.cached_tools.lock().unwrap() = Arc::new(CatalogSnapshot::new(cached));
         let personal = personal_scope();
 
-        let spec = openapi_spec(&state, Some(&personal)).to_string();
+        let spec = openapi_spec(&state, Some(&personal), DiscoveryMode::Full).to_string();
         assert!(
             !spec.contains("send_2"),
             "the team twin must not reach a Personal token's OpenAPI doc: {spec}"
