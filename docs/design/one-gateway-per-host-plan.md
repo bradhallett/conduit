@@ -30,19 +30,19 @@ Grounded in the code as of this plan:
 
 ## Delivery shape
 
-| PR  | Slice                                                              | Behavior change          |
-| --- | ------------------------------------------------------------------ | ------------------------ |
-| 1   | P2.1 rendezvous primitives (library module, tested)                | none (new module only)   |
-| 2   | P1.1 `RequestContext` formalized; globals derive from it           | none                     |
-| 3   | P1.2 `SessionState` extracted from `GatewayState`                  | none                     |
-| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade   | none                     |
-| 5   | P2.2 stdio adapter speaks the daemon session protocol, behind flag | opt-in only              |
-| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback          | opt-in only              |
-| 7   | P3.1 union catalog built once, allowed-set enforced per session    | opt-in only              |
-| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding      | opt-in only, the big win |
-| 9   | P4.1 dogfood flag, telemetry, acceptance run                       | opt-in only              |
-| 10  | P4.2 adapter topology becomes default; legacy kill switch remains  | default flip             |
-| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease     | separate, later          |
+| PR  | Slice                                                              | Behavior change           |
+| --- | ------------------------------------------------------------------ | ------------------------- |
+| 1   | P2.1 rendezvous primitives (library module, tested)                | none (new module only)    |
+| 2   | P2.2 daemon role: `--daemon` serves identity, idle-exits           | none (explicit flag only) |
+| 3   | P1.2 `SessionState` extracted from `GatewayState`                  | none                      |
+| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade   | none                      |
+| 5   | P2.2 stdio adapter speaks the daemon session protocol, behind flag | opt-in only               |
+| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback          | opt-in only               |
+| 7   | P3.1 union catalog built once, allowed-set enforced per session    | opt-in only               |
+| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding      | opt-in only, the big win  |
+| 9   | P4.1 dogfood flag, telemetry, acceptance run                       | opt-in only               |
+| 10  | P4.2 adapter topology becomes default; legacy kill switch remains  | default flip              |
+| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease     | separate, later           |
 
 Each of 1 through 8 must leave the default topology untouched and all existing suites
 green. The only PRs that change what a user gets are 10 and 11.
@@ -54,15 +54,21 @@ behavior. This is the prerequisite for sharing a runtime safely.
 
 ### P1.1 RequestContext
 
-- Promote `ActiveRequestContext` from a thread-local scratch to a value that is
-  constructed at the request boundary and threaded explicitly into `process_request`
-  (`toolport-gateway.rs:12528`) and the downstream call path. Keep the thread-local as a
-  scoped adapter populated from the explicit value, never as the source of truth.
-- Move the process globals that are really per-request into it: `MODERN_STDIO_UPSTREAM`,
-  `UpstreamTransportGuard` inputs, progress target, notification eligibility.
-- Use `request_ctx.profile` / `session` / `caller` in place of the current globals.
-- Tests: two concurrent requests with different eras, capabilities, and targets never see
-  each other's values (extend the existing request-context guard tests).
+Largely satisfied already by SBS-551, so there is no separate PR for it. The
+per-request fields (`upstream_version`, `upstream_capabilities`, `mcp_session`,
+`upstream_transport`) live in one `ActiveRequestContext`, are installed at the dispatch
+boundary (`handle_request_with_cancel` enters the era and capabilities guards;
+`process_request` enters the transport; the HTTP path enters the session), and every
+read goes through the context (`serving_modern_client`, `active_mcp_session`,
+`active_upstream_is_stdio`, `modern_client_supports_server_rpc`). The design permits the
+thread-local as a scoped adapter as long as it is populated from the explicit value and
+cannot outlive the request, which the guards already ensure.
+
+What remains is not per-request but session- and host-scoped: `MODERN_STDIO_UPSTREAM`,
+the `STDIO_*` handshake flags, `PROGRESS_*`, the PII map, and the modern HITL approval
+table. Those are single-stdio-client assumptions and move in P1.2 (`SessionState`) and
+P1.3 (`HostState`), so the isolation work lands with the types that own it instead of as a
+mechanical rewrite of the request path.
 
 ### P1.2 SessionState
 
