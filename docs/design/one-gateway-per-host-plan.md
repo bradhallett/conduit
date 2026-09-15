@@ -30,19 +30,19 @@ Grounded in the code as of this plan:
 
 ## Delivery shape
 
-| PR  | Slice                                                              | Behavior change           |
-| --- | ------------------------------------------------------------------ | ------------------------- |
-| 1   | P2.1 rendezvous primitives (library module, tested)                | none (new module only)    |
-| 2   | P2.2 daemon role: `--daemon` serves identity, idle-exits           | none (explicit flag only) |
-| 3   | P1.2 `SessionState` extracted from `GatewayState`                  | none                      |
-| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade   | none                      |
-| 5   | P2.2 stdio adapter speaks the daemon session protocol, behind flag | opt-in only               |
-| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback          | opt-in only               |
-| 7   | P3.1 union catalog built once, allowed-set enforced per session    | opt-in only               |
-| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding      | opt-in only, the big win  |
-| 9   | P4.1 dogfood flag, telemetry, acceptance run                       | opt-in only               |
-| 10  | P4.2 adapter topology becomes default; legacy kill switch remains  | default flip              |
-| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease     | separate, later           |
+| PR  | Slice                                                               | Behavior change           |
+| --- | ------------------------------------------------------------------- | ------------------------- |
+| 1   | P2.1 rendezvous primitives (library module, tested)                 | none (new module only)    |
+| 2   | P2.2a identity role; P2.2b host runtime on the internal endpoint    | none (explicit flag only) |
+| 3   | P1.2 `SessionState` extracted from `GatewayState`                   | none                      |
+| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade    | none                      |
+| 5   | P2.2c stdio adapter speaks the daemon session protocol, behind flag | opt-in only               |
+| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback           | opt-in only               |
+| 7   | P3.1 union catalog built once, allowed-set enforced per session     | opt-in only               |
+| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding       | opt-in only, the big win  |
+| 9   | P4.1 dogfood flag, telemetry, acceptance run                        | opt-in only               |
+| 10  | P4.2 adapter topology becomes default; legacy kill switch remains   | default flip              |
+| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease      | separate, later           |
 
 Each of 1 through 8 must leave the default topology untouched and all existing suites
 green. The only PRs that change what a user gets are 10 and 11.
@@ -118,18 +118,21 @@ Tests: descriptor path is compat-keyed; probe succeeds and rejects a wrong token
 identity from one build is not compatible with another; the descriptor is owner-only; 8
 concurrent cold starts elect exactly one daemon; a stale descriptor is replaced.
 
-### P2.2 Adapter protocol and flags
+### P2.2 Host runtime and adapter
 
-- Add `--daemon` and `--stdio-adapter` to `KNOWN_FLAGS` and `ArgAction`. `--daemon` starts
-  the identity listener from P2.1; `--stdio-adapter` performs `Rendezvous::ensure` and then
-  speaks the daemon session protocol.
-- Implement the adapter with Toolport's Streamable HTTP/SSE protocol against the daemon:
-  one session open, bidirectional JSON-RPC translation, cancellation, oversized frames,
-  and server-initiated RPC correlated back to the originating session.
-- No Node and no `mcp-remote`.
-- Never fall back to the in-process gateway after a request may have reached the daemon.
-  Until the adapter can serve, the default role stays the existing in-process stdio
-  gateway, and `--stdio-adapter` is opt-in.
+- P2.2a (landed): `--daemon` is accepted and the P2.1 identity listener serves
+  `/host/identity`.
+- P2.2b (this PR): `--daemon` runs the full host runtime on an ephemeral loopback endpoint
+  with a random internal bearer and publishes the descriptor. The internal
+  `/host/identity` route is daemon-only, so the user-facing HTTP bridge never exposes the
+  compat fingerprint or build. Still explicit-flag only, off the default startup path, and
+  with the same registry, router, watcher, audit, and session tables as the HTTP bridge.
+- P2.2c: `--stdio-adapter` performs `Rendezvous::ensure` and speaks the daemon session
+  protocol with Toolport's Streamable HTTP/SSE: one session open, bidirectional JSON-RPC
+  translation, cancellation, oversized frames, and server-initiated RPC correlated back to
+  the originating session. No Node and no `mcp-remote`. Never fall back to the in-process
+  gateway after a request may have reached the daemon. Until it can serve, the default role
+  stays the existing in-process stdio gateway.
 
 ### P2.3 Lifecycle and failure
 
