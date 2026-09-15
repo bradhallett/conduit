@@ -61,7 +61,7 @@ if (!browser) {
 }
 check(
   "Headless Chromium",
-  Boolean(browser && existsSync(browser)),
+  Boolean(browser) && command(browser, ["--version"]),
   "run npx playwright install chromium, or set TOOLPORT_BROWSER_BIN",
 );
 console.log(`INFO Checkout: ${root}`);

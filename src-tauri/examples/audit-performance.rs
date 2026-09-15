@@ -15,7 +15,8 @@ fn measure(mut work: impl FnMut(), samples: usize) -> serde_json::Value {
         times.push(start.elapsed().as_secs_f64() * 1000.0);
     }
     times.sort_by(f64::total_cmp);
-    json!({"median_ms": times[samples / 2], "p95_ms": times[samples * 95 / 100]})
+    let p95_index = (samples * 95).div_ceil(100).saturating_sub(1);
+    json!({"median_ms": times[samples / 2], "p95_ms": times[p95_index]})
 }
 
 fn main() {
