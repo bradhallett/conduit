@@ -1317,14 +1317,29 @@ pub(crate) fn backoff_delay(attempt: u32) -> Duration {
     HTTP_RETRY_BASE.saturating_mul(mult).min(HTTP_RETRY_CAP)
 }
 
-/// Parse a `Retry-After` value in delta-seconds form (the common 429 form),
-/// capped so a hostile or misconfigured server can't park a call for minutes.
+/// Parse a `Retry-After` header in either RFC 7231 form: delta-seconds (the
+/// common 429 form) or an HTTP-date. Elapsed dates parse to zero (the retry
+/// moment already passed); future dates are capped so a hostile or
+/// misconfigured server can't park a call for minutes. Unparseable values
+/// return None so callers apply their full-cap fallback.
 fn retry_after_delay(value: &str) -> Option<Duration> {
-    value
-        .trim()
-        .parse::<u64>()
-        .ok()
-        .map(|s| Duration::from_secs(s).min(HTTP_RETRY_CAP))
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds).min(HTTP_RETRY_CAP));
+    }
+    let target = httpdate::parse_http_date(value).ok()?;
+    let now = std::time::SystemTime::now();
+    let remaining = target.duration_since(now).unwrap_or(Duration::ZERO);
+    Some(remaining.min(HTTP_RETRY_CAP))
+}
+
+/// Record a 429 into the shared cross-process backoff window and return the
+/// parsed Retry-After, so every egress path (POST, inline POST, and the
+/// subscriptions/listen worker) records and reports rate limits identically.
+fn record_shared_rate_limit(url: &str, resp: &ureq::Response) -> Option<Duration> {
+    let retry_after = resp.header("retry-after").and_then(retry_after_delay);
+    crate::downstream_backoff::record_rate_limited(url, retry_after);
+    retry_after
 }
 
 /// True for transport errors where the request never reached the server (DNS or
@@ -4563,6 +4578,9 @@ impl HttpTransport {
         body: &Value,
         cancel: Option<&HttpCancelSignal>,
     ) -> Result<(), TransportError> {
+        // Same shared-window consult as the request/response POST path: an
+        // inline reply is still egress and must not slip past an open window.
+        self.shared_backoff_gate()?;
         let payload = body.to_string();
         self.refresh_before_send();
         let mut refreshed = self.forced_refresh_spent();
@@ -4627,6 +4645,16 @@ impl HttpTransport {
                     let _ = read_capped(resp, 8 * 1024);
                     refreshed = true;
                     self.force_refresh_after_auth_error(code)?;
+                }
+                Err(ureq::Error::Status(429, r)) => {
+                    // Record into the shared window like the main POST path
+                    // and surface a Retry signal so the Router backs off.
+                    let retry_after = record_shared_rate_limit(&self.url, &r);
+                    let _ = read_capped(r, 8 * 1024);
+                    return Err(TransportError::Retry {
+                        retry_after,
+                        message: "HTTP 429: rate limited".to_string(),
+                    });
                 }
                 Err(e) => return Err(TransportError::Fatal(e.to_string())),
             }
@@ -4748,6 +4776,23 @@ impl HttpTransport {
         ))
     }
 
+    /// Cross-process 429 backoff consult shared by every egress path of this
+    /// transport: while any gateway process on the host holds the provider's
+    /// window open, fail fast exactly like a live 429 — including during the
+    /// session-start handshake, which never reaches the Router's retry loop.
+    fn shared_backoff_gate(&self) -> Result<(), TransportError> {
+        match crate::downstream_backoff::remaining_for_url(&self.url) {
+            Some(remaining) => Err(TransportError::Retry {
+                retry_after: Some(remaining),
+                message: format!(
+                    "HTTP 429: rate limited (shared backoff: {}s)",
+                    remaining.as_secs() + 1
+                ),
+            }),
+            None => Ok(()),
+        }
+    }
+
     fn post(
         &mut self,
         body: &Value,
@@ -4772,20 +4817,9 @@ impl HttpTransport {
         extra_headers: &[(String, String)],
         cancel: Option<&HttpCancelSignal>,
     ) -> Result<Option<Value>, TransportError> {
-        // Cross-process 429 backoff (issue #874): every gateway process on a
-        // host shares one provider limit, so consult the persisted window
-        // before any wire traffic — including the session-start handshake,
-        // which never reaches the Router's retry loop — and fail fast exactly
-        // like a live 429 would.
-        if let Some(remaining) = crate::downstream_backoff::remaining_for_url(&self.url) {
-            return Err(TransportError::Retry {
-                retry_after: Some(remaining),
-                message: format!(
-                    "HTTP 429: rate limited (shared backoff: {}s)",
-                    remaining.as_secs() + 1
-                ),
-            });
-        }
+        // Cross-process 429 backoff (issue #874): consult the shared window
+        // before any wire traffic, including the session-start handshake.
+        self.shared_backoff_gate()?;
         let payload = body.to_string();
 
         // Refresh shortly before the known expiry, including before initialize.
@@ -4854,12 +4888,11 @@ impl HttpTransport {
                 // Rate limited: return a Retry signal so the Router sleeps
                 // *outside* the per-server Mutex.
                 Err(ureq::Error::Status(429, r)) => {
-                    let retry_after = r.header("retry-after").and_then(retry_after_delay);
-                    let _ = read_capped(r, 8 * 1024);
                     // Persist the window so the other gateway processes on this
                     // host (one per client session) also hold off instead of
                     // re-hitting the same provider limit at their next start.
-                    crate::downstream_backoff::record_rate_limited(&self.url, retry_after);
+                    let retry_after = record_shared_rate_limit(&self.url, &r);
+                    let _ = read_capped(r, 8 * 1024);
                     return Err(TransportError::Retry {
                         retry_after,
                         message: "HTTP 429: rate limited".to_string(),
@@ -5141,6 +5174,14 @@ impl Transport for HttpTransport {
                         }
                     }
                 }
+                // Shared 429 backoff (#874): the listener is its own egress
+                // path, so never connect while another gateway process holds
+                // the provider's window open. Re-consult after each capped
+                // sleep; the cap keeps a replaced listener noticed promptly.
+                if let Some(remaining) = crate::downstream_backoff::remaining_for_url(&url) {
+                    std::thread::sleep(remaining.min(Duration::from_secs(5)));
+                    continue;
+                }
                 let mut forced_refresh = false;
                 let response = loop {
                     let mut request = agent
@@ -5158,6 +5199,18 @@ impl Transport for HttpTransport {
                     }
                     match request.send_string(&payload) {
                         Ok(response) => break Some(response),
+                        Err(ureq::Error::Status(429, response)) => {
+                            // Rate limited: record the shared window like
+                            // every other egress path, then fall into the
+                            // reconnect backoff below, which re-consults the
+                            // window before each retry.
+                            let _ = record_shared_rate_limit(&url, &response);
+                            let _ = read_capped(response, 8 * 1024);
+                            downstream_trace(
+                                "subscriptions/listen rate limited (429); deferring reconnect",
+                            );
+                            break None;
+                        }
                         Err(ureq::Error::Status(code, response))
                             if (code == 401 || code == 403)
                                 && insufficient_scope_challenge(&response).is_some() =>
@@ -9661,15 +9714,34 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_parses_delta_seconds_and_caps() {
+    fn retry_after_parses_delta_seconds_http_dates_and_caps() {
         use super::{retry_after_delay, HTTP_RETRY_CAP};
         use std::time::Duration;
         assert_eq!(retry_after_delay("2"), Some(Duration::from_secs(2)));
         assert_eq!(retry_after_delay("  5 "), Some(Duration::from_secs(5)));
         // Over the cap is clamped to the cap.
         assert_eq!(retry_after_delay("9999"), Some(HTTP_RETRY_CAP));
-        // HTTP-date form and junk are not delta-seconds: no delay parsed.
-        assert_eq!(retry_after_delay("Wed, 21 Oct 2026 07:28:00 GMT"), None);
+        // HTTP-date form: a far-future date parses and clamps to the cap...
+        let far = std::time::SystemTime::now() + Duration::from_secs(3_600);
+        assert_eq!(
+            retry_after_delay(&httpdate::fmt_http_date(far)),
+            Some(HTTP_RETRY_CAP)
+        );
+        // ...a near-future date keeps its exact delay...
+        let soon = std::time::SystemTime::now() + Duration::from_secs(2);
+        let delay = retry_after_delay(&httpdate::fmt_http_date(soon)).unwrap();
+        assert!(
+            delay <= Duration::from_secs(2) && !delay.is_zero(),
+            "near-future date should keep ~2s, got {delay:?}"
+        );
+        // ...and a date that already elapsed means "retry now".
+        let past = std::time::SystemTime::now() - Duration::from_secs(60);
+        assert_eq!(
+            retry_after_delay(&httpdate::fmt_http_date(past)),
+            Some(Duration::ZERO)
+        );
+        // Junk parses to nothing, so callers apply the full-cap fallback.
+        assert_eq!(retry_after_delay("later"), None);
         assert_eq!(retry_after_delay(""), None);
     }
 
@@ -12083,6 +12155,69 @@ mod tests {
         assert!(
             !hit.load(Ordering::SeqCst),
             "no request may reach the wire while the shared window is open"
+        );
+        drop(t);
+        let _ = handle.join();
+        downstream_backoff::reset_for_test();
+    }
+
+    #[test]
+    fn inline_post_honors_and_records_shared_backoff() {
+        use super::{HttpTransport, TransportError};
+        use crate::downstream_backoff;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        let _backoff_state = downstream_backoff::lock_state_for_test();
+        downstream_backoff::reset_for_test();
+
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/");
+
+        // Guard: with a shared window open, an inline reply must fail fast
+        // exactly like the request/response POST path — no wire traffic.
+        downstream_backoff::record_rate_limited(&url, Some(Duration::from_secs(2)));
+        let mut t = HttpTransport::new(&url);
+        let result = t.send_post_no_response(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "result": {}
+        }));
+        match &result {
+            Err(TransportError::Retry { message, .. }) => {
+                assert!(message.contains("shared backoff"), "{message}");
+            }
+            other => panic!("expected fast-fail Retry, got {other:?}"),
+        }
+
+        // Record: a live 429 on the inline path enters the shared window.
+        downstream_backoff::reset_for_test();
+        let hit = Arc::new(AtomicBool::new(false));
+        let hc = Arc::clone(&hit);
+        let handle = std::thread::spawn(move || {
+            if let Ok(Some(req)) = server.recv_timeout(Duration::from_secs(2)) {
+                hc.store(true, Ordering::SeqCst);
+                let retry_after =
+                    tiny_http::Header::from_bytes(&b"Retry-After"[..], &b"1"[..]).unwrap();
+                let _ = req.respond(
+                    tiny_http::Response::from_string("rate limited")
+                        .with_status_code(429)
+                        .with_header(retry_after),
+                );
+            }
+        });
+        let result = t.send_post_no_response(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "result": {}
+        }));
+        match &result {
+            Err(TransportError::Retry { retry_after, .. }) => {
+                assert_eq!(*retry_after, Some(Duration::from_secs(1)));
+            }
+            other => panic!("expected Retry from live 429, got {other:?}"),
+        }
+        assert!(hit.load(Ordering::SeqCst), "the 429 response came from the wire");
+        assert!(
+            downstream_backoff::remaining_for_url(&url).is_some(),
+            "the inline 429 must be recorded into the shared window"
         );
         drop(t);
         let _ = handle.join();

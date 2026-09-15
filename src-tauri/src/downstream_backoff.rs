@@ -67,27 +67,25 @@ pub fn bind_data_dir(dir: &Path) {
         return;
     }
     if let Ok(mut disk) = load_file(&path) {
-        prune(&mut disk);
+        sanitize(&mut disk, now_ms());
         merge_max(&mut st.not_before, &disk.not_before);
     }
     st.path = Some(path);
 }
 
-/// Canonical key for a downstream endpoint: scheme://host:port. The path,
-/// query, and fragment are dropped on purpose, both so an endpoint token in
-/// any of them can never be persisted and so two server entries aimed at one
-/// provider (for example a work and a personal account) share one window —
-/// the provider limits them together.
+/// Canonical key for a downstream endpoint: scheme://host:port via url::Url
+/// origin serialization, so scheme/host case and explicit default ports
+/// (HTTPS://Example.COM:443 vs https://example.com) collapse to one key. The
+/// path, query, fragment, and userinfo are dropped on purpose, both so an
+/// endpoint token in any of them can never be persisted and so two server
+/// entries aimed at one provider (for example a work and a personal account)
+/// share one window — the provider limits them together.
 fn origin_key(url: &str) -> Option<String> {
-    let (scheme, rest) = url.split_once("://")?;
-    if !matches!(scheme, "http" | "https") || rest.is_empty() {
-        return None;
+    let parsed = url::Url::parse(url).ok()?;
+    match parsed.scheme() {
+        "http" | "https" => Some(parsed.origin().ascii_serialization()),
+        _ => None,
     }
-    let authority = rest.split(['/', '?', '#']).next()?;
-    if authority.is_empty() {
-        return None;
-    }
-    Some(format!("{scheme}://{authority}"))
 }
 
 /// Merge incoming timestamps into kept, always retaining the later one: a
@@ -101,10 +99,21 @@ fn merge_max(kept: &mut HashMap<String, u64>, incoming: &HashMap<String, u64>) {
     }
 }
 
-/// Drop timestamps that have already elapsed so the file stays small.
-fn prune(file: &mut BackoffFile) {
-    let now = now_ms();
-    file.not_before.retain(|_, ts| *ts > now);
+/// Normalize persisted deadlines: drop ones that have already elapsed so the
+/// file stays small, and cap survivors at one full window, so a hand-edited
+/// file or a clock stepped backward cannot park a provider any longer than a
+/// legitimate 429 would.
+fn sanitize(file: &mut BackoffFile, now: u64) {
+    let ceiling = now.saturating_add(HTTP_RETRY_CAP.as_millis() as u64);
+    file.not_before.retain(|_, ts| {
+        if *ts <= now {
+            return false;
+        }
+        if *ts > ceiling {
+            *ts = ceiling;
+        }
+        true
+    });
 }
 
 fn load_file(path: &Path) -> Result<BackoffFile, String> {
@@ -145,7 +154,7 @@ pub fn record_rate_limited(url: &str, retry_after: Option<Duration>) {
     };
     let mut disk = load_file(&path).unwrap_or_default();
     merge_max(&mut disk.not_before, &st.not_before);
-    prune(&mut disk);
+    sanitize(&mut disk, now_ms());
     if save_file(&path, &disk).is_ok() {
         st.not_before = disk.not_before;
     }
@@ -156,10 +165,22 @@ pub fn record_rate_limited(url: &str, retry_after: Option<Duration>) {
 /// missing, unreadable, or corrupt.
 pub fn remaining_for_url(url: &str) -> Option<Duration> {
     let key = origin_key(url)?;
-    let guard = state_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let not_before = guard.not_before.get(&key).copied()?;
+    let mut guard = state_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let st = &mut *guard;
+    // Another gateway process may have recorded a window after this one
+    // bound the file, so a consult reloads and merges persisted state rather
+    // than trusting the startup snapshot. atomic_write keeps each read
+    // complete, so a best-effort consult needs no cross-process lock.
+    if let Some(path) = st.path.clone() {
+        if let Ok(mut disk) = load_file(&path) {
+            sanitize(&mut disk, now_ms());
+            merge_max(&mut st.not_before, &disk.not_before);
+        }
+    }
+    let not_before = st.not_before.get(&key).copied()?;
     let now = now_ms();
-    (not_before > now).then(|| Duration::from_millis(not_before - now))
+    let remaining = not_before.saturating_sub(now);
+    (remaining > 0).then(|| Duration::from_millis(remaining).min(HTTP_RETRY_CAP))
 }
 
 #[cfg(test)]
@@ -230,6 +251,72 @@ mod tests {
         assert_eq!(origin_key("not a url"), None);
         assert_eq!(origin_key("ftp://example.com"), None);
         assert_eq!(origin_key("https://"), None);
+    }
+
+    #[test]
+    fn origin_key_canonicalizes_case_and_default_port() {
+        // One provider, one window, however the server entry spells the URL.
+        assert_eq!(
+            origin_key("HTTPS://API.Example.COM:443/mcp"),
+            Some("https://api.example.com".into())
+        );
+        assert_eq!(
+            origin_key("https://api.example.com/mcp"),
+            Some("https://api.example.com".into())
+        );
+        assert_eq!(
+            origin_key("http://Example.com:80"),
+            Some("http://example.com".into())
+        );
+        assert_eq!(
+            origin_key("http://example.com"),
+            Some("http://example.com".into())
+        );
+        // Credentials in the URL never reach the key.
+        assert_eq!(
+            origin_key("https://user:secret@example.com/mcp"),
+            Some("https://example.com".into())
+        );
+    }
+
+    #[test]
+    fn loaded_deadlines_are_capped_at_one_window() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        let dir = TestDir::new("cap-on-load");
+        let path = dir.0.join(FILE_NAME);
+        let mut file = BackoffFile::default();
+        file.not_before.insert(
+            "https://api.example.com".into(),
+            now_ms() + HTTP_RETRY_CAP.as_millis() as u64 * 10,
+        );
+        fs::write(&path, serde_json::to_string(&file).unwrap()).unwrap();
+
+        bind_data_dir(&dir.0);
+
+        let remaining = remaining_for_url("https://api.example.com").unwrap();
+        assert!(
+            remaining <= HTTP_RETRY_CAP,
+            "a hand-edited or backward-clock deadline must not outlive one window"
+        );
+    }
+
+    #[test]
+    fn consult_picks_up_windows_recorded_after_bind() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_for_test();
+        let dir = TestDir::new("cross-process-pickup");
+        let path = dir.0.join(FILE_NAME);
+        bind_data_dir(&dir.0);
+        assert_eq!(remaining_for_url("https://api.example.com"), None);
+
+        // Another gateway process records a window after this one started.
+        let mut disk = BackoffFile::default();
+        disk.not_before.insert("https://api.example.com".into(), now_ms() + 2_000);
+        fs::write(&path, serde_json::to_string(&disk).unwrap()).unwrap();
+
+        let remaining = remaining_for_url("https://api.example.com").unwrap();
+        assert!(remaining <= Duration::from_secs(2) && !remaining.is_zero());
     }
 
     #[test]
