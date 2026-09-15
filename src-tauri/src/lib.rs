@@ -10,6 +10,7 @@ pub mod catalog;
 pub mod clients;
 pub mod codemode;
 pub mod codemode_worker;
+pub mod daemon;
 #[cfg(feature = "desktop")]
 mod desktop;
 pub mod diagnostics_controller;
