@@ -4772,6 +4772,20 @@ impl HttpTransport {
         extra_headers: &[(String, String)],
         cancel: Option<&HttpCancelSignal>,
     ) -> Result<Option<Value>, TransportError> {
+        // Cross-process 429 backoff (issue #874): every gateway process on a
+        // host shares one provider limit, so consult the persisted window
+        // before any wire traffic — including the session-start handshake,
+        // which never reaches the Router's retry loop — and fail fast exactly
+        // like a live 429 would.
+        if let Some(remaining) = crate::downstream_backoff::remaining_for_url(&self.url) {
+            return Err(TransportError::Retry {
+                retry_after: Some(remaining),
+                message: format!(
+                    "HTTP 429: rate limited (shared backoff: {}s)",
+                    remaining.as_secs() + 1
+                ),
+            });
+        }
         let payload = body.to_string();
 
         // Refresh shortly before the known expiry, including before initialize.
@@ -4842,6 +4856,10 @@ impl HttpTransport {
                 Err(ureq::Error::Status(429, r)) => {
                     let retry_after = r.header("retry-after").and_then(retry_after_delay);
                     let _ = read_capped(r, 8 * 1024);
+                    // Persist the window so the other gateway processes on this
+                    // host (one per client session) also hold off instead of
+                    // re-hitting the same provider limit at their next start.
+                    crate::downstream_backoff::record_rate_limited(&self.url, retry_after);
                     return Err(TransportError::Retry {
                         retry_after,
                         message: "HTTP 429: rate limited".to_string(),
@@ -11567,9 +11585,12 @@ mod tests {
     #[test]
     fn post_returns_retry_on_429_with_retry_after() {
         use super::{HttpTransport, TransportError};
+        use crate::downstream_backoff;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
         use std::time::Duration;
+        let _backoff_state = downstream_backoff::lock_state_for_test();
+        downstream_backoff::reset_for_test();
 
         // Mock MCP server: 429 with Retry-After: 2 on the first request,
         // 200 JSON-RPC on the second.
@@ -11616,6 +11637,10 @@ mod tests {
             }
             other => panic!("expected TransportError::Retry, got {other:?}"),
         }
+
+        // The 429 above recorded a shared 2s backoff window for this origin;
+        // clear it so the second POST below can reach the wire as before.
+        downstream_backoff::reset_for_test();
 
         // Second call: the server now responds 200.
         let result2 = t.post(
@@ -12008,6 +12033,60 @@ mod tests {
             normalize_invocation("/usr/bin/my tool", &[]),
             ("/usr/bin/my tool".into(), vec![]),
         );
+    }
+
+    #[test]
+    fn post_fails_fast_while_shared_backoff_window_open() {
+        use super::{HttpTransport, TransportError};
+        use crate::downstream_backoff;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        let _backoff_state = downstream_backoff::lock_state_for_test();
+        downstream_backoff::reset_for_test();
+
+        // Mock server that records any request it receives. The point of the
+        // shared window is that NO wire traffic happens while it is open, so
+        // the test fails if this server is ever contacted.
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let hit = Arc::new(AtomicBool::new(false));
+        let hc = Arc::clone(&hit);
+        let handle = std::thread::spawn(move || {
+            // recv_timeout (not recv) so the thread always exits and the join
+            // below returns even when the fast-fail works and nothing arrives.
+            if let Ok(Some(req)) = server.recv_timeout(Duration::from_secs(2)) {
+                hc.store(true, Ordering::SeqCst);
+                let _ = req
+                    .respond(tiny_http::Response::from_string("late").with_status_code(200));
+            }
+        });
+
+        // Simulate another gateway process on the host having recorded the
+        // window (unbound state is in-memory here, which is equivalent for
+        // this process's consult).
+        let url = format!("http://127.0.0.1:{port}/");
+        downstream_backoff::record_rate_limited(&url, Some(Duration::from_secs(2)));
+
+        let mut t = HttpTransport::new(&url);
+        let result = t.post(
+            &serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }),
+            true,
+        );
+        match &result {
+            Err(TransportError::Retry { retry_after, message }) => {
+                assert!(*retry_after <= Some(Duration::from_secs(2)));
+                assert!(message.contains("shared backoff"), "{message}");
+            }
+            other => panic!("expected fast-fail Retry, got {other:?}"),
+        }
+        assert!(
+            !hit.load(Ordering::SeqCst),
+            "no request may reach the wire while the shared window is open"
+        );
+        drop(t);
+        let _ = handle.join();
+        downstream_backoff::reset_for_test();
     }
 
     #[test]
