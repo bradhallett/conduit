@@ -14,6 +14,7 @@ pub mod codemode_worker;
 mod desktop;
 pub mod diagnostics_controller;
 pub mod downstream;
+pub mod downstream_backoff;
 pub mod gateway_publish;
 pub mod gatewaylog;
 pub mod hooks;

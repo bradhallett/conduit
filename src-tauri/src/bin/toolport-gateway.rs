@@ -15672,6 +15672,9 @@ fn main() {
     // counters then stay process-local until the first successful bind.
     if let Some(dir) = registry::conduit_dir() {
         conduit_lib::rate_limits::bind_data_dir(&dir);
+        // Share downstream 429 backoff windows across gateway processes
+        // (issue #874) until the host daemon lands. Missing state = no backoff.
+        conduit_lib::downstream_backoff::bind_data_dir(&dir);
     }
     // Diagnostic: `toolport-gateway --selftest-secrets` reads every vaulted secret
     // from THIS (gateway) process and reports. Used to validate the macOS keychain

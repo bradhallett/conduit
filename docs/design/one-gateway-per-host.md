@@ -9,6 +9,14 @@ per-request guards). It was closed at that point, which read as "one gateway per
 done" when only the enabling refactor had shipped. The measured cost of the unchanged
 topology is in the Phase 0 baseline below.
 
+One interim mitigation for the rate-limit cost of this topology has shipped: when a
+downstream HTTP server returns 429 (honoring `Retry-After` when present), the gateway
+records a capped retry-not-before window for that provider in
+`downstream_backoff.json` in the data dir, and every gateway process on the host fails
+fast against that provider while the window is open (issue #874). This keeps
+session-start fan-out from re-tripping a provider that is already limiting, but it does
+not deduplicate the connects themselves — only the daemon phases below do that.
+
 ## Goal
 
 Stop every stdio AI-client session from starting its own router and copy of every

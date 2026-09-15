@@ -97,6 +97,9 @@ urlencoding = "2"
 # file:// URI -> path decoding for the ${ROOT} cwd token (issue #239); already in
 # the tree transitively, promoted to a direct dep for url::Url::to_file_path.
 url = "2"
+# RFC 7231 HTTP-date parsing for Retry-After headers: delta-seconds alone
+# misses the date form several providers send on 429s.
+httpdate = "1"
 # Minimal synchronous HTTP server for the gateway's native HTTP/OpenAPI mode
 # (first-class Open WebUI and any OpenAPI tool client, no external bridge).
 tiny_http = "0.12"
