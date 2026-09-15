@@ -30,19 +30,19 @@ Grounded in the code as of this plan:
 
 ## Delivery shape
 
-| PR  | Slice                                                            | Behavior change             |
-| --- | ---------------------------------------------------------------- | --------------------------- |
-| 1   | P2.1 rendezvous primitives (library module, tested)             | none (new module only)      |
-| 2   | P1.1 `RequestContext` formalized; globals derive from it          | none                        |
-| 3   | P1.2 `SessionState` extracted from `GatewayState`                 | none                        |
-| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade  | none                        |
-| 5   | P2.2 stdio adapter speaks the daemon session protocol, behind flag| opt-in only                 |
-| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback         | opt-in only                 |
-| 7   | P3.1 union catalog built once, allowed-set enforced per session   | opt-in only                 |
-| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding     | opt-in only, the big win    |
-| 9   | P4.1 dogfood flag, telemetry, acceptance run                      | opt-in only                 |
-| 10  | P4.2 adapter topology becomes default; legacy kill switch remains | default flip                |
-| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease    | separate, later             |
+| PR  | Slice                                                              | Behavior change          |
+| --- | ------------------------------------------------------------------ | ------------------------ |
+| 1   | P2.1 rendezvous primitives (library module, tested)                | none (new module only)   |
+| 2   | P1.1 `RequestContext` formalized; globals derive from it           | none                     |
+| 3   | P1.2 `SessionState` extracted from `GatewayState`                  | none                     |
+| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade   | none                     |
+| 5   | P2.2 stdio adapter speaks the daemon session protocol, behind flag | opt-in only              |
+| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback          | opt-in only              |
+| 7   | P3.1 union catalog built once, allowed-set enforced per session    | opt-in only              |
+| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding      | opt-in only, the big win |
+| 9   | P4.1 dogfood flag, telemetry, acceptance run                       | opt-in only              |
+| 10  | P4.2 adapter topology becomes default; legacy kill switch remains  | default flip             |
+| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease     | separate, later          |
 
 Each of 1 through 8 must leave the default topology untouched and all existing suites
 green. The only PRs that change what a user gets are 10 and 11.
