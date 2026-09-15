@@ -1446,9 +1446,19 @@ fn append_routine_tool_defs(tools: &mut Vec<Value>, allow_writes: bool) {
 /// `toolport_` meta namespace so scoped clients keep it (meta-tools pass
 /// `scope_tools` unrouted).
 const ROUTINE_TOOL_PREFIX: &str = "toolport_routine_";
-/// Keep virtual Routine tools compatible with clients that enforce the common
-/// 64-character function-name limit, even though Routine display names may be longer.
+/// Provider function names cap at 64 characters. Many clients also prefix a
+/// server's tools (`toolport_` from OpenCode and others), so the advertised name
+/// keeps headroom rather than spending the whole 64 on its own (#872).
 const ROUTINE_TOOL_NAME_MAX_CHARS: usize = 64;
+/// Characters reserved for a client's own prefix so `prefix + advertised name`
+/// still fits under the provider cap.
+const ROUTINE_CLIENT_PREFIX_HEADROOM: usize = 12;
+/// Hex characters of the routine id used to keep advertised names distinct. A
+/// 12-hex (48-bit) tail is plenty for a local store and leaves the slug readable;
+/// a longer tail is taken only when two routines would otherwise collide.
+const ROUTINE_ID_TAIL_HEX: usize = 12;
+/// Full hex length of a routine id (`routine_` plus 32 hex).
+const ROUTINE_ID_HEX_CHARS: usize = 32;
 /// Direct advertisement stays bounded so a large long-lived Routine Store cannot undo
 /// lazy discovery's context savings. Older definitions remain reachable via the Catalog.
 const MAX_FLATTENED_ROUTINE_TOOLS: usize = 32;
@@ -1458,6 +1468,15 @@ const MAX_FLATTENED_ROUTINE_TOOLS: usize = 32;
 /// alike from colliding. Collapsing underscores also guarantees these gateway-owned names
 /// never contain the downstream `server__tool` namespace separator.
 fn routine_tool_name(routine: &routines::RoutineDefinition) -> String {
+    routine_tool_name_with_tail(routine, ROUTINE_ID_TAIL_HEX)
+}
+
+/// [`routine_tool_name`] with an explicit id-tail length, so a caller that needs to
+/// disambiguate two otherwise identical names can take more of the id.
+fn routine_tool_name_with_tail(
+    routine: &routines::RoutineDefinition,
+    id_tail_chars: usize,
+) -> String {
     let mut slug = String::new();
     let mut previous_was_separator = false;
     for character in sanitize_segment(routine.name()).chars() {
@@ -1472,12 +1491,14 @@ fn routine_tool_name(routine: &routines::RoutineDefinition) -> String {
         }
     }
     let slug = slug.trim_matches('_');
-    let id_tail = routine
+    let id = routine
         .id()
         .strip_prefix("routine_")
         .unwrap_or_else(|| routine.id());
-    let slug_budget =
-        ROUTINE_TOOL_NAME_MAX_CHARS.saturating_sub(ROUTINE_TOOL_PREFIX.len() + 1 + id_tail.len());
+    let id_tail: String = id.chars().take(id_tail_chars).collect();
+    let slug_budget = ROUTINE_TOOL_NAME_MAX_CHARS
+        .saturating_sub(ROUTINE_CLIENT_PREFIX_HEADROOM)
+        .saturating_sub(ROUTINE_TOOL_PREFIX.len() + 1 + id_tail.len());
     let slug = slug.chars().take(slug_budget).collect::<String>();
     let slug = slug.trim_end_matches('_');
     if slug.is_empty() {
@@ -1485,6 +1506,43 @@ fn routine_tool_name(routine: &routines::RoutineDefinition) -> String {
     } else {
         format!("{ROUTINE_TOOL_PREFIX}{slug}_{id_tail}")
     }
+}
+
+/// Saved routines in advertisement order: newest first, one per display name, capped.
+/// Shared by the advertised defs and the resolver so both compute identical names.
+fn advertised_routines() -> Result<Vec<routines::RoutineDefinition>, String> {
+    let mut seen_display_names = std::collections::HashSet::new();
+    let mut advertised = Vec::new();
+    for routine in routines::list()? {
+        if advertised.len() >= MAX_FLATTENED_ROUTINE_TOOLS {
+            break;
+        }
+        if !seen_display_names.insert(routine.name().to_string()) {
+            continue;
+        }
+        advertised.push(routine);
+    }
+    Ok(advertised)
+}
+
+/// Advertised names for `advertised`, in order. If two routines would produce the
+/// same name, the later one takes more of its id until they differ, so a truncated
+/// id tail can never make two routines share one advertised name.
+fn routine_tool_names(advertised: &[routines::RoutineDefinition]) -> Vec<String> {
+    let mut used = std::collections::HashSet::new();
+    advertised
+        .iter()
+        .map(|routine| {
+            let mut tail_chars = ROUTINE_ID_TAIL_HEX.min(ROUTINE_ID_HEX_CHARS);
+            loop {
+                let name = routine_tool_name_with_tail(routine, tail_chars);
+                if used.insert(name.clone()) || tail_chars >= ROUTINE_ID_HEX_CHARS {
+                    return name;
+                }
+                tail_chars += 4;
+            }
+        })
+        .collect()
 }
 
 /// Advertise each saved routine as a first-class tool so the model can select it by
@@ -1496,19 +1554,19 @@ fn routine_tool_name(routine: &routines::RoutineDefinition) -> String {
 /// display name shared by several immutable definitions resolves to the newest one, both
 /// here and in [`resolve_flattened_routine_id`].
 fn flattened_routine_tool_defs() -> Vec<Value> {
-    let Ok(saved) = routines::list() else {
-        return Vec::new();
+    let advertised = match advertised_routines() {
+        Ok(advertised) => advertised,
+        Err(error) => {
+            eprintln!(
+                "toolport-gateway: saved routines could not be loaded and are hidden \
+                 until routines.json is fixed: {error}"
+            );
+            return Vec::new();
+        }
     };
+    let names = routine_tool_names(&advertised);
     let mut defs = Vec::new();
-    let mut seen_display_names = std::collections::HashSet::new();
-    for routine in saved {
-        if defs.len() >= MAX_FLATTENED_ROUTINE_TOOLS {
-            break;
-        }
-        if !seen_display_names.insert(routine.name().to_string()) {
-            continue;
-        }
-        let name = routine_tool_name(&routine);
+    for (routine, name) in advertised.iter().zip(names) {
         let dependencies = routine
             .evidence()
             .observed_dependencies()
@@ -1547,21 +1605,13 @@ fn resolve_flattened_routine_id(tool_name: &str) -> Option<String> {
     if !tool_name.starts_with(ROUTINE_TOOL_PREFIX) {
         return None;
     }
-    let saved = routines::list().ok()?;
-    let mut seen_display_names = std::collections::HashSet::new();
-    for routine in saved {
-        if seen_display_names.len() >= MAX_FLATTENED_ROUTINE_TOOLS {
-            break;
-        }
-        if !seen_display_names.insert(routine.name().to_string()) {
-            continue;
-        }
-        let name = routine_tool_name(&routine);
-        if name == tool_name {
-            return Some(routine.id().to_string());
-        }
-    }
-    None
+    let advertised = advertised_routines().ok()?;
+    let names = routine_tool_names(&advertised);
+    advertised
+        .iter()
+        .zip(names)
+        .find(|(_, name)| name == tool_name)
+        .map(|(routine, _)| routine.id().to_string())
 }
 
 fn fetch_result_tool_def() -> Value {
@@ -20143,7 +20193,8 @@ mod tests {
             .filter(|name| name.starts_with(ROUTINE_TOOL_PREFIX))
             .collect();
         let work_alias = routine_tool_name(&newer);
-        assert!(work_alias.ends_with(newer.id().trim_start_matches("routine_")));
+        let id_hex = newer.id().trim_start_matches("routine_");
+        assert!(work_alias.ends_with(&id_hex[..ROUTINE_ID_TAIL_HEX]));
         assert_eq!(
             flattened.iter().filter(|name| **name == work_alias).count(),
             1,
@@ -20154,7 +20205,9 @@ mod tests {
             flattened.contains(&cjk_alias.as_str()),
             "non-ASCII name must fall back to the id tail: {flattened:?}"
         );
-        assert!(flattened.iter().all(|name| name.len() <= 64));
+        assert!(flattened
+            .iter()
+            .all(|name| name.len() <= ROUTINE_TOOL_NAME_MAX_CHARS - ROUTINE_CLIENT_PREFIX_HEADROOM));
         assert!(flattened.iter().all(|name| !name.contains("__")));
         assert_ne!(
             routine_tool_name(&punctuation),
