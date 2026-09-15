@@ -7713,12 +7713,21 @@ fn handle_request(
     client: Option<&str>,
 ) -> Option<Value> {
     let search_index = CatalogSearchIndex::build(cached);
+    // Callers of this wrapper hand in the process mode as a bool; translate it
+    // back to a mode so a global grouped mode still applies to them.
+    let mode = if lazy {
+        DiscoveryMode::Lazy
+    } else if grouped_discovery() {
+        DiscoveryMode::Grouped
+    } else {
+        DiscoveryMode::Full
+    };
     handle_request_with_cancel(
         req,
         reg,
         router,
         cached,
-        lazy,
+        mode,
         profile,
         guard,
         confirm,
@@ -7740,7 +7749,7 @@ fn handle_request_with_cancel(
     reg: &Registry,
     router: &Router,
     cached: &[Value],
-    lazy: bool,
+    mode: DiscoveryMode,
     profile: Option<&str>,
     guard: &SearchGuard,
     confirm: &ConfirmGuard,
@@ -7802,7 +7811,7 @@ fn handle_request_with_cancel(
             id,
             json!({
                 "supportedVersions": SUPPORTED_UPSTREAM_VERSIONS,
-                "capabilities": gateway_capabilities(router, allowed, reg, lazy),
+                "capabilities": gateway_capabilities(router, allowed, reg, mode == DiscoveryMode::Lazy),
                 "instructions": format!("Toolport aggregates every configured MCP server behind one endpoint. In lazy discovery mode the catalog is reached through toolport_search_tools / toolport_call_tool rather than a full tools/list. {ROUTINE_AGENT_INSTRUCTIONS}"),
                 // server/discover is a cacheable operation. The list results grow
                 // these fields in SOU-454.
@@ -7833,7 +7842,7 @@ fn handle_request_with_cancel(
                 id,
                 json!({
                     "protocolVersion": proto,
-                    "capabilities": gateway_capabilities(router, allowed, reg, lazy),
+                    "capabilities": gateway_capabilities(router, allowed, reg, mode == DiscoveryMode::Lazy),
                     "serverInfo": { "name": "toolport-gateway", "version": env!("CARGO_PKG_VERSION") },
                     "instructions": ROUTINE_AGENT_INSTRUCTIONS
                 }),
@@ -7843,7 +7852,7 @@ fn handle_request_with_cancel(
             // Lazy mode: advertise only the meta-tools, so the client's context
             // holds a handful of tool defs instead of the whole catalog. The model
             // finds real tools via toolport_search_tools and runs toolport_call_tool.
-            if lazy {
+            if mode == DiscoveryMode::Lazy {
                 let mut tools = vec![
                     status_tool_def(),
                     search_tool_def(),
@@ -7914,7 +7923,7 @@ fn handle_request_with_cancel(
             // Grouped mode: the lazy meta-tools plus a per-server help_<server> browse
             // tool, so a weak model can pick a server by name instead of inventing a
             // search query. Scoped to the client's servers, same as full mode.
-            if grouped_discovery() {
+            if mode == DiscoveryMode::Grouped {
                 let agg;
                 let unblocked;
                 let catalog: &[Value] = if cached.is_empty() {
@@ -8042,7 +8051,7 @@ fn handle_request_with_cancel(
             // alternative to inventing a search query. Rewrite it into a server-scoped
             // toolport_search_tools so it reuses the exact ranking/listing path, and
             // dispatch of the chosen tool still goes through toolport_call_tool below.
-            if grouped_discovery() {
+            if mode == DiscoveryMode::Grouped {
                 if let Some(prefix) = grouped_help_target(&name) {
                     let q = arguments.get("query").cloned().unwrap_or_else(|| json!(""));
                     let server = prefix.to_string();
@@ -13079,7 +13088,7 @@ fn process_request(
         &reg,
         &router,
         &cache_snapshot.tools,
-        discovery == DiscoveryMode::Lazy,
+        discovery,
         profile_snapshot.as_deref(),
         guard,
         confirm,
@@ -19993,7 +20002,7 @@ mod tests {
             &reg,
             &router,
             &[],
-            true,
+            DiscoveryMode::Lazy,
             None,
             &SearchGuard::default(),
             &ConfirmGuard::new(),
@@ -20020,7 +20029,7 @@ mod tests {
             &reg,
             &router,
             &[],
-            true,
+            DiscoveryMode::Lazy,
             None,
             &SearchGuard::default(),
             &ConfirmGuard::new(),
@@ -20245,7 +20254,7 @@ mod tests {
                 &reg,
                 &router,
                 &catalog,
-                true,
+                DiscoveryMode::Lazy,
                 None,
                 &SearchGuard::default(),
                 &ConfirmGuard::new(),
@@ -20420,7 +20429,7 @@ mod tests {
                 &reg,
                 &router,
                 &catalog,
-                true,
+                DiscoveryMode::Lazy,
                 None,
                 &SearchGuard::default(),
                 &ConfirmGuard::new(),
