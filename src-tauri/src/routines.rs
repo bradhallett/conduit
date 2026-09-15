@@ -748,8 +748,18 @@ fn load_from_inner(path: &Path) -> Result<RoutineStore, String> {
     match parse_store(&content) {
         Ok(store) => Ok(store),
         Err(error) if error.starts_with("Unsupported routines schemaVersion") => Err(error),
-        Err(error) => recover_from_backup(path)
-            .ok_or_else(|| format!("{error}; no valid routines.json backup was available")),
+        Err(error) => match recover_from_backup(path) {
+            Some(store) => {
+                eprintln!(
+                    "toolport: routines.json did not validate ({error}); restored the last valid \
+                     backup, which drops any edit Toolport did not write itself"
+                );
+                Ok(store)
+            }
+            None => Err(format!(
+                "{error}; no valid routines.json backup was available"
+            )),
+        },
     }
 }
 
