@@ -21,7 +21,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::daemon::{DaemonDescriptor, Rendezvous};
@@ -114,8 +114,9 @@ struct Session {
     /// Set when a daemon call failed at the transport level. The next request
     /// re-rendezvouses instead of replaying the call that failed.
     stale: AtomicBool,
-    /// Serializes recovery so only one caller re-rendezvouses at a time.
-    recovering: Mutex<()>,
+    /// Shared by healthy exchanges; taken exclusively while one caller recovers, so
+    /// no request runs against the old descriptor or ahead of the replayed handshake.
+    gate: RwLock<()>,
     session_id: Mutex<Option<String>>,
     /// The client's `initialize` and its `notifications/initialized`, kept so a
     /// replacement daemon can be given an equivalent session.
@@ -130,7 +131,7 @@ impl Session {
             rendezvous,
             descriptor: Mutex::new(descriptor),
             stale: AtomicBool::new(false),
-            recovering: Mutex::new(()),
+            gate: RwLock::new(()),
             session_id: Mutex::new(None),
             handshake_initialize: Mutex::new(None),
             handshake_initialized: Mutex::new(None),
@@ -209,6 +210,15 @@ impl Session {
         }
         let response = match request.send_string(body) {
             Ok(response) => response,
+            // The daemon answered, just not with 2xx. It is alive, so this is not a
+            // recovery trigger; the body is the error the caller should see.
+            Err(ureq::Error::Status(code, response)) => {
+                let body = response.into_string().unwrap_or_default();
+                return Err(format!(
+                    "the host daemon answered HTTP {code}: {}",
+                    body.trim()
+                ));
+            }
             Err(error) => {
                 // The daemon is gone or unreachable. The next request re-rendezvouses;
                 // the call that hit this is never retried.
@@ -231,19 +241,8 @@ impl Session {
     }
 
     /// Re-rendezvous after a daemon failure, then replay the client's handshake so
-    /// the new session is equivalent. A no-op when nothing has failed.
-    fn ensure_live(&self) -> Result<(), String> {
-        if !self.stale.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-        let _recovering = self
-            .recovering
-            .lock()
-            .map_err(|_| "recovery lock poisoned".to_string())?;
-        if !self.stale.swap(false, Ordering::SeqCst) {
-            // Another caller already recovered while we waited.
-            return Ok(());
-        }
+    /// the new session is equivalent. The caller holds the write gate.
+    fn recover(&self) -> Result<(), String> {
         let descriptor = self
             .rendezvous
             .ensure(spawn_daemon)
@@ -274,10 +273,32 @@ impl Session {
         Ok(())
     }
 
-    /// POST one client message: re-establish the daemon first if it failed, remember
-    /// the handshake, then forward the daemon's answer to the client.
+    /// POST one client message. Healthy calls share the read gate and run
+    /// concurrently; after a failure, one caller re-finds the daemon under the write
+    /// gate while the rest wait, so no request runs against the old descriptor or
+    /// ahead of the replayed handshake.
     fn exchange(&self, body: &str) -> Result<(), String> {
-        self.ensure_live()?;
+        if !self.stale.load(Ordering::SeqCst) {
+            let _healthy = self
+                .gate
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !self.stale.load(Ordering::SeqCst) {
+                self.remember_handshake(body);
+                return self.post(body, true);
+            }
+        }
+        let _recovering = self
+            .gate
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.stale.swap(false, Ordering::SeqCst) {
+            if let Err(error) = self.recover() {
+                // Let a later request try again rather than staying healthy-looking.
+                self.stale.store(true, Ordering::SeqCst);
+                return Err(error);
+            }
+        }
         self.remember_handshake(body);
         self.post(body, true)
     }
@@ -508,12 +529,10 @@ fn spawn_listen_stream(session: Arc<Session>) {
             std::thread::sleep(LISTEN_POLL);
             continue;
         };
-        let url = format!("http://{}/mcp", session.descriptor().endpoint);
+        let descriptor = session.descriptor();
+        let url = format!("http://{}/mcp", descriptor.endpoint);
         let response = ureq::get(&url)
-            .set(
-                "Authorization",
-                &format!("Bearer {}", session.descriptor().token),
-            )
+            .set("Authorization", &format!("Bearer {}", descriptor.token))
             .set("Accept", "text/event-stream")
             .set("Mcp-Session-Id", &session_id)
             .timeout(Duration::from_secs(3600))
