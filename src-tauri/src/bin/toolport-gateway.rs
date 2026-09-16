@@ -14883,15 +14883,16 @@ fn daemon_idle_grace() -> Duration {
     .unwrap_or(conduit_lib::daemon::DAEMON_IDLE_GRACE)
 }
 
-/// Exit the daemon once it has been idle for `grace`. A live MCP session is what a
-/// connected adapter, its subscriptions, and its pending work all reduce to, so
-/// "no in-flight request and no session" is the whole idle condition. The
-/// descriptor is cleared before exiting so the next adapter starts a fresh daemon
-/// instead of probing a dead endpoint.
+/// Exit the daemon once nothing has been in flight for `grace`. An open connection
+/// is what a connected adapter, its listen stream, its subscriptions, and a call in
+/// progress all reduce to, so "no in-flight request for the whole grace" is the idle
+/// condition. A session row left behind by an adapter that died without a DELETE
+/// does not pin the process. Discovery is withdrawn before the decision is final,
+/// and put back if work arrived in that window.
 fn spawn_daemon_idle_watchdog(
-    state: GatewayState,
     inflight: Arc<AtomicUsize>,
     descriptor_path: std::path::PathBuf,
+    descriptor: conduit_lib::daemon::DaemonDescriptor,
     grace: Duration,
 ) {
     let poll = Duration::from_millis(200).min(grace);
@@ -14900,21 +14901,21 @@ fn spawn_daemon_idle_watchdog(
         if inflight.load(Ordering::Relaxed) > 0 {
             continue;
         }
-        reap_stale_mcp_sessions(&state);
-        let live_session = state
-            .mcp_sessions
-            .lock()
-            .map(|sessions| !sessions.is_empty())
-            .unwrap_or(true);
-        if live_session {
+        let idle_ms = activity_now_ms().saturating_sub(LAST_ACTIVITY_MS.load(Ordering::Relaxed));
+        if idle_ms < grace.as_millis() as u64 {
             continue;
         }
-        let idle_ms = activity_now_ms().saturating_sub(LAST_ACTIVITY_MS.load(Ordering::Relaxed));
-        if idle_ms >= grace.as_millis() as u64 {
-            glog("daemon: idle exit");
-            conduit_lib::daemon::clear_descriptor(&descriptor_path);
-            std::process::exit(0);
+        // Commit: stop advertising this daemon, then confirm nothing connected in the
+        // window between the check and here.
+        conduit_lib::daemon::clear_descriptor(&descriptor_path);
+        std::thread::sleep(poll);
+        if inflight.load(Ordering::Relaxed) > 0 {
+            // A client found us first. Advertise again and keep serving.
+            let _ = conduit_lib::daemon::write_descriptor(&descriptor_path, &descriptor);
+            continue;
         }
+        glog("daemon: idle exit");
+        std::process::exit(0);
     });
 }
 
@@ -14973,9 +14974,9 @@ fn serve_daemon(state: GatewayState) -> ! {
     LAST_ACTIVITY_MS.store(activity_now_ms(), Ordering::Relaxed);
     let inflight = Arc::new(AtomicUsize::new(0));
     spawn_daemon_idle_watchdog(
-        state.clone(),
         Arc::clone(&inflight),
         descriptor_path.clone(),
+        descriptor.clone(),
         daemon_idle_grace(),
     );
     serve_http_loop_with_inflight(server, state, Some(token), search, confirm, false, inflight);

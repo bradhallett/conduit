@@ -6,6 +6,8 @@
 //! deleted. The unit tests cover the rendezvous; this is the only test that watches
 //! the process actually leave.
 
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -125,7 +127,7 @@ fn an_idle_daemon_exits_and_clears_its_descriptor() {
 }
 
 #[test]
-fn a_daemon_with_a_live_session_does_not_exit_until_it_is_deleted() {
+fn an_open_listen_stream_prevents_idle_exit() {
     let dir = scratch_dir();
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create data dir");
@@ -158,22 +160,33 @@ fn a_daemon_with_a_live_session_does_not_exit_until_it_is_deleted() {
         .map(str::to_string)
         .expect("a session id");
 
-    // Well past the grace: the live session holds the daemon open.
-    std::thread::sleep(Duration::from_millis(1200));
+    // Hold a listen stream open, the way the adapter does. The open connection is the
+    // lease that keeps the daemon alive.
+    let mut listen = TcpStream::connect(&endpoint).expect("connect for the listen stream");
+    listen
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set a read timeout");
+    write!(
+        listen,
+        "GET /mcp HTTP/1.1\r\nHost: {endpoint}\r\nAuthorization: Bearer {token}\r\nAccept: text/event-stream\r\nMcp-Session-Id: {session}\r\n\r\n"
+    )
+    .expect("write the listen request");
+    listen.flush().expect("flush the listen request");
+    let mut head = [0u8; 128];
+    let read = listen.read(&mut head).expect("read the listen response");
+    let head = String::from_utf8_lossy(&head[..read]);
     assert!(
-        child.0.try_wait().expect("daemon status").is_none(),
-        "the daemon exited while a session was live"
+        head.starts_with("HTTP/1.1 200"),
+        "the listen stream was refused: {head}"
     );
 
-    // Deleting the session leaves nothing to keep it alive.
-    ureq::delete(&format!("http://{endpoint}/mcp"))
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("Mcp-Session-Id", &session)
-        .timeout(Duration::from_secs(10))
-        .call()
-        .expect("delete the session");
-
-    let status = wait_for_exit(&mut child, Duration::from_secs(30));
-    assert!(status.success(), "unexpected daemon exit: {status:?}");
-    let _ = std::fs::remove_dir_all(&dir);
+    // Past the grace: the open stream holds the daemon up. This only has to prove
+    // the lease holds it; the idle-exit test above covers the exit path. Waiting for
+    // the exit here would mean waiting out the listen stream's 30s keepalive, which
+    // is how long the daemon can take to notice the socket closed.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        child.0.try_wait().expect("daemon status").is_none(),
+        "the daemon exited while a listen stream was open"
+    );
 }
