@@ -7022,6 +7022,18 @@ fn approval_card(
             .build(),
     );
 
+    if let Some(rule) = &view.agent_rule {
+        card.append(
+            &gtk::Label::builder()
+                .label(format!("Your permission rule: {rule}"))
+                .halign(gtk::Align::Start)
+                .xalign(0.0)
+                .wrap(true)
+                .selectable(true)
+                .build(),
+        );
+    }
+
     if let Some(url) = &view.url_elicitation {
         card.append(
             &gtk::Label::builder()
@@ -7180,6 +7192,7 @@ fn approval_reason(reason: crate::approval::ApprovalReason) -> &'static str {
         }
         crate::approval::ApprovalReason::PersistentCodeWrite => "persistent routine write",
         crate::approval::ApprovalReason::PiiCrossServer => "cross-server data release",
+        crate::approval::ApprovalReason::AgentPermission => "ask-first permission rule",
     }
 }
 
@@ -8350,6 +8363,15 @@ fn approval_notification(view: &crate::approval_broker::PendingView) -> (String,
             format!(
                 "{} requested an external browser interaction. Review it in Toolport.",
                 elicitation.origin
+            ),
+        );
+    }
+    if let Some(rule) = &view.agent_rule {
+        return (
+            "Toolport: approval required".to_string(),
+            format!(
+                "{} asks before {}: your rule {rule}. Approve or deny it in Toolport.",
+                view.server, view.tool
             ),
         );
     }
@@ -10898,6 +10920,7 @@ mod tests {
             arguments: serde_json::json!({}),
             url_elicitation: None,
             pii_release: None,
+            agent_rule: None,
             deadline_ms: 0,
         };
         assert_eq!(

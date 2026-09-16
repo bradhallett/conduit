@@ -29,6 +29,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde_json::{json, Value};
 
 use conduit_lib::approval;
+use conduit_lib::approval::{new_correlation_id, read_endpoint_descriptor, request_human_decision};
 use conduit_lib::clients;
 use conduit_lib::codemode;
 use conduit_lib::codemode_worker as worker;
@@ -3977,130 +3978,6 @@ fn http_client_label(reg: &Registry, provided: Option<&str>) -> Option<String> {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-/// A fresh 128-bit correlation id for an approval request (same CSPRNG-or-die policy
-/// as the confirm token: a randomness failure on a security gate is fatal, not papered).
-fn new_correlation_id() -> String {
-    let mut buf = [0u8; 16];
-    getrandom::getrandom(&mut buf).expect("CSPRNG unavailable");
-    buf.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Read the approval-broker endpoint the Toolport app publishes into the data dir.
-/// `None` when it is absent/unreadable (the app is not running) - a fail-closed signal.
-fn read_endpoint_descriptor() -> Option<approval::EndpointDescriptor> {
-    let dir = conduit_lib::registry::conduit_dir()?;
-    let raw = std::fs::read_to_string(dir.join(approval::ENDPOINT_FILE)).ok()?;
-    serde_json::from_str(&raw).ok()
-}
-
-/// The outcome of a single dial to the approval broker. Separating "we never reached a
-/// live broker" from "a broker answered" lets the caller retry a *stale* endpoint (the app
-/// just restarted and rebound to a new port) without ever re-prompting a human who was
-/// already asked.
-enum BrokerAttempt {
-    /// A broker received the request and answered (Approved / Denied / Timeout).
-    Decided(approval::ApprovalDecision),
-    /// We never handed the request to a live broker: no descriptor, connect refused, or the
-    /// transport failed before the request went across. No human was asked, so a retry
-    /// against a freshly-read descriptor is safe.
-    Unreachable,
-}
-
-/// One dial to the broker described by `desc`. FAIL-CLOSED throughout: the arguments travel
-/// over the socket and never touch disk. The dial itself ([`approval::dial_broker`]) makes
-/// the peer prove it holds the descriptor's token before a byte of the request is written,
-/// so a process that merely binds the published endpoint after the app has gone gets
-/// neither the arguments nor a say in the decision (SBS-867).
-///
-/// The key invariant: `Unreachable` is returned ONLY when the request never reached a
-/// broker (so no human saw it). Once the request is written, any later failure - including
-/// the read timeout that means "the human didn't answer" - is a `Decided(Timeout)`, so we
-/// never retry in a way that could double-prompt.
-fn try_decide_once(
-    desc: Option<approval::EndpointDescriptor>,
-    req: &mut approval::ApprovalRequest,
-) -> BrokerAttempt {
-    use std::io::{BufRead, BufReader, Write};
-    let Some(desc) = desc else {
-        return BrokerAttempt::Unreachable;
-    };
-    req.token = desc.token.clone();
-    // Connect refused, no answer to the challenge, or a wrong proof: in every case the
-    // request was never written, so no human was asked and a re-dial is safe.
-    let Ok(mut stream) = approval::dial_broker(&desc) else {
-        return BrokerAttempt::Unreachable;
-    };
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(approval::DEFAULT_TIMEOUT_SECS)));
-    let Ok(line) = serde_json::to_string(req) else {
-        // We connected but can't serialize our own request: not a reachability problem, so
-        // don't spin on retry. Fail closed.
-        return BrokerAttempt::Decided(approval::ApprovalDecision::Timeout);
-    };
-    if stream.write_all(line.as_bytes()).is_err() || stream.write_all(b"\n").is_err() {
-        // The request never made it across, so no human was asked: safe to re-dial.
-        return BrokerAttempt::Unreachable;
-    }
-    let _ = stream.flush();
-    let mut resp = String::new();
-    match BufReader::new(stream).read_line(&mut resp) {
-        // Connected and the peer closed with no answer: not a healthy broker. No human was
-        // shown a prompt (the broker's pre-prompt reject paths close silently), so re-dial.
-        Ok(0) => BrokerAttempt::Unreachable,
-        Ok(_) => {
-            let t = resp.trim();
-            if t.is_empty() {
-                BrokerAttempt::Unreachable
-            } else {
-                // A parseable decision is authoritative; an unparseable line is fail-closed
-                // as a Timeout (a real broker answered, so this is not a retry case).
-                BrokerAttempt::Decided(
-                    serde_json::from_str::<approval::ApprovalDecision>(t)
-                        .unwrap_or(approval::ApprovalDecision::Timeout),
-                )
-            }
-        }
-        // A read error AFTER we sent the request is the "human didn't answer in time" path
-        // (read timeout) or a mid-wait drop. Either way the broker had our request, so this
-        // is a genuine no-decision Timeout - never retry (that would re-prompt).
-        Err(_) => BrokerAttempt::Decided(approval::ApprovalDecision::Timeout),
-    }
-}
-
-/// Ask the app broker for a human decision on `req`, reading the endpoint descriptor once.
-/// Collapses an unreachable broker to the `Unreachable` decision (still fail-closed). Kept
-/// as a thin, dependency-free entry point for unit tests; `request_human_decision` is the
-/// production path with the self-healing retry.
-fn decide_via_broker(
-    desc: Option<approval::EndpointDescriptor>,
-    req: &mut approval::ApprovalRequest,
-) -> approval::ApprovalDecision {
-    match try_decide_once(desc, req) {
-        BrokerAttempt::Decided(d) => d,
-        BrokerAttempt::Unreachable => approval::ApprovalDecision::Unreachable,
-    }
-}
-
-/// Hold a gated tool call until a human decides via the Toolport app (or it fails closed).
-///
-/// If the first dial can't reach a live broker, re-read the descriptor and retry once: the
-/// app may have just restarted and rebound to a new port, leaving the descriptor we first
-/// read stale. This self-heals that race without ever failing open - two unreachable dials
-/// return `Unreachable`, which is still a deny.
-fn request_human_decision(mut req: approval::ApprovalRequest) -> approval::ApprovalDecision {
-    match try_decide_once(read_endpoint_descriptor(), &mut req) {
-        BrokerAttempt::Decided(d) => d,
-        BrokerAttempt::Unreachable => match try_decide_once(read_endpoint_descriptor(), &mut req) {
-            BrokerAttempt::Decided(d) => d,
-            BrokerAttempt::Unreachable => {
-                gtrace("approval broker unreachable after retry; failing closed (Unreachable)");
-                approval::ApprovalDecision::Unreachable
-            }
-        },
-    }
-}
-
 /// The stable machine token for a HITL decision, shared by the audit record and the
 /// agent-facing envelope so both name the outcome the same way. `Approved` is included for
 /// the audit path (approved calls are logged too); the refusal envelope never sees it.
@@ -4519,6 +4396,7 @@ fn execute_call(
                 tool_fingerprint: current_fp.clone(),
                 url_elicitation: None,
                 pii_release: None,
+                agent_rule: None,
             };
             let mut approval_reason = reason;
             let (decision, held_ms, approved_fp, audit_approval) = if modern_direct_call {
@@ -4623,6 +4501,7 @@ fn execute_call(
                 approval::ApprovalReason::UntrustedSource => "untrusted_source",
                 approval::ApprovalReason::DestructiveAndUntrusted => "destructive_and_untrusted",
                 approval::ApprovalReason::PersistentCodeWrite => "persistent_code_write",
+                approval::ApprovalReason::AgentPermission => "agent_permission",
                 // Unreachable here: this gate comes from `gate_reason`, which never returns
                 // it. The PII release gate runs later, at the dispatch boundary, and audits
                 // itself in `approve_pii_release`.
@@ -5281,6 +5160,7 @@ fn approve_pii_release(
             // re-checked against the map once the answer comes back.
             values: values.clone(),
         }),
+        agent_rule: None,
     });
     // The audit record names the tokens' count via the args hash only -- `record_decision`
     // hashes rather than stores, so the released values stay out of the log.
@@ -7181,6 +7061,7 @@ fn save_routine_promotion_dispatch(
         tool_fingerprint: None,
         url_elicitation: None,
         pii_release: None,
+        agent_rule: None,
     });
     audit::record_decision(
         "toolport",
@@ -7420,6 +7301,7 @@ fn save_routine_dispatch(
         tool_fingerprint: None,
         url_elicitation: None,
         pii_release: None,
+        agent_rule: None,
     });
     audit::record_decision(
         "toolport",
@@ -12250,6 +12132,7 @@ fn broker_url_elicitation(
             message: screened.message,
         }),
         pii_release: None,
+        agent_rule: None,
     });
     match decision {
         approval::ApprovalDecision::Approved => ServerRequestAction::Respond(
@@ -16366,6 +16249,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use conduit_lib::approval::decide_via_broker;
 
     /// A server whose NAME contains a write verb must not drag its read-only
     /// tools out of the catalog. The destructive fallback scans the tool name for
@@ -18056,6 +17940,7 @@ mod tests {
             tool_fingerprint: Some("v2:abc".into()),
             url_elicitation: None,
             pii_release: None,
+            agent_rule: None,
         };
         // No endpoint descriptor (Toolport app not running) -> Unreachable (fail-closed),
         // distinct from a human Timeout so the caller can explain *why* it was blocked.
@@ -18112,6 +17997,7 @@ mod tests {
             tool_fingerprint: Some("v2:abc".into()),
             url_elicitation: None,
             pii_release: None,
+            agent_rule: None,
         };
         let desc = Some(approval::EndpointDescriptor {
             endpoint,

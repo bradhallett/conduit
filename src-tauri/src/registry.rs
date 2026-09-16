@@ -1030,6 +1030,17 @@ pub struct Registry {
     /// into `~/.cursor/hooks.json` treats the same permission rules. `Off` = not installed.
     #[serde(default, skip_serializing_if = "GuardMode::is_off")]
     pub guard_cursor_mode: GuardMode,
+    /// Cursor guard, when enforcing: route an "ask first" rule through Toolport's approval
+    /// window instead of Cursor's own prompt (SBS-1059). Off = Cursor prompts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub guard_cursor_ask_via_toolport: bool,
+    /// Claude Code guard (SBS-1059): the `--toolport-guard claude-code` PreToolUse hook.
+    /// Claude Code enforces deny and allow natively, so this hook's one job is asks:
+    /// `Enforce` moves the ask rules it can judge (shell commands, file reads, MCP tools)
+    /// out of `settings.json` and into Toolport's approval window. `Observe` installs the
+    /// hook and records what it would decide; the native rules stay as they are.
+    #[serde(default, skip_serializing_if = "GuardMode::is_off")]
+    pub guard_claude_mode: GuardMode,
     /// Absolute paths of the hooks files the guard has been written into, for exact cleanup.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub guard_targets: Vec<String>,
@@ -1317,6 +1328,8 @@ impl Default for Registry {
             rules_targets: Vec::new(),
             rules_projects: Vec::new(),
             guard_cursor_mode: GuardMode::Off,
+            guard_cursor_ask_via_toolport: false,
+            guard_claude_mode: GuardMode::Off,
             guard_targets: Vec::new(),
             agent_permissions_enabled: false,
             agent_permission_rules: Vec::new(),

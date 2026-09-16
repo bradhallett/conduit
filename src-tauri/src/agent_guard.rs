@@ -38,6 +38,8 @@
 //! stands aside - and in `Enforce` Cursor's `failClosed` still covers a crash or timeout.
 
 use serde::{Deserialize, Serialize};
+
+use crate::approval::{ApprovalDecision, ApprovalReason, ApprovalRequest};
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 
@@ -55,8 +57,85 @@ const CURSOR_EVENTS: [&str; 3] = [
     "beforeReadFile",
 ];
 
-/// Seconds Cursor should allow the hook. A wedged guard must cost a bounded pause.
+/// Seconds an agent should allow the hook. A wedged guard must cost a bounded pause.
 const GUARD_TIMEOUT_SECS: u64 = 10;
+
+/// Seconds an agent should allow the hook when an "ask first" rule is routed through
+/// Toolport's approval window: the broker's own fail-closed wait plus a margin, so the
+/// guard always answers (deny, on no decision) before the agent gives up on it. An agent
+/// that times the hook out may run the call as if nothing had objected (SBS-1059).
+const GUARD_ASK_TIMEOUT_SECS: u64 = crate::approval::DEFAULT_TIMEOUT_SECS + 30;
+
+/// The one Claude Code event that can refuse a call. The matcher keeps the hook to the
+/// tools it can judge; Claude Code's own permission system covers the rest natively.
+const CLAUDE_EVENT: &str = "PreToolUse";
+const CLAUDE_GUARD_MATCHER: &str = "Bash|Read|mcp__.*";
+
+/// The agents the guard serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Agent {
+    Cursor,
+    ClaudeCode,
+}
+
+impl Agent {
+    fn parse(arg: &str) -> Option<Self> {
+        match arg {
+            "cursor" => Some(Agent::Cursor),
+            "claude-code" | "claude" => Some(Agent::ClaudeCode),
+            _ => None,
+        }
+    }
+
+    /// The hook argument, the sensor row's `agent`, and the `server` of a routed ask.
+    pub fn id(self) -> &'static str {
+        match self {
+            Agent::Cursor => "cursor",
+            Agent::ClaudeCode => "claude-code",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Agent::Cursor => "Cursor",
+            Agent::ClaudeCode => "Claude Code",
+        }
+    }
+
+    fn mode(self, reg: &crate::registry::Registry) -> GuardMode {
+        match self {
+            Agent::Cursor => reg.guard_cursor_mode,
+            Agent::ClaudeCode => reg.guard_claude_mode,
+        }
+    }
+
+    /// Whether an enforced "ask first" goes to Toolport's approval window rather than
+    /// the agent's own prompt. Cursor opts in; for Claude Code that IS the guard's job.
+    fn routes_asks(self, reg: &crate::registry::Registry) -> bool {
+        match self {
+            Agent::Cursor => reg.guard_cursor_ask_via_toolport,
+            Agent::ClaudeCode => true,
+        }
+    }
+
+    /// The hook timeout to register: long enough for a person to answer when asks are
+    /// routed here, short otherwise.
+    fn hook_timeout(self, reg: &crate::registry::Registry) -> u64 {
+        if self.mode(reg) == GuardMode::Enforce && self.routes_asks(reg) {
+            GUARD_ASK_TIMEOUT_SECS
+        } else {
+            GUARD_TIMEOUT_SECS
+        }
+    }
+}
+
+/// Whether a rule pattern is one the guard can judge: shell commands, file reads and MCP
+/// tools. `agent_permissions` keeps the ask rules that pass this out of Claude Code's
+/// settings while the guard owns asks there.
+pub fn judges_pattern(pattern: &str) -> bool {
+    let (tool, _) = split_rule(pattern);
+    tool == "Bash" || tool == "Read" || tool.starts_with("mcp__")
+}
 
 /// Cap on the payload read from stdin. Generous on purpose: a `beforeReadFile` payload
 /// embeds the file's content, and in Enforce a call the guard cannot see is DENIED, so a
@@ -435,25 +514,117 @@ pub fn evaluate(rules: &[PermissionRule], subject: &Subject) -> Verdict {
 // ---------------------------------------------------------------------------
 
 /// Cursor's canonical "proceed" response.
+/// What the guard has decided, before it is shaped for the agent that asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Answer {
+    /// Nothing to say: the agent proceeds under its own rules. For Cursor this is its
+    /// canonical "proceed" response; for Claude Code it is no output at all.
+    NoOpinion,
+    /// Let it run, with a note when a person approved it in Toolport.
+    Allow {
+        note: Option<String>,
+    },
+    Deny {
+        user: String,
+        agent: String,
+    },
+    /// The agent's own confirmation prompt (Cursor, when asks are not routed here).
+    Ask {
+        user: String,
+        agent: String,
+    },
+}
+
+impl Answer {
+    fn decision(&self) -> &'static str {
+        match self {
+            Answer::NoOpinion | Answer::Allow { .. } => "allow",
+            Answer::Deny { .. } => "deny",
+            Answer::Ask { .. } => "ask",
+        }
+    }
+}
+
 fn allow_response() -> Value {
     json!({ "continue": true, "permission": "allow" })
 }
 
-fn decision_response(action: PermissionAction, rule: &str, what: &str) -> Value {
-    match action {
-        PermissionAction::Deny => json!({
+/// Shape an answer the way the agent reads it. Cursor reads `permission` plus optional
+/// user/agent messages; Claude Code reads `hookSpecificOutput.permissionDecision` and
+/// treats empty output as "no opinion".
+fn render(agent: Agent, answer: Answer) -> Value {
+    match (agent, answer) {
+        (Agent::Cursor, Answer::NoOpinion) => allow_response(),
+        (Agent::Cursor, Answer::Allow { note }) => match note {
+            Some(note) => json!({ "continue": true, "permission": "allow", "user_message": note }),
+            None => allow_response(),
+        },
+        (Agent::Cursor, Answer::Deny { user, agent }) => json!({
             "continue": true,
             "permission": "deny",
-            "user_message": format!("Toolport: blocked by your permission rule {rule}."),
-            "agent_message": format!("Toolport blocked {what}: it matches the user's permission rule {rule} (deny). Do not retry it or work around it; explain and ask the user how to proceed."),
+            "user_message": user,
+            "agent_message": agent,
         }),
-        PermissionAction::Ask => json!({
+        (Agent::Cursor, Answer::Ask { user, agent }) => json!({
             "continue": true,
             "permission": "ask",
-            "user_message": format!("Toolport: your permission rule {rule} asks before this."),
-            "agent_message": format!("{what} matches the user's permission rule {rule} (ask); wait for their answer."),
+            "user_message": user,
+            "agent_message": agent,
         }),
-        PermissionAction::Allow => allow_response(),
+        (Agent::ClaudeCode, Answer::NoOpinion) => Value::Null,
+        (Agent::ClaudeCode, Answer::Allow { note }) => claude_decision(
+            "allow",
+            &note.unwrap_or_else(|| "Toolport: allowed by your permission rules.".to_string()),
+        ),
+        (Agent::ClaudeCode, Answer::Deny { agent, .. }) => claude_decision("deny", &agent),
+        (Agent::ClaudeCode, Answer::Ask { agent, .. }) => claude_decision("ask", &agent),
+    }
+}
+
+fn claude_decision(decision: &str, reason: &str) -> Value {
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": CLAUDE_EVENT,
+            "permissionDecision": decision,
+            "permissionDecisionReason": reason,
+        }
+    })
+}
+
+fn decision_answer(action: PermissionAction, rule: &str, what: &str) -> Answer {
+    match action {
+        PermissionAction::Deny => Answer::Deny {
+            user: format!("Toolport: blocked by your permission rule {rule}."),
+            agent: format!("Toolport blocked {what}: it matches the user's permission rule {rule} (deny). Do not retry it or work around it; explain and ask the user how to proceed."),
+        },
+        PermissionAction::Ask => Answer::Ask {
+            user: format!("Toolport: your permission rule {rule} asks before this."),
+            agent: format!("{what} matches the user's permission rule {rule} (ask); wait for their answer."),
+        },
+        PermissionAction::Allow => Answer::Allow { note: None },
+    }
+}
+
+/// The answer for an "ask first" rule that went to Toolport's approval window. Only an
+/// explicit approval lets the call run; a denial, no decision in time, and an app that is
+/// not running all refuse it, each saying which, so the person knows what to do next.
+fn routed_answer(decision: ApprovalDecision, rule: &str, what: &str) -> Answer {
+    match decision {
+        ApprovalDecision::Approved => Answer::Allow {
+            note: Some(format!("Toolport: you approved this in the Toolport app (rule {rule}).")),
+        },
+        ApprovalDecision::Denied => Answer::Deny {
+            user: format!("Toolport: you denied this in the Toolport app (rule {rule})."),
+            agent: format!("The user denied {what} in Toolport (rule {rule}). Do not retry it or work around it; ask the user how to proceed."),
+        },
+        ApprovalDecision::Unreachable => Answer::Deny {
+            user: format!("Toolport: the Toolport app is not running, so this could not be approved (rule {rule}). Start Toolport, or stop routing asks through it."),
+            agent: format!("{what} matches the user's permission rule {rule} (ask) and Toolport's approval window was unreachable, so it was refused. Do not retry it; tell the user Toolport is not running."),
+        },
+        ApprovalDecision::Timeout | ApprovalDecision::StaleState => Answer::Deny {
+            user: format!("Toolport: no decision was made in the Toolport app in time, so this was refused (rule {rule})."),
+            agent: format!("{what} matches the user's permission rule {rule} (ask) and was not approved in time, so it was refused. Do not retry it; tell the user it is waiting on their approval in Toolport."),
+        },
     }
 }
 
@@ -495,6 +666,49 @@ fn cursor_subject<'a>(
     }
 }
 
+/// The subject a Claude Code `PreToolUse` payload describes. Only the tools the guard
+/// judges are recognised; anything else is Claude Code's own permission system's business.
+fn claude_subject<'a>(payload: &'a Value, home: Option<&'a str>) -> Option<(Subject<'a>, String)> {
+    let tool = payload.get("tool_name")?.as_str()?;
+    let input = payload.get("tool_input");
+    let root = payload.get("cwd").and_then(Value::as_str);
+    match tool {
+        "Bash" => {
+            let command = input?.get("command")?.as_str()?;
+            Some((
+                Subject::Shell(command),
+                format!("the shell command `{}`", truncate(command, 120)),
+            ))
+        }
+        "Read" => {
+            let path = input?.get("file_path")?.as_str()?;
+            Some((
+                Subject::Read { path, root, home },
+                format!("reading `{}`", truncate(path, 160)),
+            ))
+        }
+        // Claude Code names the tool in full (`mcp__server__tool`); the rule matcher
+        // works on the part after `mcp__`, where a rule's own `server__tool` remainder
+        // matches the whole and its tool part matches the tail.
+        name => {
+            let rest = name.strip_prefix("mcp__")?;
+            Some((
+                Subject::Mcp { tool: rest },
+                format!("the MCP tool `{}`", truncate(name, 80)),
+            ))
+        }
+    }
+}
+
+/// Whether a Claude Code payload names a tool the guard should have been able to judge.
+fn claude_judgeable(payload: &Value) -> bool {
+    payload
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .map(|t| t == "Bash" || t == "Read" || t.starts_with("mcp__"))
+        .unwrap_or(false)
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
@@ -508,6 +722,11 @@ fn truncate(s: &str, n: usize) -> String {
 /// `truncated` says the payload hit [`MAX_GUARD_STDIN_BYTES`] and is not whole.
 pub fn handle_stdin(agent: &str, stdin: &str, truncated: bool) -> (String, i32) {
     let out = handle(agent, stdin, truncated);
+    // Claude Code reads empty output as "no opinion"; a JSON `null` would be a parse
+    // error it reports to the user on every unmatched call.
+    if out.is_null() {
+        return (String::new(), 0);
+    }
     (out.to_string(), 0)
 }
 
@@ -515,66 +734,85 @@ pub fn handle_stdin(agent: &str, stdin: &str, truncated: bool) -> (String, i32) 
 /// not be able to slip a call past a rule by making the payload unreadable (padding it past
 /// the cap, say), and Cursor's `failClosed` would not catch a well-formed allow. Otherwise
 /// allow, and record that it could not judge.
-fn cannot_judge(reg: &crate::registry::Registry, why: &str) -> Value {
-    if reg.guard_cursor_mode == GuardMode::Enforce {
-        json!({
-            "continue": true,
-            "permission": "deny",
-            "user_message": format!("Toolport: this call was refused because the guard could not read it ({why}). Switch the Cursor guard to Observe if this keeps happening."),
-            "agent_message": format!("Toolport could not evaluate this call ({why}) and is enforcing, so it was refused. Do not retry it in a different form; tell the user."),
+fn cannot_judge(agent: Agent, enforced: bool, why: &str) -> Value {
+    if enforced {
+        render(agent, Answer::Deny {
+            user: format!("Toolport: this call was refused because the guard could not read it ({why}). Switch the {} guard to Observe if this keeps happening.", agent.label()),
+            agent: format!("Toolport could not evaluate this call ({why}) and is enforcing, so it was refused. Do not retry it in a different form; tell the user."),
         })
     } else {
-        allow_response()
+        render(agent, Answer::NoOpinion)
     }
 }
 
-fn registry_unavailable(why: &str) -> Value {
-    json!({
-        "continue": true,
-        "permission": "deny",
-        "user_message": format!("Toolport: this call was refused because the guard could not load its policy ({why})."),
-        "agent_message": format!("Toolport could not load its permission policy ({why}), so it refused this call. Tell the user."),
+fn registry_unavailable(agent: Agent, why: &str) -> Value {
+    render(agent, Answer::Deny {
+        user: format!("Toolport: this call was refused because the guard could not load its policy ({why})."),
+        agent: format!("Toolport could not load its permission policy ({why}), so it refused this call. Tell the user."),
     })
 }
 
 fn handle(agent: &str, stdin: &str, truncated: bool) -> Value {
-    if agent != "cursor" {
+    handle_with(
+        agent,
+        stdin,
+        truncated,
+        &crate::approval::request_human_decision,
+    )
+}
+
+/// [`handle`] with the approval broker injectable, so tests drive a scripted decision
+/// instead of the app's socket.
+fn handle_with(
+    agent: &str,
+    stdin: &str,
+    truncated: bool,
+    decide: &dyn Fn(ApprovalRequest) -> ApprovalDecision,
+) -> Value {
+    let Some(agent) = Agent::parse(agent) else {
         crate::gatewaylog::append(&format!(
             "toolport: guard invoked for unknown agent {agent:?}"
         ));
         return allow_response();
-    }
+    };
     let reg = match crate::registry::load_resolved_with_source() {
         Ok((reg, source)) if source.is_authoritative() => reg,
         Ok((_reg, source)) => {
             crate::gatewaylog::append(&format!(
                 "toolport: guard registry is not authoritative: {source:?}"
             ));
-            return registry_unavailable("the registry was recovered or unreadable");
+            return registry_unavailable(agent, "the registry was recovered or unreadable");
         }
         Err(error) => {
             crate::gatewaylog::append(&format!(
                 "toolport: guard could not load the registry: {error}"
             ));
-            return registry_unavailable("the registry could not be read");
+            return registry_unavailable(agent, "the registry could not be read");
         }
     };
+    let mode = agent.mode(&reg);
+    let enforced = mode == GuardMode::Enforce;
+    let fallback = if enforced { "deny" } else { "allow" };
     // Cursor on Windows is documented to prefix hook stdin with a UTF-8 BOM.
     let stdin = stdin.trim_start_matches('\u{FEFF}');
     if truncated {
         record(
-            json!({ "agent": "cursor", "event": "guard", "malformed": true, "truncated": true, "decision": if reg.guard_cursor_mode == GuardMode::Enforce { "deny" } else { "allow" }, "mode": reg.guard_cursor_mode }),
+            json!({ "agent": agent.id(), "event": "guard", "malformed": true, "truncated": true, "decision": fallback, "mode": mode }),
         );
-        return cannot_judge(&reg, "the payload was larger than the guard reads");
+        return cannot_judge(
+            agent,
+            enforced,
+            "the payload was larger than the guard reads",
+        );
     }
     let payload: Value = match serde_json::from_str(stdin) {
         Ok(v) => v,
         Err(error) => {
             record(
-                json!({ "agent": "cursor", "event": "guard", "malformed": true, "decision": if reg.guard_cursor_mode == GuardMode::Enforce { "deny" } else { "allow" }, "mode": reg.guard_cursor_mode }),
+                json!({ "agent": agent.id(), "event": "guard", "malformed": true, "decision": fallback, "mode": mode }),
             );
             crate::gatewaylog::append(&format!("toolport: guard payload did not parse: {error}"));
-            return cannot_judge(&reg, "the payload did not parse");
+            return cannot_judge(agent, enforced, "the payload did not parse");
         }
     };
     let event = payload
@@ -594,48 +832,112 @@ fn handle(agent: &str, stdin: &str, truncated: bool) -> Value {
         })
         .map(str::to_string);
     let home = dirs::home_dir().map(|h| h.to_string_lossy().to_string());
-    let Some((subject, what)) = cursor_subject(&event, &payload, home.as_deref()) else {
+    let subject = match agent {
+        Agent::Cursor => cursor_subject(&event, &payload, home.as_deref()),
+        Agent::ClaudeCode => claude_subject(&payload, home.as_deref()),
+    };
+    let Some((subject, what)) = subject else {
         // An event we did not register for, or one of ours missing its subject field. The
-        // first is benign (allow); the second, in Enforce, is a call we cannot judge.
-        let registered = CURSOR_EVENTS.contains(&event.as_str());
-        record(
-            json!({ "agent": "cursor", "event": "guard", "hookEvent": event, "cwd": cwd, "unhandled": true, "decision": if registered && reg.guard_cursor_mode == GuardMode::Enforce { "deny" } else { "allow" }, "mode": reg.guard_cursor_mode }),
-        );
-        return if registered {
-            cannot_judge(&reg, "the call had no command, path or tool to check")
-        } else {
-            allow_response()
+        // first is benign (no opinion); the second, in Enforce, is a call we cannot judge.
+        let registered = match agent {
+            Agent::Cursor => CURSOR_EVENTS.contains(&event.as_str()),
+            // Every other Claude Code tool (Edit, WebFetch, ...) is its own permission
+            // system's business, and recording each would flood the sensor log with rows
+            // that decide nothing.
+            Agent::ClaudeCode => event == CLAUDE_EVENT && claude_judgeable(&payload),
         };
+        if registered {
+            record(
+                json!({ "agent": agent.id(), "event": "guard", "hookEvent": event, "cwd": cwd, "unhandled": true, "decision": fallback, "mode": mode }),
+            );
+            return cannot_judge(
+                agent,
+                enforced,
+                "the call had no command, path or tool to check",
+            );
+        }
+        if agent == Agent::Cursor {
+            record(
+                json!({ "agent": agent.id(), "event": "guard", "hookEvent": event, "cwd": cwd, "unhandled": true, "decision": "allow", "mode": mode }),
+            );
+        }
+        return render(agent, Answer::NoOpinion);
     };
     let verdict = evaluate(&reg.agent_permission_rules, &subject);
-    let (tool, hash_src) = match &subject {
-        Subject::Shell(c) => ("Bash", (*c).to_string()),
-        Subject::Read { path, .. } => ("Read", (*path).to_string()),
-        Subject::Mcp { tool } => ("mcp", (*tool).to_string()),
+    let (tool, hash_src, request_tool, arguments) = match &subject {
+        Subject::Shell(c) => (
+            "Bash",
+            (*c).to_string(),
+            "Bash".to_string(),
+            json!({ "command": c }),
+        ),
+        Subject::Read { path, .. } => (
+            "Read",
+            (*path).to_string(),
+            "Read".to_string(),
+            json!({ "path": path }),
+        ),
+        Subject::Mcp { tool } => (
+            "mcp",
+            (*tool).to_string(),
+            format!("mcp__{tool}"),
+            payload
+                .get("tool_input")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+        ),
     };
-    let enforced = reg.guard_cursor_mode == GuardMode::Enforce;
-    let decision = match (enforced, verdict.action) {
-        (_, None) => "allow",
-        (true, Some(a)) => a.list_key(),
-        (false, Some(_)) => "allow",
-    };
-    record(json!({
-        "agent": "cursor",
+    let mut row = json!({
+        "agent": agent.id(),
         "event": "guard",
         "hookEvent": event,
         "cwd": cwd,
         "tool": tool,
         "argsHash": crate::audit::args_hash(&json!({ "subject": hash_src })),
-        "mode": reg.guard_cursor_mode,
+        "mode": mode,
         "wouldBe": verdict.action.map(|a| a.list_key()),
         "rule": verdict.rule,
-        "decision": decision,
-    }));
-    match (enforced, verdict.action) {
-        (true, Some(action)) => {
-            decision_response(action, verdict.rule.as_deref().unwrap_or("?"), &what)
+    });
+    let rule = verdict.rule.clone().unwrap_or_else(|| "?".to_string());
+    let answer = match (enforced, verdict.action) {
+        (true, Some(PermissionAction::Ask)) if agent.routes_asks(&reg) => {
+            // The person decides in Toolport's approval window; the agent waits. The
+            // arguments cross the loopback broker and are never written anywhere.
+            let request = ApprovalRequest {
+                token: String::new(),
+                id: crate::approval::new_correlation_id(),
+                client: Some(agent.label().to_string()),
+                server: agent.id().to_string(),
+                tool: request_tool,
+                reason: ApprovalReason::AgentPermission,
+                arguments,
+                tool_fingerprint: None,
+                url_elicitation: None,
+                pii_release: None,
+                agent_rule: Some(rule.clone()),
+            };
+            let approval_id = request.id.clone();
+            let decision = decide(request);
+            row["askVia"] = json!("toolport");
+            row["approval"] = json!({ "id": approval_id, "outcome": decision_token(decision) });
+            routed_answer(decision, &rule, &what)
         }
-        _ => allow_response(),
+        (true, Some(action)) => decision_answer(action, &rule, &what),
+        _ => Answer::NoOpinion,
+    };
+    row["decision"] = json!(answer.decision());
+    record(row);
+    render(agent, answer)
+}
+
+/// The broker's outcome as the sensor row names it, matching the gateway's audit rows.
+fn decision_token(decision: ApprovalDecision) -> &'static str {
+    match decision {
+        ApprovalDecision::Approved => "approved",
+        ApprovalDecision::Denied => "denied",
+        ApprovalDecision::Unreachable => "unreachable",
+        ApprovalDecision::StaleState => "stale_state",
+        ApprovalDecision::Timeout => "no_response",
     }
 }
 
@@ -659,7 +961,7 @@ fn record(mut row: Value) {
 }
 
 // ---------------------------------------------------------------------------
-// Install into ~/.cursor/hooks.json
+// Install: ~/.cursor/hooks.json and every Claude Code settings.json
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -675,10 +977,17 @@ pub struct GuardProfile {
 #[serde(rename_all = "camelCase")]
 pub struct GuardView {
     pub cursor_mode: GuardMode,
+    /// Cursor, enforcing: "ask first" goes to Toolport's approval window (SBS-1059).
+    pub cursor_ask_via_toolport: bool,
     /// Absent when Cursor's config directory cannot be resolved.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<GuardProfile>,
     pub events: Vec<String>,
+    /// The Claude Code `PreToolUse` guard, whose enforce mode owns the ask prompt.
+    pub claude_mode: GuardMode,
+    /// One row per Claude Code profile (`~/.claude/settings.json` and any
+    /// `CLAUDE_CONFIG_DIR` profile), like the sensor and the native policy.
+    pub claude: Vec<GuardProfile>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binary: Option<String>,
 }
@@ -697,8 +1006,8 @@ fn cursor_hooks_path() -> Option<PathBuf> {
     Some(dirs::home_dir()?.join(".cursor").join("hooks.json"))
 }
 
-fn guard_command(binary: &Path) -> String {
-    format!("\"{}\" {GUARD_MARKER} cursor", binary.display())
+fn guard_command(binary: &Path, agent: Agent) -> String {
+    format!("\"{}\" {GUARD_MARKER} {}", binary.display(), agent.id())
 }
 
 fn is_ours(entry: &Value) -> bool {
@@ -709,6 +1018,7 @@ fn is_ours(entry: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether a Cursor `hooks.json` carries the guard.
 pub fn is_installed(root: &Value) -> bool {
     root.get("hooks")
         .and_then(Value::as_object)
@@ -750,8 +1060,14 @@ pub fn strip_guard(root: &Value) -> Value {
 }
 
 /// `root` carrying exactly one guard entry per Cursor event. Strip-then-add, so idempotent
-/// and convergent across binary paths; `failClosed` only when enforcing.
-pub fn upsert_guard(root: &Value, binary: &Path, enforce: bool) -> Result<Value, String> {
+/// and convergent across binary paths; `failClosed` only when enforcing, and the timeout
+/// long enough for a person when asks are routed to Toolport.
+pub fn upsert_guard(
+    root: &Value,
+    binary: &Path,
+    enforce: bool,
+    timeout_secs: u64,
+) -> Result<Value, String> {
     let mut out = strip_guard(root);
     let obj = out
         .as_object_mut()
@@ -771,36 +1087,136 @@ pub fn upsert_guard(root: &Value, binary: &Path, enforce: bool) -> Result<Value,
             .as_array_mut()
             .ok_or_else(|| format!("`hooks.{event}` is present but is not an array"))?;
         list.push(json!({
-            "command": guard_command(binary),
-            "timeout": GUARD_TIMEOUT_SECS,
+            "command": guard_command(binary, Agent::Cursor),
+            "timeout": timeout_secs,
             "failClosed": enforce,
         }));
     }
     Ok(out)
 }
 
+/// Whether a Claude Code `settings.json` carries the guard. Claude Code's hooks are
+/// matcher groups holding entries, the sensor's shape ([`crate::hooks`]); the markers
+/// differ, so the sensor and the guard never strip each other.
+pub fn is_claude_installed(root: &Value) -> bool {
+    root.get("hooks")
+        .and_then(Value::as_object)
+        .map(|hooks| {
+            hooks.values().any(|groups| {
+                groups
+                    .as_array()
+                    .map(|groups| {
+                        groups.iter().any(|group| {
+                            group
+                                .get("hooks")
+                                .and_then(Value::as_array)
+                                .map(|entries| entries.iter().any(is_ours))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// `root` with every guard entry removed from a Claude Code settings file, per entry so a
+/// user's own hook in the same group survives, pruning only what this pass emptied.
+pub fn strip_claude_guard(root: &Value) -> Value {
+    let mut out = root.clone();
+    let Some(obj) = out.as_object_mut() else {
+        return out;
+    };
+    let Some(hooks) = obj.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return out;
+    };
+    let events: Vec<String> = hooks.keys().cloned().collect();
+    for event in events {
+        let Some(groups) = hooks.get_mut(&event).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        groups.retain_mut(|group| {
+            if let Some(entries) = group.get_mut("hooks").and_then(Value::as_array_mut) {
+                let before = entries.len();
+                entries.retain(|entry| !is_ours(entry));
+                return before == entries.len() || !entries.is_empty();
+            }
+            true
+        });
+        if groups.is_empty() {
+            hooks.remove(&event);
+        }
+    }
+    if hooks.is_empty() {
+        obj.remove("hooks");
+    }
+    out
+}
+
+/// `root` carrying exactly one guard group on `PreToolUse`, matched to the tools the
+/// guard judges. Strip-then-add, like the Cursor form.
+pub fn upsert_claude_guard(
+    root: &Value,
+    binary: &Path,
+    timeout_secs: u64,
+) -> Result<Value, String> {
+    let mut out = strip_claude_guard(root);
+    let obj = out
+        .as_object_mut()
+        .ok_or_else(|| "settings root is not a JSON object".to_string())?;
+    let hooks = obj
+        .entry("hooks".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let hooks = hooks
+        .as_object_mut()
+        .ok_or_else(|| "`hooks` is present but is not an object".to_string())?;
+    let groups = hooks
+        .entry(CLAUDE_EVENT.to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let groups = groups
+        .as_array_mut()
+        .ok_or_else(|| format!("`hooks.{CLAUDE_EVENT}` is present but is not an array"))?;
+    groups.push(json!({
+        "matcher": CLAUDE_GUARD_MATCHER,
+        "hooks": [{
+            "type": "command",
+            "command": guard_command(binary, Agent::ClaudeCode),
+            "timeout": timeout_secs,
+        }]
+    }));
+    Ok(out)
+}
+
 pub fn apply_on_startup() {
     let active = crate::registry::load()
-        .map(|reg| !reg.guard_cursor_mode.is_off() || !reg.guard_targets.is_empty())
+        .map(|reg| {
+            !reg.guard_cursor_mode.is_off()
+                || !reg.guard_claude_mode.is_off()
+                || !reg.guard_targets.is_empty()
+        })
         .unwrap_or(false);
     if !active {
         return;
     }
-    if let Err(error) = apply_with(None) {
+    if let Err(error) = apply_with(GuardChange::None) {
         crate::gatewaylog::append(&format!("toolport: guard startup apply failed: {error}"));
     }
 }
 
 pub fn view() -> GuardView {
     let reg = crate::registry::load().unwrap_or_default();
-    view_with(&reg, cursor_hooks_path().as_deref())
+    view_with(
+        &reg,
+        cursor_hooks_path().as_deref(),
+        &crate::clients::claude_settings_paths(),
+    )
 }
 
-fn view_with(reg: &crate::registry::Registry, cursor: Option<&Path>) -> GuardView {
-    let cursor = cursor.map(|path| match crate::clients::read_settings_json(path) {
+fn profile_at(path: &Path, installed: impl Fn(&Value) -> bool) -> GuardProfile {
+    match crate::clients::read_settings_json(path) {
         Ok((root, _)) => GuardProfile {
             path: path.display().to_string(),
-            installed: is_installed(&root),
+            installed: installed(&root),
             error: None,
         },
         Err(error) => GuardProfile {
@@ -808,18 +1224,60 @@ fn view_with(reg: &crate::registry::Registry, cursor: Option<&Path>) -> GuardVie
             installed: false,
             error: Some(error),
         },
-    });
+    }
+}
+
+fn view_with(
+    reg: &crate::registry::Registry,
+    cursor: Option<&Path>,
+    claude: &[PathBuf],
+) -> GuardView {
     GuardView {
         cursor_mode: reg.guard_cursor_mode,
-        cursor,
+        cursor_ask_via_toolport: reg.guard_cursor_ask_via_toolport,
+        cursor: cursor.map(|path| profile_at(path, is_installed)),
         events: CURSOR_EVENTS.iter().map(|e| (*e).to_string()).collect(),
+        claude_mode: reg.guard_claude_mode,
+        claude: claude
+            .iter()
+            .map(|path| profile_at(path, is_claude_installed))
+            .collect(),
         binary: crate::clients::resolve_gateway_path_readonly().map(|p| p.display().to_string()),
     }
 }
 
+/// One setting change, applied together with the files it affects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuardChange {
+    None,
+    CursorMode(GuardMode),
+    CursorAskViaToolport(bool),
+    ClaudeMode(GuardMode),
+}
+
 /// Set Cursor's mode and make the file match, in one transaction.
 pub fn set_cursor_mode(mode: GuardMode) -> Result<GuardView, String> {
-    report(apply_with(Some(mode))?)?;
+    report(apply_with(GuardChange::CursorMode(mode))?)?;
+    Ok(view())
+}
+
+/// Route Cursor's enforced asks through Toolport's approval window (or back to Cursor's
+/// prompt). The hook is rewritten because its timeout depends on this.
+pub fn set_cursor_ask_via_toolport(enabled: bool) -> Result<GuardView, String> {
+    report(apply_with(GuardChange::CursorAskViaToolport(enabled))?)?;
+    Ok(view())
+}
+
+/// Set the Claude Code guard's mode, write the hook into every profile, and then re-apply
+/// the native policy: enforcing moves the judged ask rules out of `settings.json` and
+/// anything else puts them back ([`crate::agent_permissions::rules_to_write`]).
+pub fn set_claude_mode(mode: GuardMode) -> Result<GuardView, String> {
+    report(apply_with(GuardChange::ClaudeMode(mode))?)?;
+    if let Err(error) = crate::agent_permissions::apply() {
+        return Err(format!(
+            "The guard was applied, but the Claude Code permission rules could not be updated to match: {error}"
+        ));
+    }
     Ok(view())
 }
 
@@ -832,59 +1290,101 @@ fn report(profiles: Vec<GuardProfile>) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "The mode was saved, but the hooks file could not be updated: {}",
+            "The setting was saved, but a hooks file could not be updated: {}",
             failed.join("; ")
         ))
     }
 }
 
-fn apply_with(set_mode: Option<GuardMode>) -> Result<Vec<GuardProfile>, String> {
-    apply_to(set_mode, cursor_hooks_path().as_deref(), &|| {
-        crate::clients::resolve_gateway_path().filter(|p| p.is_file())
-    })
+fn apply_with(change: GuardChange) -> Result<Vec<GuardProfile>, String> {
+    apply_to(
+        change,
+        cursor_hooks_path().as_deref(),
+        &crate::clients::claude_settings_paths(),
+        &|| crate::clients::resolve_gateway_path().filter(|p| p.is_file()),
+    )
+}
+
+/// One wanted hooks file: where, how to write it, and how to tell it is there.
+struct Want {
+    path: PathBuf,
+    agent: Agent,
+    enforce: bool,
+    timeout_secs: u64,
 }
 
 fn apply_to(
-    set_mode: Option<GuardMode>,
+    change: GuardChange,
     cursor: Option<&Path>,
+    claude: &[PathBuf],
     resolve_binary: &dyn Fn() -> Option<PathBuf>,
 ) -> Result<Vec<GuardProfile>, String> {
     let (_, statuses) = crate::registry::update_authoritative(|reg| {
-        if let Some(mode) = set_mode {
-            reg.guard_cursor_mode = mode;
+        match change {
+            GuardChange::None => {}
+            GuardChange::CursorMode(mode) => reg.guard_cursor_mode = mode,
+            GuardChange::CursorAskViaToolport(enabled) => {
+                reg.guard_cursor_ask_via_toolport = enabled
+            }
+            GuardChange::ClaudeMode(mode) => reg.guard_claude_mode = mode,
+        }
+        let mut wants: Vec<Want> = Vec::new();
+        if let (mode, Some(path)) = (reg.guard_cursor_mode, cursor) {
+            if !mode.is_off() {
+                wants.push(Want {
+                    path: path.to_path_buf(),
+                    agent: Agent::Cursor,
+                    enforce: mode == GuardMode::Enforce,
+                    timeout_secs: Agent::Cursor.hook_timeout(reg),
+                });
+            }
+        }
+        if !reg.guard_claude_mode.is_off() {
+            for path in claude {
+                wants.push(Want {
+                    path: path.clone(),
+                    agent: Agent::ClaudeCode,
+                    enforce: reg.guard_claude_mode == GuardMode::Enforce,
+                    timeout_secs: Agent::ClaudeCode.hook_timeout(reg),
+                });
+            }
         }
         let mut statuses = Vec::new();
         let mut targets: Vec<String> = Vec::new();
-        let want = match (reg.guard_cursor_mode, cursor) {
-            (GuardMode::Off, _) | (_, None) => None,
-            (mode, Some(path)) => Some((path.to_path_buf(), mode == GuardMode::Enforce)),
-        };
-        if let Some((path, enforce)) = &want {
+        if !wants.is_empty() {
             let binary = resolve_binary()
                 .ok_or_else(|| "no gateway binary is available to run as a hook".to_string())?;
-            let key = path.display().to_string();
-            match install_at(path, &binary, *enforce) {
-                Ok(()) => {
-                    targets.push(key.clone());
-                    statuses.push(GuardProfile {
-                        path: key,
-                        installed: true,
-                        error: None,
-                    });
-                }
-                Err(error) => {
-                    if reg.guard_targets.contains(&key) {
-                        targets.push(key.clone());
+            for want in &wants {
+                let key = want.path.display().to_string();
+                let written = match want.agent {
+                    Agent::Cursor => {
+                        install_at(&want.path, &binary, want.enforce, want.timeout_secs)
                     }
-                    statuses.push(GuardProfile {
-                        path: key,
-                        installed: false,
-                        error: Some(error),
-                    });
+                    Agent::ClaudeCode => install_claude_at(&want.path, &binary, want.timeout_secs),
+                };
+                match written {
+                    Ok(()) => {
+                        targets.push(key.clone());
+                        statuses.push(GuardProfile {
+                            path: key,
+                            installed: true,
+                            error: None,
+                        });
+                    }
+                    Err(error) => {
+                        if reg.guard_targets.contains(&key) {
+                            targets.push(key.clone());
+                        }
+                        statuses.push(GuardProfile {
+                            path: key,
+                            installed: false,
+                            error: Some(error),
+                        });
+                    }
                 }
             }
         }
-        let wanted: Vec<String> = want.iter().map(|(p, _)| p.display().to_string()).collect();
+        let wanted: Vec<String> = wants.iter().map(|w| w.path.display().to_string()).collect();
         for stale in reg.guard_targets.iter().filter(|t| !wanted.contains(t)) {
             if let Err(error) = remove_at(Path::new(stale)) {
                 targets.push(stale.clone());
@@ -901,15 +1401,33 @@ fn apply_to(
     Ok(statuses)
 }
 
-fn install_at(path: &Path, binary: &Path, enforce: bool) -> Result<(), String> {
+fn install_at(path: &Path, binary: &Path, enforce: bool, timeout_secs: u64) -> Result<(), String> {
     let (root, original) = crate::clients::read_settings_json(path)?;
-    let updated = upsert_guard(&root, binary, enforce)?;
+    let updated = upsert_guard(&root, binary, enforce, timeout_secs)?;
     if updated.get("hooks") == root.get("hooks") {
         return Ok(());
     }
     crate::clients::write_settings_key_for("cursor", path, original.as_deref(), &updated, "hooks")
 }
 
+fn install_claude_at(path: &Path, binary: &Path, timeout_secs: u64) -> Result<(), String> {
+    let (root, original) = crate::clients::read_settings_json(path)?;
+    let updated = upsert_claude_guard(&root, binary, timeout_secs)?;
+    if updated == root {
+        return Ok(());
+    }
+    crate::clients::write_settings_json(path, original.as_deref(), &updated)
+}
+
+/// Which file shape a recorded target has: Cursor's `hooks.json` is flat per event; a
+/// Claude Code `settings.json` holds matcher groups.
+fn is_cursor_file(path: &Path) -> bool {
+    path.file_name().and_then(|n| n.to_str()) == Some("hooks.json")
+}
+
+/// Remove the guard from one file. A file that is gone is success (its profile was
+/// deleted); one that cannot be parsed is not - refusing loudly beats rewriting a file
+/// we do not understand.
 fn remove_at(path: &Path) -> Result<(), String> {
     let (root, original) = match crate::clients::read_settings_json(path) {
         Ok(pair) => pair,
@@ -923,14 +1441,28 @@ fn remove_at(path: &Path) -> Result<(), String> {
     if original.is_none() {
         return Ok(());
     }
-    let stripped = strip_guard(&root);
-    if stripped == root {
-        return Ok(());
+    if is_cursor_file(path) {
+        let stripped = strip_guard(&root);
+        if stripped.get("hooks") == root.get("hooks") {
+            return Ok(());
+        }
+        crate::clients::write_settings_key_for(
+            "cursor",
+            path,
+            original.as_deref(),
+            &stripped,
+            "hooks",
+        )
+    } else {
+        let stripped = strip_claude_guard(&root);
+        if stripped == root {
+            return Ok(());
+        }
+        crate::clients::write_settings_json(path, original.as_deref(), &stripped)
     }
-    crate::clients::write_settings_key_for("cursor", path, original.as_deref(), &stripped, "hooks")
 }
 
-/// The bytes `~/.cursor/hooks.json` would hold in `mode` (Off = with the guard removed).
+/// The exact bytes a Cursor mode change would write. Writes nothing.
 pub fn preview(mode: GuardMode) -> Result<Option<GuardPreview>, String> {
     let Some(path) = cursor_hooks_path() else {
         return Ok(None);
@@ -938,18 +1470,61 @@ pub fn preview(mode: GuardMode) -> Result<Option<GuardPreview>, String> {
     let binary = crate::clients::resolve_gateway_path_readonly().ok_or_else(|| {
         "no gateway binary has been published yet, so there is nothing to preview".to_string()
     })?;
-    Ok(Some(preview_at(&path, &binary, mode)))
+    let reg = crate::registry::load().unwrap_or_default();
+    let timeout = if mode == GuardMode::Enforce && reg.guard_cursor_ask_via_toolport {
+        GUARD_ASK_TIMEOUT_SECS
+    } else {
+        GUARD_TIMEOUT_SECS
+    };
+    Ok(Some(preview_at(&path, &binary, mode, timeout)))
 }
 
-fn preview_at(path: &Path, binary: &Path, mode: GuardMode) -> GuardPreview {
+fn preview_at(path: &Path, binary: &Path, mode: GuardMode, timeout_secs: u64) -> GuardPreview {
     let rendered = crate::clients::read_settings_json(path).and_then(|(root, original)| {
         let updated = match mode {
             GuardMode::Off => strip_guard(&root),
-            m => upsert_guard(&root, binary, m == GuardMode::Enforce)?,
+            m => upsert_guard(&root, binary, m == GuardMode::Enforce, timeout_secs)?,
         };
         let after = crate::clients::render_settings_key(original.as_deref(), &updated, "hooks")?;
         Ok((original.unwrap_or_default(), after))
     });
+    preview_result(path, rendered)
+}
+
+/// The exact bytes a Claude Code mode change would write, per profile. Writes nothing.
+pub fn preview_claude(mode: GuardMode) -> Result<Vec<GuardPreview>, String> {
+    let binary = crate::clients::resolve_gateway_path_readonly().ok_or_else(|| {
+        "no gateway binary has been published yet, so there is nothing to preview".to_string()
+    })?;
+    let timeout = if mode == GuardMode::Enforce {
+        GUARD_ASK_TIMEOUT_SECS
+    } else {
+        GUARD_TIMEOUT_SECS
+    };
+    Ok(crate::clients::claude_settings_paths()
+        .iter()
+        .map(|path| preview_claude_at(path, &binary, mode, timeout))
+        .collect())
+}
+
+fn preview_claude_at(
+    path: &Path,
+    binary: &Path,
+    mode: GuardMode,
+    timeout_secs: u64,
+) -> GuardPreview {
+    let rendered = crate::clients::read_settings_json(path).and_then(|(root, original)| {
+        let updated = match mode {
+            GuardMode::Off => strip_claude_guard(&root),
+            _ => upsert_claude_guard(&root, binary, timeout_secs)?,
+        };
+        let after = crate::clients::render_settings_json(original.as_deref(), &updated)?;
+        Ok((original.unwrap_or_default(), after))
+    });
+    preview_result(path, rendered)
+}
+
+fn preview_result(path: &Path, rendered: Result<(String, String), String>) -> GuardPreview {
     match rendered {
         Ok((before, after)) => GuardPreview {
             path: path.display().to_string(),
@@ -970,6 +1545,11 @@ fn preview_at(path: &Path, binary: &Path, mode: GuardMode) -> GuardPreview {
 mod tests {
     use super::*;
     use PermissionAction::{Allow, Ask, Deny};
+
+    /// Render a decision the way Cursor reads it, for the shape assertions below.
+    fn decision_response(decision: PermissionAction, rule: &str, what: &str) -> Value {
+        render(Agent::Cursor, decision_answer(decision, rule, what))
+    }
 
     fn rule(p: &str, a: PermissionAction) -> PermissionRule {
         PermissionRule {
@@ -1157,7 +1737,10 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Do not retry"));
-        assert_eq!(registry_unavailable("test failure")["permission"], "deny");
+        assert_eq!(
+            registry_unavailable(Agent::Cursor, "test failure")["permission"],
+            "deny"
+        );
         let r = decision_response(Ask, "Bash(git push*)", "x");
         assert_eq!(r["permission"], "ask");
         assert_eq!(decision_response(Allow, "x", "y"), allow_response());
@@ -1169,16 +1752,8 @@ mod tests {
 
     #[test]
     fn unjudgeable_input_is_denied_only_when_enforcing() {
-        let enforce = crate::registry::Registry {
-            guard_cursor_mode: GuardMode::Enforce,
-            ..Default::default()
-        };
-        let observe = crate::registry::Registry {
-            guard_cursor_mode: GuardMode::Observe,
-            ..Default::default()
-        };
-        assert_eq!(cannot_judge(&enforce, "x")["permission"], "deny");
-        assert_eq!(cannot_judge(&observe, "x"), allow_response());
+        assert_eq!(cannot_judge(Agent::Cursor, true, "x")["permission"], "deny");
+        assert_eq!(cannot_judge(Agent::Cursor, false, "x"), allow_response());
         // A BOM-prefixed payload parses once the BOM is stripped.
         let bom = "\u{FEFF}{\"hook_event_name\":\"beforeShellExecution\",\"command\":\"ls\"}";
         assert!(serde_json::from_str::<Value>(bom).is_err());
@@ -1221,7 +1796,7 @@ mod tests {
             "hooks": { "beforeShellExecution": [{ "command": "./my-own.sh" }], "stop": [{ "command": "./done.sh" }] }
         });
         let bin = Path::new("/opt/toolport/toolport-gateway");
-        let with = upsert_guard(&theirs, bin, true).unwrap();
+        let with = upsert_guard(&theirs, bin, true, GUARD_ASK_TIMEOUT_SECS).unwrap();
         assert!(is_installed(&with));
         assert!(!is_installed(&theirs));
         let shell = with["hooks"]["beforeShellExecution"].as_array().unwrap();
@@ -1242,12 +1817,16 @@ mod tests {
         assert_eq!(with["hooks"]["beforeReadFile"].as_array().unwrap().len(), 1);
         assert_eq!(with["hooks"]["stop"], theirs["hooks"]["stop"]);
         // Idempotent, and re-upserting with observe flips only failClosed.
-        assert_eq!(upsert_guard(&with, bin, true).unwrap(), with);
-        let observe = upsert_guard(&with, bin, false).unwrap();
+        assert_eq!(
+            upsert_guard(&with, bin, true, GUARD_ASK_TIMEOUT_SECS).unwrap(),
+            with
+        );
+        let observe = upsert_guard(&with, bin, false, GUARD_ASK_TIMEOUT_SECS).unwrap();
         assert_eq!(observe["hooks"]["beforeReadFile"][0]["failClosed"], false);
         // Strip gives theirs back, pruning only the lists we created.
         assert_eq!(strip_guard(&with), theirs);
-        let fresh = upsert_guard(&serde_json::json!({}), bin, false).unwrap();
+        let fresh =
+            upsert_guard(&serde_json::json!({}), bin, false, GUARD_ASK_TIMEOUT_SECS).unwrap();
         assert_eq!(fresh["version"], 1);
         assert_eq!(
             strip_guard(&fresh),
@@ -1271,13 +1850,19 @@ mod tests {
         let resolve = || Some(bin.clone());
 
         // Off: nothing written.
-        apply_to(None, Some(&hooks), &resolve).unwrap();
+        apply_to(GuardChange::None, Some(&hooks), &[], &resolve).unwrap();
         assert!(!std::fs::read_to_string(&hooks)
             .unwrap()
             .contains("toolport-guard"));
 
         // Observe: installed, failClosed false, user's hook kept and formatting too.
-        let st = apply_to(Some(GuardMode::Observe), Some(&hooks), &resolve).unwrap();
+        let st = apply_to(
+            GuardChange::CursorMode(GuardMode::Observe),
+            Some(&hooks),
+            &[],
+            &resolve,
+        )
+        .unwrap();
         assert!(st[0].installed && st[0].error.is_none(), "{st:?}");
         let text = std::fs::read_to_string(&hooks).unwrap();
         assert!(
@@ -1288,10 +1873,16 @@ mod tests {
         );
         let reg = crate::registry::load().unwrap();
         assert_eq!(reg.guard_targets, vec![hooks.display().to_string()]);
-        assert!(view_with(&reg, Some(&hooks)).cursor.unwrap().installed);
+        assert!(view_with(&reg, Some(&hooks), &[]).cursor.unwrap().installed);
 
         // Enforce: same entries, failClosed true.
-        apply_to(Some(GuardMode::Enforce), Some(&hooks), &resolve).unwrap();
+        apply_to(
+            GuardChange::CursorMode(GuardMode::Enforce),
+            Some(&hooks),
+            &[],
+            &resolve,
+        )
+        .unwrap();
         let text = std::fs::read_to_string(&hooks).unwrap();
         assert!(
             text.contains("\"failClosed\": true") && !text.contains("\"failClosed\": false"),
@@ -1300,13 +1891,19 @@ mod tests {
 
         // A hand-removed entry comes back at startup reconcile.
         std::fs::write(&hooks, "{\n  \"version\": 1,\n  \"hooks\": { \"stop\": [{ \"command\": \"./done.sh\" }] }\n}\n").unwrap();
-        apply_to(None, Some(&hooks), &resolve).unwrap();
+        apply_to(GuardChange::None, Some(&hooks), &[], &resolve).unwrap();
         assert!(std::fs::read_to_string(&hooks)
             .unwrap()
             .contains("toolport-guard"));
 
         // Off: exactly ours leaves; the user's stop hook and version stay.
-        apply_to(Some(GuardMode::Off), Some(&hooks), &resolve).unwrap();
+        apply_to(
+            GuardChange::CursorMode(GuardMode::Off),
+            Some(&hooks),
+            &[],
+            &resolve,
+        )
+        .unwrap();
         let text = std::fs::read_to_string(&hooks).unwrap();
         assert!(
             !text.contains("toolport-guard")

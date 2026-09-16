@@ -274,6 +274,29 @@ pub fn is_applied(root: &Value, rules: &[PermissionRule]) -> bool {
     rules.iter().all(|r| contains(root, r))
 }
 
+/// The rules to write natively, given the policy and the Claude Code guard's mode.
+///
+/// With the guard enforcing, the "ask first" rules it can judge (shell commands, file
+/// reads, MCP tools) stay OUT of `settings.json`: Claude Code applies its own ask rules
+/// before any hook runs, so leaving them in would keep its prompt in front of Toolport's
+/// (SBS-1059). Every deny and allow, and any ask rule the guard has no event for (`Edit`,
+/// `WebFetch`), is written exactly as before, so nothing stops being enforced.
+pub(crate) fn rules_to_write(
+    reg: &crate::registry::Registry,
+    rules: &[PermissionRule],
+) -> Vec<PermissionRule> {
+    if reg.guard_claude_mode != crate::registry::GuardMode::Enforce {
+        return rules.to_vec();
+    }
+    rules
+        .iter()
+        .filter(|r| {
+            !(r.action == PermissionAction::Ask && crate::agent_guard::judges_pattern(&r.pattern))
+        })
+        .cloned()
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Apply / view / preview
 // ---------------------------------------------------------------------------
@@ -313,6 +336,7 @@ fn view_with(reg: &crate::registry::Registry, profiles: &[PathBuf]) -> Permissio
                 .cloned()
                 .unwrap_or_default();
             let added = recorded.len();
+            let wanted = rules_to_write(reg, &reg.agent_permission_rules);
             match crate::clients::read_settings_json(path) {
                 Ok((root, _)) => {
                     // A rule we added that the policy no longer has, still on disk, is a
@@ -320,10 +344,10 @@ fn view_with(reg: &crate::registry::Registry, profiles: &[PathBuf]) -> Permissio
                     // Applied just because the surviving rules are present.
                     let leftover = recorded
                         .iter()
-                        .any(|r| !reg.agent_permission_rules.contains(r) && contains(&root, r));
+                        .any(|r| !wanted.contains(r) && contains(&root, r));
                     let state = if reg.agent_permissions_enabled {
                         // An empty policy is trivially applied.
-                        if is_applied(&root, &reg.agent_permission_rules) && !leftover {
+                        if is_applied(&root, &wanted) && !leftover {
                             "applied"
                         } else {
                             "stale"
@@ -428,7 +452,7 @@ fn apply_to(
         if let Some(rules) = set_rules {
             reg.agent_permission_rules = rules;
         }
-        let rules = reg.agent_permission_rules.clone();
+        let rules = rules_to_write(reg, &reg.agent_permission_rules);
         let candidates: Vec<String> = if reg.agent_permissions_enabled {
             profiles.iter().map(|p| p.display().to_string()).collect()
         } else {
@@ -536,6 +560,7 @@ pub fn preview(rules: Option<Vec<PermissionRule>>) -> Result<Vec<PermissionsPrev
     let reg = crate::registry::load()?;
     let rules = rules.unwrap_or_else(|| reg.agent_permission_rules.clone());
     validate_rules(&rules)?;
+    let rules = rules_to_write(&reg, &rules);
     Ok(preview_to(
         &reg,
         &rules,
