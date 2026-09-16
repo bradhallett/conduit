@@ -98,7 +98,14 @@ impl<V> SessionStore<V> {
         if !self.entries.contains_key(key) {
             self.insert(key, make());
         }
-        self.with(key, f).expect("the entry was just inserted")
+        // Read the entry directly rather than through `with`: a zero TTL would make
+        // the entry look expired the instant it was inserted and panic the expect.
+        let entry = self
+            .entries
+            .get_mut(key)
+            .expect("the entry exists after insertion");
+        entry.last_seen = Instant::now();
+        f(&mut entry.value)
     }
 
     /// Read the entry for `key` without refreshing its TTL.
@@ -216,6 +223,15 @@ mod tests {
         assert_eq!(store.remove("session-a"), Some(7));
         assert_eq!(store.remove("session-a"), None);
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn get_or_insert_with_does_not_panic_with_a_zero_ttl() {
+        let mut store: SessionStore<i32> = SessionStore::new(Duration::ZERO, 8);
+        assert_eq!(
+            store.get_or_insert_with("session-a", || 1, |value| *value),
+            1
+        );
     }
 
     #[test]
