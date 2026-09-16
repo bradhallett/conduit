@@ -10,11 +10,19 @@
 //! back to. A transport failure becomes a JSON-RPC error to the client, and the
 //! default stdio role stays the existing in-process gateway (the rollback is the
 //! flag, not a code path).
+//!
+//! Requests run on bounded worker threads, so a client that pipelines a slow call
+//! and a fast one is answered in completion order rather than arrival order. The
+//! first request runs inline, so `initialize` establishes the session before
+//! anything can reference it. Notifications stay on the reader thread, which keeps
+//! a cancellation ahead of whatever is queued behind it (MCP cancellation is
+//! best-effort, so one that loses the race simply does not apply).
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::daemon::{DaemonDescriptor, Rendezvous};
 use crate::registry;
@@ -32,6 +40,15 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const LISTEN_POLL: Duration = Duration::from_millis(100);
 /// Backoff between listen-stream reconnects.
 const LISTEN_RECONNECT: Duration = Duration::from_millis(500);
+/// How many requests may be in flight against the daemon at once. Matches the
+/// in-process gateway's stdio worker cap. Past it the reader runs the request on
+/// its own thread rather than waiting for a worker, so the reader can never be
+/// held off stdin by a worker that is itself waiting on something the reader has
+/// to carry (an elicitation answer, a cancellation).
+const MAX_INFLIGHT: usize = 256;
+/// On client EOF, how long to let in-flight requests finish before the session is
+/// deleted. The client is already gone, so this is a courtesy rather than a wait.
+const EOF_GRACE: Duration = Duration::from_secs(5);
 
 /// Whether the command line asked for the adapter role. Kept beside the flag so
 /// the help text and the parser cannot disagree.
@@ -195,12 +212,125 @@ fn response_frames(response: ureq::Response) -> Result<Vec<String>, String> {
         .collect())
 }
 
-/// Read from stdin and proxy to the daemon until EOF. Each message is sent
-/// synchronously; a failed send becomes a JSON-RPC error for that request rather
-/// than a silent drop or a fallback.
+/// Releases one slot on drop, so the live count falls even if a worker panics.
+struct InflightGuard(Arc<AtomicUsize>);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Claim one slot below `limit`, or `None` when the cap is already reached.
+fn try_acquire_inflight(inflight: &Arc<AtomicUsize>, limit: usize) -> Option<InflightGuard> {
+    let mut current = inflight.load(Ordering::Relaxed);
+    loop {
+        if current >= limit {
+            return None;
+        }
+        match inflight.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Some(InflightGuard(Arc::clone(inflight))),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// Runs one exchange per worker thread, bounded, so a slow call cannot stall the
+/// reader. Past the cap the reader runs the exchange itself rather than waiting on
+/// a worker, because the reader is the only path a server-initiated answer or a
+/// cancellation can take back to the daemon. The job is a closure rather than a
+/// `Session` method so the dispatch and bounding can be tested without a daemon.
+struct Dispatcher {
+    run: Arc<dyn Fn(String) + Send + Sync>,
+    inflight: Arc<AtomicUsize>,
+    workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    limit: usize,
+}
+
+impl Dispatcher {
+    fn new(run: Arc<dyn Fn(String) + Send + Sync>, limit: usize) -> Self {
+        Self {
+            run,
+            inflight: Arc::new(AtomicUsize::new(0)),
+            workers: Mutex::new(Vec::new()),
+            limit,
+        }
+    }
+
+    /// Join the workers that have finished, so their resources are reclaimed.
+    fn reap(&self) {
+        if let Ok(mut workers) = self.workers.lock() {
+            let mut index = 0;
+            while index < workers.len() {
+                if workers[index].is_finished() {
+                    let handle = workers.swap_remove(index);
+                    let _ = handle.join();
+                } else {
+                    index += 1;
+                }
+            }
+        }
+    }
+
+    /// Send one request on a worker thread, or inline when the pool is full.
+    fn dispatch(&self, body: String) {
+        self.reap();
+        match try_acquire_inflight(&self.inflight, self.limit) {
+            Some(guard) => {
+                let run = Arc::clone(&self.run);
+                let handle = std::thread::spawn(move || {
+                    let _guard = guard;
+                    run(body);
+                });
+                if let Ok(mut workers) = self.workers.lock() {
+                    workers.push(handle);
+                }
+            }
+            // At the cap. Running inline keeps the reader moving and, unlike a
+            // blocking join, cannot wait on a worker that needs the reader.
+            None => (self.run)(body),
+        }
+    }
+
+    /// Let in-flight work settle for `grace`, then stop waiting. Anything still
+    /// running is abandoned to process exit: the client has already gone away.
+    fn drain(&self, grace: Duration) {
+        let deadline = Instant::now() + grace;
+        while self.inflight.load(Ordering::Relaxed) > 0 && Instant::now() < deadline {
+            self.reap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        self.reap();
+    }
+}
+
+/// Read from stdin and proxy to the daemon until EOF. A request runs on a worker
+/// so a slow call does not hold up the ones behind it, except the first request,
+/// which runs inline so `initialize` establishes the session id before anything
+/// can reference it. A notification always runs inline, keeping its order against
+/// the requests around it. A failed exchange becomes a JSON-RPC error for that
+/// request rather than a silent drop or a fallback.
 fn proxy_stdio(descriptor: &DaemonDescriptor) -> Result<(), String> {
     let session = Arc::new(Session::new(descriptor));
     spawn_listen_stream(Arc::clone(&session));
+
+    let dispatcher = Dispatcher::new(
+        {
+            let session = Arc::clone(&session);
+            Arc::new(move |body: String| {
+                let request = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+                if let Err(error) = session.exchange(&body) {
+                    report_request_error(&session, &request, &error);
+                }
+            })
+        },
+        MAX_INFLIGHT,
+    );
 
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
@@ -228,10 +358,14 @@ fn proxy_stdio(descriptor: &DaemonDescriptor) -> Result<(), String> {
                 continue;
             }
         };
-        if let Err(error) = session.exchange(trimmed) {
+        let is_request = request.get("id").map(|id| !id.is_null()).unwrap_or(false);
+        if is_request && session.session_id().is_some() {
+            dispatcher.dispatch(trimmed.to_string());
+        } else if let Err(error) = session.exchange(trimmed) {
             report_request_error(&session, &request, &error);
         }
     }
+    dispatcher.drain(EOF_GRACE);
     session.close();
     Ok(())
 }
@@ -283,6 +417,10 @@ fn spawn_listen_stream(session: Arc<Session>) {
                         }
                     }
                 }
+                // The stream ended without an error (a clean drop or a server
+                // close). Pause before reconnecting so a server that keeps closing
+                // immediately cannot be connected to in a tight loop.
+                std::thread::sleep(LISTEN_RECONNECT);
             }
             Err(_) => std::thread::sleep(LISTEN_RECONNECT),
         }
@@ -394,5 +532,111 @@ mod tests {
             read_bounded_line(&mut reader, 4).unwrap(),
             Some(ClientFrame::Line("ok".to_string()))
         );
+    }
+
+    use std::sync::Condvar;
+
+    /// Build a dispatcher whose jobs record into `completed`, with `slow` blocking
+    /// until `release` is set.
+    fn blocking_dispatcher(
+        release: Arc<(Mutex<bool>, Condvar)>,
+        completed: Arc<Mutex<Vec<String>>>,
+        started: std::sync::mpsc::Sender<String>,
+    ) -> Dispatcher {
+        Dispatcher::new(
+            Arc::new(move |body: String| {
+                if body == "slow" {
+                    let _ = started.send(body.clone());
+                    let (lock, cvar) = &*release;
+                    let mut go = lock.lock().unwrap();
+                    while !*go {
+                        go = cvar.wait(go).unwrap();
+                    }
+                }
+                completed.lock().unwrap().push(body);
+            }),
+            4,
+        )
+    }
+
+    #[test]
+    fn a_slow_exchange_does_not_block_the_next_dispatch() {
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let dispatcher =
+            blocking_dispatcher(Arc::clone(&release), Arc::clone(&completed), started_tx);
+
+        dispatcher.dispatch("slow".to_string());
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the slow job started");
+
+        dispatcher.dispatch("fast".to_string());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !completed.lock().unwrap().iter().any(|body| body == "fast") {
+            assert!(
+                Instant::now() < deadline,
+                "the fast job never completed while the slow one was held"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        {
+            let (lock, cvar) = &*release;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        dispatcher.drain(Duration::from_secs(5));
+        let done = completed.lock().unwrap().clone();
+        assert!(done.contains(&"slow".to_string()), "{done:?}");
+        assert!(done.contains(&"fast".to_string()), "{done:?}");
+    }
+
+    #[test]
+    fn dispatch_runs_inline_at_the_cap_instead_of_waiting_on_a_worker() {
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let second_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let dispatcher = Dispatcher::new(
+            {
+                let release = Arc::clone(&release);
+                let second_ran = Arc::clone(&second_ran);
+                Arc::new(move |body: String| {
+                    if body == "first" {
+                        let _ = started_tx.send(body.clone());
+                        let (lock, cvar) = &*release;
+                        let mut go = lock.lock().unwrap();
+                        while !*go {
+                            go = cvar.wait(go).unwrap();
+                        }
+                    } else {
+                        second_ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                })
+            },
+            1,
+        );
+
+        dispatcher.dispatch("first".to_string());
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first job started");
+
+        // The cap is 1 and the worker is held, so `second` runs inline on this
+        // thread. dispatch must return once it has run rather than waiting on the
+        // held worker; a blocking join here would hang this test.
+        dispatcher.dispatch("second".to_string());
+        assert!(
+            second_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the over-cap request did not run inline"
+        );
+
+        {
+            let (lock, cvar) = &*release;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        dispatcher.drain(Duration::from_secs(5));
     }
 }
