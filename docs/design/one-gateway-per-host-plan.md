@@ -27,16 +27,20 @@ Landed:
   (`reap_stale_mcp_sessions`) predates this work.
 - P1.2 first increment: `session_store::SessionStore` (#894), a TTL and cap store for the
   session-scoped maps, as a tested module with nothing wired to it yet.
+- P1.2 maps and owner: the PII pseudonym map, shaped-result cursors, and modern HITL
+  approvals moved off their ad-hoc process globals onto `SessionStore`, and a
+  `SessionState` owner now holds the PII and HITL tables (the shaped stash is owned by
+  `shaping`). Behavior is unchanged; the tables are now TTL- and cap-bounded, with
+  reap-on-close and cap tests.
 
 Still open:
 
-- P1.2 proper: introduce `SessionState`, move the PII map, shaped-result cursors, and
-  modern HITL approvals onto `SessionStore`, and unify `McpSession`/`StdioUpstream`. This
-  is the next slice and the largest one; it rewires security-sensitive state.
+- P1.2 unification: thread `SessionState` through the request path, then unify
+  `McpSession`/`StdioUpstream` onto it, deleting `StdioUpstream` as a separate concept.
+  This is the next slice and the largest one; it rewires security-sensitive state.
 - P1.3 `HostState`. `GatewayState` still mixes host and session state.
 - A set of process globals still encode one-stdio-client assumptions (discovery/code mode,
-  stdio presence and era, progress routes, PII maps, modern HITL approvals, result stash,
-  `SearchGuard`/`ConfirmGuard`).
+  stdio presence and era, progress routes, `SearchGuard`/`ConfirmGuard`).
 - No `HostState`, `SessionState`, or `RequestContext` type, and no topology feature flag in
   the registry.
 - The adapter has not been dogfooded against a real client (P4.1).
@@ -48,19 +52,19 @@ Still open:
 
 ## Delivery shape
 
-| PR  | Slice                                                               | Behavior change           | Status                         |
-| --- | ------------------------------------------------------------------- | ------------------------- | ------------------------------ |
-| 1   | P2.1 rendezvous primitives (library module, tested)                 | none (new module only)    | landed (#880)                  |
-| 2   | P2.2a identity role; P2.2b host runtime on the internal endpoint    | none (explicit flag only) | landed (#881)                  |
-| 3   | P1.2 `SessionState` extracted from `GatewayState`                   | none                      | started: #894, extraction next |
-| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade    | none                      | not started                    |
-| 5   | P2.2c stdio adapter speaks the daemon session protocol, behind flag | opt-in only               | landed (#888, #891, #893)      |
-| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback           | opt-in only               | landed (#892, #893)            |
-| 7   | P3.1 union catalog built once, allowed-set enforced per session     | opt-in only               | not started                    |
-| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding       | opt-in only, the big win  | not started                    |
-| 9   | P4.1 dogfood flag, telemetry, acceptance run                        | opt-in only               | not started                    |
-| 10  | P4.2 adapter topology becomes default; legacy kill switch remains   | default flip              | not started                    |
-| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease      | separate, later           | not started                    |
+| PR  | Slice                                                               | Behavior change           | Status                                     |
+| --- | ------------------------------------------------------------------- | ------------------------- | ------------------------------------------ |
+| 1   | P2.1 rendezvous primitives (library module, tested)                 | none (new module only)    | landed (#880)                              |
+| 2   | P2.2a identity role; P2.2b host runtime on the internal endpoint    | none (explicit flag only) | landed (#881)                              |
+| 3   | P1.2 session tables on `SessionStore`; `SessionState` owner         | none                      | maps landed (#894 store); unification next |
+| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade    | none                      | not started                                |
+| 5   | P2.2c stdio adapter speaks the daemon session protocol, behind flag | opt-in only               | landed (#888, #891, #893)                  |
+| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback           | opt-in only               | landed (#892, #893)                        |
+| 7   | P3.1 union catalog built once, allowed-set enforced per session     | opt-in only               | not started                                |
+| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding       | opt-in only, the big win  | not started                                |
+| 9   | P4.1 dogfood flag, telemetry, acceptance run                        | opt-in only               | not started                                |
+| 10  | P4.2 adapter topology becomes default; legacy kill switch remains   | default flip              | not started                                |
+| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease      | separate, later           | not started                                |
 
 Each of 1 through 8 must leave the default topology untouched and all existing suites
 green. The only PRs that change what a user gets are 10 and 11.
@@ -83,15 +87,17 @@ thread-local as a scoped adapter as long as it is populated from the explicit va
 cannot outlive the request, which the guards already ensure.
 
 What remains is not per-request but session- and host-scoped: `MODERN_STDIO_UPSTREAM`,
-the `STDIO_*` handshake flags, `PROGRESS_*`, the PII map, and the modern HITL approval
-table. Those are single-stdio-client assumptions and move in P1.2 (`SessionState`) and
-P1.3 (`HostState`), so the isolation work lands with the types that own it instead of as a
-mechanical rewrite of the request path.
+the `STDIO_*` handshake flags, and `PROGRESS_*`. Those are single-stdio-client
+assumptions and move in P1.2 (`SessionState`) and P1.3 (`HostState`), so the isolation
+work lands with the types that own it instead of as a mechanical rewrite of the request
+path. The PII and HITL tables already moved onto a `SessionStore` owner; the rest of the
+session-scoped state follows in the unification slice.
 
 ### P1.2 SessionState
 
-Status: started. `session_store::SessionStore` landed as a tested module (#894); the
-extraction below is the remaining work.
+Status: store landed (#894), the three session-scoped maps moved onto it, and a
+`SessionState` owner now holds the PII and HITL tables; the unification below is the
+remaining work.
 
 - Introduce `SessionState` owning exactly what the design lists: session id, principal and
   audit label, effective scope, protocol version and capabilities, roots and `${ROOT}`,
@@ -100,8 +106,10 @@ extraction below is the remaining work.
 - `McpSession` becomes the HTTP transport face of `SessionState`; the stdio path gets the
   same type with a stdio transport face, deleting `StdioUpstream` as a separate concept.
 - PII maps, shaped-result cursors, and modern HITL approvals stay keyed by principal, but
-  move behind a `SessionStore` with explicit TTL and cap, with tests for reap-on-close and
-  reap-on-TTL. The store itself is in place; moving these three maps onto it is next.
+  live behind a `SessionStore` with explicit TTL and cap. Landed: `session_store::SessionStore`
+  (#894) plus the PII map, shaped-result cursors, and modern HITL approvals moved onto it,
+  with reap-on-close and reap-on-TTL/cap tests. `SessionState` currently resolves as one
+  process-level owner; threading it per session is the unification slice.
 
 ### P1.3 HostState
 

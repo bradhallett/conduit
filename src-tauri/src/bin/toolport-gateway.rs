@@ -54,6 +54,7 @@ use conduit_lib::savings;
 use conduit_lib::searchtrace;
 use conduit_lib::secrets;
 use conduit_lib::semantic;
+use conduit_lib::session_store::SessionStore;
 use conduit_lib::shaping;
 use conduit_lib::{audit, usage_report};
 
@@ -4854,33 +4855,83 @@ struct CallOpts {
     allow_app_only: bool,
 }
 
-/// Run untrusted tool-call output through content defense and result shaping, then
-/// append a Toolport-authored trailer. Shared by the success and error branches of
-/// [`execute_call`] so they can't drift: a hostile server must not be able to bypass the
-/// injection scanner by answering `tools/call` with a JSON-RPC error instead of a result
-/// (issue #421). The trailer (a recovery hint) is Toolport's own text and is added AFTER
-/// both passes, so it is never wrapped as external data nor truncated by shaping.
+/// Session-scoped state the gateway keys by session or principal
+/// (one-gateway-per-host P1.2).
 ///
-/// When opt-in block-on-injection is effective for `srv` (SOU-345) and the scanner hits
-/// high confidence, the labeled body is withheld and replaced with an `isError` security
-/// message so the agent never sees the payload as a successful result.
-/// PII token maps, one per client (SBS-346).
+/// Two tables used to be process globals with ad-hoc lifetimes: the PII pseudonym
+/// map (SBS-346) and the modern HITL approval table. They are keyed the same way
+/// and released the same way, so they get one owner with one set of rules: a
+/// session's state is dropped when it closes, is bounded by a TTL, and cannot grow
+/// past a cap. The shaped-result stash got the same treatment in
+/// [`conduit_lib::shaping`], which owns it behind a `SessionStore`. This is where
+/// the unification slice will thread the owner as one per-session value.
 ///
-/// Keyed by client, NOT process-global. One gateway process serves several
-/// clients over the HTTP bridge, each with its own bearer token, so a single
-/// shared map would let a token minted from client A's result be re-hydrated into
-/// client B's outgoing call -- handing A's real PII to B's downstream server.
-/// That is the exact leak this feature exists to prevent, so isolation is
-/// enforced here rather than assumed from "one process per stdio client".
+/// The PII table is keyed by client, NOT process-global in effect. One gateway
+/// process serves several clients over the HTTP bridge, each with its own bearer
+/// token, so a single shared map would let a token minted from client A's result
+/// be re-hydrated into client B's outgoing call -- handing A's real PII to B's
+/// downstream server. That is the exact leak this feature exists to prevent, so
+/// isolation is enforced here rather than assumed from "one process per stdio
+/// client".
 ///
 /// `None` (the local stdio client, and Toolport's own internal calls) gets its own
 /// reserved key rather than sharing with the first HTTP client to connect.
 ///
 /// Ephemeral by construction: these live in memory and die with the process, so
 /// no PII reaches disk. Never serialized, never travels in a result.
-fn pii_sessions() -> &'static Mutex<HashMap<String, pii::SessionMap>> {
-    static SESSIONS: OnceLock<Mutex<HashMap<String, pii::SessionMap>>> = OnceLock::new();
-    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+struct SessionState {
+    pii: Mutex<SessionStore<pii::SessionMap>>,
+    hitl: Mutex<SessionStore<ModernHitlApproval>>,
+}
+
+impl SessionState {
+    fn new() -> Self {
+        Self {
+            // The map is cleared on session teardown and on a fresh initialize, so the
+            // TTL is a backstop against a client that never disconnects; it matches the
+            // MCP session TTL. Last use refreshes it, so a live conversation keeps its
+            // tokens. The cap matches the session cap: one map per live client.
+            pii: Mutex::new(SessionStore::new(MCP_SESSION_TTL, MCP_SESSION_MAX)),
+            hitl: Mutex::new(SessionStore::new(
+                MODERN_HITL_RETENTION,
+                MODERN_HITL_MAX_PENDING,
+            )),
+        }
+    }
+
+    /// Run `f` against one client's PII map, creating it on first use.
+    ///
+    /// A poisoned lock is recovered rather than propagated: the map is a cache,
+    /// and failing every tool call because one thread panicked mid-pass would be a
+    /// worse outcome than continuing with whatever it already holds.
+    fn with_pii<T>(&self, client: Option<&str>, f: impl FnOnce(&mut pii::SessionMap) -> T) -> T {
+        let mut sessions = self
+            .pii
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sessions.get_or_insert_with(client.unwrap_or(PII_LOCAL_SESSION), pii::SessionMap::new, f)
+    }
+
+    /// Forget everything mapped for one client.
+    fn clear_pii(&self, client: Option<&str>) {
+        self.pii
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(client.unwrap_or(PII_LOCAL_SESSION));
+    }
+
+    fn hitl(&self) -> std::sync::MutexGuard<'_, SessionStore<ModernHitlApproval>> {
+        self.hitl
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// This process's session-scoped tables. One per gateway; resolved here until
+/// the request path is threaded with its owner in the unification slice.
+fn session_state() -> &'static SessionState {
+    static STATE: OnceLock<SessionState> = OnceLock::new();
+    STATE.get_or_init(SessionState::new)
 }
 
 /// True when a browser `Origin` names this machine, so the request came from a page
@@ -5019,10 +5070,7 @@ fn pii_origin_id(server: &str) -> String {
 /// across conversations — and the tokens simply stop resolving rather than
 /// resolving to something wrong.
 fn clear_pii_session(client: Option<&str>) {
-    pii_sessions()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(client.unwrap_or(PII_LOCAL_SESSION));
+    session_state().clear_pii(client);
 }
 
 /// Run `f` against one client's map.
@@ -5031,13 +5079,7 @@ fn clear_pii_session(client: Option<&str>) {
 /// failing every tool call because one thread panicked mid-pass would be a worse
 /// outcome than continuing with whatever it already holds.
 fn with_pii_session<T>(client: Option<&str>, f: impl FnOnce(&mut pii::SessionMap) -> T) -> T {
-    let mut sessions = pii_sessions()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let map = sessions
-        .entry(client.unwrap_or(PII_LOCAL_SESSION).to_string())
-        .or_insert_with(pii::SessionMap::new);
-    f(map)
+    session_state().with_pii(client, f)
 }
 
 /// Resolve pseudonyms on the owned dispatch copy only, for a call bound to `server`.
@@ -5376,6 +5418,16 @@ fn pseudonymize_if_enabled(
     })
 }
 
+/// Run untrusted tool-call output through content defense and result shaping, then
+/// append a Toolport-authored trailer. Shared by the success and error branches of
+/// [`execute_call`] so they can't drift: a hostile server must not be able to bypass the
+/// injection scanner by answering `tools/call` with a JSON-RPC error instead of a result
+/// (issue #421). The trailer (a recovery hint) is Toolport's own text and is added AFTER
+/// both passes, so it is never wrapped as external data nor truncated by shaping.
+///
+/// When opt-in block-on-injection is effective for `srv` (SOU-345) and the scanner hits
+/// high confidence, the labeled body is withheld and replaced with an `isError` security
+/// message so the agent never sees the payload as a successful result.
 fn defend_and_shape(
     reg: &Registry,
     srv: &str,
@@ -12216,18 +12268,10 @@ enum ModernHitlPoll {
 const MODERN_HITL_MAX_PENDING: usize = 64;
 const MODERN_HITL_RETENTION: Duration = Duration::from_secs(approval::DEFAULT_TIMEOUT_SECS + 30);
 
-fn modern_hitl_approvals() -> &'static Mutex<HashMap<String, ModernHitlApproval>> {
-    static STORE: std::sync::OnceLock<Mutex<HashMap<String, ModernHitlApproval>>> =
-        std::sync::OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 fn modern_hitl_input_required(token: &str) -> Value {
-    let input_request = modern_hitl_approvals()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(token)
-        .map(|pending| pending.input_request.clone());
+    let input_request = session_state()
+        .hitl()
+        .peek(token, |pending| pending.input_request.clone());
     json!({
         "resultType": "input_required",
         "inputRequests": input_request.map(|request| json!({
@@ -12238,11 +12282,7 @@ fn modern_hitl_input_required(token: &str) -> Value {
 }
 
 fn modern_hitl_reason(token: &str) -> Option<approval::ApprovalReason> {
-    modern_hitl_approvals()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(token)
-        .map(|pending| pending.reason)
+    session_state().hitl().peek(token, |pending| pending.reason)
 }
 
 fn downstream_input_responses(input_responses: Option<Value>) -> Option<Value> {
@@ -12268,15 +12308,13 @@ fn start_modern_hitl(
 ) -> Result<String, approval::ApprovalDecision> {
     let token = format!("toolport-hitl-{}", new_correlation_id());
     {
-        let mut approvals = modern_hitl_approvals()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        approvals.retain(|_, pending| pending.started.elapsed() <= MODERN_HITL_RETENTION);
+        let mut approvals = session_state().hitl();
+        approvals.reap_expired();
         if approvals.len() >= MODERN_HITL_MAX_PENDING {
             return Err(approval::ApprovalDecision::Unreachable);
         }
         approvals.insert(
-            token.clone(),
+            &token,
             ModernHitlApproval {
                 name: name.to_string(),
                 args_hash,
@@ -12319,78 +12357,78 @@ fn poll_modern_hitl(
     client: Option<&str>,
     input_responses: Option<Value>,
 ) -> ModernHitlPoll {
-    let mut approvals = modern_hitl_approvals()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    approvals.retain(|_, pending| pending.started.elapsed() <= MODERN_HITL_RETENTION);
-    let Some(pending) = approvals.get_mut(token) else {
-        return ModernHitlPoll::Missing;
-    };
-    if pending.name != name || pending.args_hash != args_hash || pending.client.as_deref() != client
-    {
-        return ModernHitlPoll::Stale;
-    }
-    let decision = match &pending.status {
-        ModernHitlStatus::AwaitingClient => {
-            let response = input_responses
-                .as_ref()
-                .and_then(|responses| responses.get("toolport_approval"));
-            let Some(response) = response else {
-                return ModernHitlPoll::Pending;
+    let (poll, remove) = session_state()
+        .hitl()
+        .with(token, |pending| {
+            if pending.name != name
+                || pending.args_hash != args_hash
+                || pending.client.as_deref() != client
+            {
+                return (ModernHitlPoll::Stale, false);
+            }
+            let decision = match &pending.status {
+                ModernHitlStatus::AwaitingClient => {
+                    let response = input_responses
+                        .as_ref()
+                        .and_then(|responses| responses.get("toolport_approval"));
+                    let Some(response) = response else {
+                        return (ModernHitlPoll::Pending, false);
+                    };
+                    let accepted = response.get("action").and_then(Value::as_str) == Some("accept")
+                        && response
+                            .get("content")
+                            .and_then(|content| content.get("approved"))
+                            .and_then(Value::as_bool)
+                            == Some(true);
+                    Some(if accepted {
+                        approval::ApprovalDecision::Approved
+                    } else {
+                        approval::ApprovalDecision::Denied
+                    })
+                }
+                ModernHitlStatus::Approved => None,
             };
-            let accepted = response.get("action").and_then(Value::as_str) == Some("accept")
-                && response
-                    .get("content")
-                    .and_then(|content| content.get("approved"))
-                    .and_then(Value::as_bool)
-                    == Some(true);
-            Some(if accepted {
-                approval::ApprovalDecision::Approved
-            } else {
-                approval::ApprovalDecision::Denied
-            })
-        }
-        ModernHitlStatus::Approved => None,
-    };
-    let newly_approved = decision.is_some();
-    if let Some(decision) = decision {
-        if !decision.is_approved() {
-            let held_ms = pending.started.elapsed().as_millis() as u64;
-            let reason = pending.reason;
-            approvals.remove(token);
-            return ModernHitlPoll::Decided(decision, held_ms, reason);
-        }
-        pending.status = ModernHitlStatus::Approved;
+            let newly_approved = decision.is_some();
+            if let Some(decision) = decision {
+                if !decision.is_approved() {
+                    let held_ms = pending.started.elapsed().as_millis() as u64;
+                    let reason = pending.reason;
+                    return (ModernHitlPoll::Decided(decision, held_ms, reason), true);
+                }
+                pending.status = ModernHitlStatus::Approved;
+            }
+            pending.downstream.input_responses = downstream_input_responses(input_responses);
+            (
+                ModernHitlPoll::Approved {
+                    approved_fingerprint: pending.approved_fingerprint.clone(),
+                    reason: pending.reason,
+                    held_ms: pending.started.elapsed().as_millis() as u64,
+                    downstream: pending.downstream.clone(),
+                    newly_approved,
+                },
+                false,
+            )
+        })
+        .unwrap_or((ModernHitlPoll::Missing, false));
+    if remove {
+        session_state().hitl().remove(token);
     }
-    pending.downstream.input_responses = downstream_input_responses(input_responses);
-    ModernHitlPoll::Approved {
-        approved_fingerprint: pending.approved_fingerprint.clone(),
-        reason: pending.reason,
-        held_ms: pending.started.elapsed().as_millis() as u64,
-        downstream: pending.downstream.clone(),
-        newly_approved,
-    }
+    poll
 }
 
 fn update_modern_hitl_downstream(token: &str, result: &mut Value) {
-    let mut approvals = modern_hitl_approvals()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(pending) = approvals.get_mut(token) {
+    session_state().hitl().with(token, |pending| {
         pending.downstream = MrtrRequest {
             input_responses: None,
             request_state: result.get("requestState").cloned(),
         };
         result["requestState"] = json!(token);
-    }
+    });
 }
 
 fn finish_modern_hitl(token: Option<&str>) {
     if let Some(token) = token {
-        modern_hitl_approvals()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(token);
+        session_state().hitl().remove(token);
     }
 }
 
@@ -17796,10 +17834,7 @@ mod tests {
 
     #[test]
     fn initial_modern_hitl_call_starts_mrtr_without_retry_fields() {
-        modern_hitl_approvals()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+        session_state().hitl().clear();
         let request = json!({
             "params": {
                 "_meta": {
@@ -17936,8 +17971,8 @@ mod tests {
     #[test]
     fn modern_hitl_state_is_bound_to_the_exact_call() {
         let token = format!("test-{}", new_correlation_id());
-        modern_hitl_approvals().lock().unwrap().insert(
-            token.clone(),
+        session_state().hitl().insert(
+            &token,
             ModernHitlApproval {
                 name: "s__wipe".into(),
                 args_hash: audit::args_hash(&json!({ "target": "x" })),
@@ -17961,6 +17996,49 @@ mod tests {
             ModernHitlPoll::Stale
         ));
         finish_modern_hitl(Some(&token));
+    }
+
+    #[test]
+    fn session_state_tables_reap_on_close_and_enforce_their_cap() {
+        // P1.2: the PII and HITL tables now sit on a SessionStore. Closing a
+        // session drops its PII map, and the HITL table stays bounded.
+        let state = SessionState::new();
+
+        // Reap on close: clearing the client's entry leaves a fresh, empty map.
+        state.with_pii(Some("p12-client"), |map| {
+            map.pseudonymize("crm", "ada@example.com");
+        });
+        assert!(state.with_pii(Some("p12-client"), |map| !map.is_empty()));
+        state.clear_pii(Some("p12-client"));
+        assert!(state.with_pii(Some("p12-client"), |map| map.is_empty()));
+
+        // Cap: inserting past the cap evicts the oldest approval, so the table
+        // cannot grow without bound on a long-lived gateway.
+        {
+            let mut hitl = state.hitl();
+            for i in 0..(MODERN_HITL_MAX_PENDING + 1) {
+                hitl.insert(
+                    &format!("token-{i}"),
+                    ModernHitlApproval {
+                        name: "s__wipe".into(),
+                        args_hash: audit::args_hash(&json!({ "target": i })),
+                        client: Some("cursor".into()),
+                        approved_fingerprint: None,
+                        reason: approval::ApprovalReason::Destructive,
+                        started: Instant::now(),
+                        downstream: MrtrRequest::default(),
+                        input_request: json!({ "method": "elicitation/create" }),
+                        status: ModernHitlStatus::AwaitingClient,
+                    },
+                );
+            }
+            assert_eq!(hitl.len(), MODERN_HITL_MAX_PENDING);
+            assert!(
+                hitl.peek("token-0", |_| ()).is_none(),
+                "the oldest approval is evicted at the cap"
+            );
+            assert!(hitl.peek("token-1", |_| ()).is_some());
+        }
     }
 
     #[test]

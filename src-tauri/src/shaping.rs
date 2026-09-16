@@ -10,11 +10,11 @@
 //! otherwise sit in context). The gateway is the one place that can impose it
 //! across every server, including legacy APIs with no native pagination.
 
+use crate::session_store::SessionStore;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Results whose serialized size exceeds this get shaped. Generous on purpose, so
 /// only genuinely large results are touched. Override with `TOOLPORT_RESULT_BUDGET`
@@ -65,15 +65,18 @@ struct Cached {
     /// insert. The eviction loop sums this across entries on every oversized call, so
     /// caching it avoids re-serializing every structured payload on each iteration.
     size: usize,
-    at: Instant,
     /// The client the result belongs to (a registered HTTP client's label), or None
     /// for the single-tenant stdio process. Only this client may fetch it back.
     owner: Option<String>,
 }
 
-fn cache() -> &'static Mutex<HashMap<String, Cached>> {
-    static C: OnceLock<Mutex<HashMap<String, Cached>>> = OnceLock::new();
-    C.get_or_init(|| Mutex::new(HashMap::new()))
+/// The bounded stash of shaped results, keyed by cursor. P1.2: the lifetime rules
+/// live on a [`SessionStore`] rather than a bare `HashMap` -- entries expire
+/// `CACHE_TTL` after they were stashed, and an arrival past `MAX_CACHE_ENTRIES` or
+/// `MAX_CACHE_BYTES` evicts the oldest.
+fn cache() -> &'static Mutex<SessionStore<Cached>> {
+    static C: OnceLock<Mutex<SessionStore<Cached>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(SessionStore::new(CACHE_TTL, MAX_CACHE_ENTRIES)))
 }
 
 fn next_cursor() -> String {
@@ -81,23 +84,22 @@ fn next_cursor() -> String {
     format!("r{}", N.fetch_add(1, Ordering::Relaxed))
 }
 
-fn sweep(map: &mut HashMap<String, Cached>) {
-    map.retain(|_, c| c.at.elapsed() < CACHE_TTL);
+fn sweep(store: &mut SessionStore<Cached>) {
+    store.reap_expired();
 }
 
 /// Bound memory: evict oldest until the entry count and total bytes leave room for
-/// a `new_entry_size`-byte result (or the cache empties, keeping one over-cap
+/// a `new_entry_size`-byte result (or the stash empties, keeping one over-cap
 /// result). Each entry's `size` is precomputed, so this sum is O(n) adds, not O(n)
 /// JSON re-serializations, on every iteration.
-fn evict_to_fit(map: &mut HashMap<String, Cached>, new_entry_size: usize) {
-    while !map.is_empty()
-        && (map.len() >= MAX_CACHE_ENTRIES
-            || map.values().map(|c| c.size).sum::<usize>() + new_entry_size > MAX_CACHE_BYTES)
+fn evict_to_fit(store: &mut SessionStore<Cached>, new_entry_size: usize) {
+    while !store.is_empty()
+        && (store.len() >= MAX_CACHE_ENTRIES
+            || store.weight(|c| c.size) + new_entry_size > MAX_CACHE_BYTES)
     {
-        let Some(oldest) = map.iter().min_by_key(|(_, c)| c.at).map(|(k, _)| k.clone()) else {
+        if !store.remove_oldest() {
             break;
-        };
-        map.remove(&oldest);
+        }
     }
 }
 
@@ -324,18 +326,15 @@ pub fn shape_result_preserving_prefix(
     // Only now stash the full body: the cursor in the marker above is live from
     // here on.
     {
-        let mut map = cache().lock().unwrap_or_else(|e| e.into_inner());
-        sweep(&mut map);
-
-        evict_to_fit(&mut map, new_entry_size);
-
-        map.insert(
-            cursor.clone(),
+        let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
+        sweep(&mut store);
+        evict_to_fit(&mut store, new_entry_size);
+        store.insert(
+            &cursor,
             Cached {
                 body,
                 structured,
                 size: new_entry_size,
-                at: Instant::now(),
                 owner: owner.map(str::to_string),
             },
         );
@@ -352,24 +351,15 @@ pub fn shape_result_preserving_prefix(
 pub fn stash_payload(body: String, structured: Option<Value>, owner: Option<&str>) -> String {
     let cursor = next_cursor();
     let size = body.len() + structured.as_ref().map(value_size).unwrap_or(0);
-    let mut map = cache().lock().unwrap_or_else(|e| e.into_inner());
-    sweep(&mut map);
-    while !map.is_empty()
-        && (map.len() >= MAX_CACHE_ENTRIES
-            || map.values().map(|c| c.size).sum::<usize>() + size > MAX_CACHE_BYTES)
-    {
-        let Some(oldest) = map.iter().min_by_key(|(_, c)| c.at).map(|(k, _)| k.clone()) else {
-            break;
-        };
-        map.remove(&oldest);
-    }
-    map.insert(
-        cursor.clone(),
+    let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
+    sweep(&mut store);
+    evict_to_fit(&mut store, size);
+    store.insert(
+        &cursor,
         Cached {
             body,
             structured,
             size,
-            at: Instant::now(),
             owner: owner.map(str::to_string),
         },
     );
@@ -385,15 +375,15 @@ pub fn fetch_result(
     requester: Option<&str>,
     projection: Option<&str>,
 ) -> Value {
-    let mut map = cache().lock().unwrap_or_else(|e| e.into_inner());
-    sweep(&mut map);
+    let mut store = cache().lock().unwrap_or_else(|e| e.into_inner());
+    sweep(&mut store);
     // Scope: a cached result is readable only by the client that stashed it. Owner
     // must be a stable principal (e.g. client:{id}), never a shared display label
     // (SOU-324). A mismatch returns the SAME "unknown or expired" answer as a
     // missing cursor, so a scoped client can't probe which cursors exist. The
     // stash is process-global; without this check one HTTP client could read
     // another's result by guessing the sequential `r{n}` cursor.
-    let c = match map.get(cursor) {
+    let c = match store.get(cursor) {
         Some(c) if c.owner.as_deref() == requester => c,
         _ => {
             return text_result(
@@ -889,16 +879,15 @@ mod tests {
         );
     }
 
-    // A cache entry with a given recorded `size` and age, without allocating a body
-    // of that size: the eviction loop reads `Cached.size`, never the body itself, so
-    // multi-megabyte entries cost a few bytes here. `secs_ago` fixes the insertion
-    // order deterministically rather than relying on clock resolution between calls.
-    fn cached_entry(size: usize, secs_ago: u64) -> Cached {
+    // A cache entry with a given recorded `size`, without allocating a body of that
+    // size: the eviction loop reads `Cached.size`, never the body itself, so
+    // multi-megabyte entries cost a few bytes here. The store evicts in insertion
+    // order, so the tests insert oldest first.
+    fn cached_entry(size: usize) -> Cached {
         Cached {
             body: String::new(),
             structured: None,
             size,
-            at: Instant::now() - Duration::from_secs(secs_ago),
             owner: None,
         }
     }
@@ -911,35 +900,36 @@ mod tests {
         // Three of these sum to 72 MiB, past the 64 MiB cap; dropping the oldest
         // leaves 48 MiB, so exactly one eviction is required for a 1 MiB arrival.
         const HUGE: usize = 24 * 1024 * 1024;
-        let mut map: HashMap<String, Cached> = HashMap::new();
-        map.insert("oldest".to_string(), cached_entry(HUGE, 60));
-        map.insert("middle".to_string(), cached_entry(HUGE, 40));
-        map.insert("newest".to_string(), cached_entry(HUGE, 20));
+        let mut store: SessionStore<Cached> =
+            SessionStore::new(Duration::from_secs(900), MAX_CACHE_ENTRIES);
+        store.insert("oldest", cached_entry(HUGE));
+        store.insert("middle", cached_entry(HUGE));
+        store.insert("newest", cached_entry(HUGE));
         assert!(
-            map.len() < MAX_CACHE_ENTRIES,
+            store.len() < MAX_CACHE_ENTRIES,
             "must exercise the byte cap, not the entry cap"
         );
 
         let new_entry_size = 1024 * 1024;
-        evict_to_fit(&mut map, new_entry_size);
-        map.insert("incoming".to_string(), cached_entry(new_entry_size, 0));
+        evict_to_fit(&mut store, new_entry_size);
+        store.insert("incoming", cached_entry(new_entry_size));
 
-        let total: usize = map.values().map(|c| c.size).sum();
         assert!(
-            total <= MAX_CACHE_BYTES,
-            "cached bytes grew to {total}, past the {MAX_CACHE_BYTES} cap"
+            store.weight(|c| c.size) <= MAX_CACHE_BYTES,
+            "cached bytes grew to {}, past the {MAX_CACHE_BYTES} cap",
+            store.weight(|c| c.size)
         );
-        // Oldest-by-insertion-time goes first, and only as far as needed.
+        // Oldest-by-insertion goes first, and only as far as needed.
         assert!(
-            !map.contains_key("oldest"),
+            store.get("oldest").is_none(),
             "the oldest entry must be evicted first"
         );
         assert!(
-            map.contains_key("middle"),
+            store.get("middle").is_some(),
             "eviction must stop once the new body fits"
         );
-        assert!(map.contains_key("newest"));
-        assert!(map.contains_key("incoming"));
+        assert!(store.get("newest").is_some());
+        assert!(store.get("incoming").is_some());
     }
 
     #[test]
@@ -947,27 +937,27 @@ mod tests {
         // Documented behaviour (see MAX_CACHE_BYTES): evict until it fits OR the
         // cache is empty, so a single body larger than the cap is still retained
         // rather than dropping the result the caller just produced.
-        let mut map: HashMap<String, Cached> = HashMap::new();
-        map.insert("stale".to_string(), cached_entry(1024, 60));
+        let mut store: SessionStore<Cached> =
+            SessionStore::new(Duration::from_secs(900), MAX_CACHE_ENTRIES);
+        store.insert("stale", cached_entry(1024));
 
-        evict_to_fit(&mut map, MAX_CACHE_BYTES + 1);
+        evict_to_fit(&mut store, MAX_CACHE_BYTES + 1);
         assert!(
-            map.is_empty(),
+            store.is_empty(),
             "everything older must be evicted to make room"
         );
 
         // Eviction stops at an empty cache, so the caller's own over-cap result is
         // still inserted rather than discarded. It is over the cap by construction;
         // the next oversized call is what evicts it.
-        map.insert("incoming".to_string(), cached_entry(MAX_CACHE_BYTES + 1, 0));
+        store.insert("incoming", cached_entry(MAX_CACHE_BYTES + 1));
         assert!(
-            map.contains_key("incoming"),
+            store.get("incoming").is_some(),
             "an over-cap body is kept, not dropped, when it is the only entry"
         );
-        let mut map2 = map;
-        evict_to_fit(&mut map2, 1);
+        evict_to_fit(&mut store, 1);
         assert!(
-            map2.is_empty(),
+            store.is_empty(),
             "the retained over-cap entry must be evicted by the next arrival"
         );
     }
