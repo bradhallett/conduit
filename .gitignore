@@ -122,5 +122,10 @@ src-tauri/rate_limit_counters.test.json
 /packaging/linux/aur/.SRCINFO
 /aur/
 
+# makepkg downloads the versioned source archive named in the PKGBUILD into this
+# directory. The PKGBUILD fetches it from the GitHub tag, so a committed copy is
+# dead weight that goes stale with every release.
+/packaging/linux/native/*.tar.gz
+
 # Local verification logs and screenshots
 /.verify/
