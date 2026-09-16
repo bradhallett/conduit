@@ -15590,7 +15590,13 @@ fn handle_connection(
 /// place so `--help`'s usage text and the unknown-flag check in [`parse_args`]
 /// can't drift from the real parsers in `http_port`, `insecure_loopback_requested`,
 /// and `main`'s `--selftest-secrets` check.
-const KNOWN_FLAGS: &[&str] = &["--http", INSECURE_LOOPBACK_FLAG, "--daemon", "--selftest-secrets"];
+const KNOWN_FLAGS: &[&str] = &[
+    "--http",
+    INSECURE_LOOPBACK_FLAG,
+    "--daemon",
+    "--selftest-secrets",
+    conduit_lib::stdio_adapter::STDIO_ADAPTER_FLAG,
+];
 
 /// What the command line is asking `main` to do, decided purely from `args`
 /// (already excluding argv[0]) with no I/O - unit-testable without spawning a
@@ -15698,6 +15704,8 @@ fn usage() -> String {
          \x20   --daemon             Run as the host daemon for this host (Phase 2;\n\
          \x20                        internal rendezvous endpoint, not the user HTTP\n\
          \x20                        surface)\n\
+         \x20   --stdio-adapter      Proxy stdio to the host daemon instead of running\n\
+         \x20                        the in-process gateway (Phase 2; opt-in)\n\
          \x20   --selftest-secrets    Diagnostic: read every vaulted secret and report\n\
          \x20   --toolport-hook EVENT Record one agent lifecycle event and exit (installed\n\
          \x20                         into an agent's settings by Toolport; always exits 0)\n\
@@ -15806,6 +15814,13 @@ fn main() {
             std::process::exit(code);
         }
         ArgAction::Run => {}
+    }
+    // Phase 2 stdio adapter: hand stdio to the host daemon instead of starting an
+    // in-process gateway. Diverges, and deliberately runs before the session
+    // detach, registry load, and watcher: this role owns none of that state, the
+    // daemon does.
+    if conduit_lib::stdio_adapter::adapter_requested(&cli_args) {
+        conduit_lib::stdio_adapter::run_stdio_adapter();
     }
     let selftest_secrets = cli_args.first().map(String::as_str) == Some("--selftest-secrets");
     if !selftest_secrets {
