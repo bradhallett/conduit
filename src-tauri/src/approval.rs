@@ -66,6 +66,14 @@ pub enum ApprovalReason {
     /// "the call fails", so the prompt can only turn a certain failure into a possible
     /// success.
     PiiCrossServer,
+    /// A native agent call (a shell command, a file read, an MCP tool in Cursor or
+    /// Claude Code) matched one of the user's "ask first" permission rules, and the
+    /// agent's guard hook routed the question here instead of to the agent's own
+    /// prompt (SBS-1059). `server` is the agent, `tool` the call kind, and
+    /// [`ApprovalRequest::agent_rule`] names the rule. Never produced by
+    /// [`gate_reason`]; never eligible for an allowlist entry, since the "tool" here is
+    /// a whole class of calls rather than one definition.
+    AgentPermission,
 }
 
 /// A request to release specific pseudonymized values to a server that did not produce them.
@@ -130,6 +138,10 @@ pub struct ApprovalRequest {
     /// Present only for [`ApprovalReason::PiiCrossServer`]; absent for ordinary approvals.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pii_release: Option<PiiReleaseRequest>,
+    /// The permission rule that asked, for [`ApprovalReason::AgentPermission`] only
+    /// (`Bash(git push*)`), so the person sees which of their rules is prompting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_rule: Option<String>,
 }
 
 /// The already-screened browser interaction carried over the local broker. The gateway
@@ -454,6 +466,135 @@ pub fn dial_broker(desc: &EndpointDescriptor) -> io::Result<BrokerStream> {
     Ok(stream)
 }
 
+// ---------------------------------------------------------------------------
+// Broker client: shared by the gateway's HITL gate and the agent guard (SBS-1059)
+// ---------------------------------------------------------------------------
+
+/// A fresh 128-bit correlation id for an approval request (same CSPRNG-or-die policy
+/// as the confirm token: a randomness failure on a security gate is fatal, not papered).
+pub fn new_correlation_id() -> String {
+    let mut buf = [0u8; 16];
+    getrandom::getrandom(&mut buf).expect("CSPRNG unavailable");
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Read the approval-broker endpoint the Toolport app publishes into the data dir.
+/// `None` when it is absent/unreadable (the app is not running) - a fail-closed signal.
+pub fn read_endpoint_descriptor() -> Option<EndpointDescriptor> {
+    let dir = crate::registry::conduit_dir()?;
+    let raw = std::fs::read_to_string(dir.join(ENDPOINT_FILE)).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// The outcome of a single dial to the approval broker. Separating "we never reached a
+/// live broker" from "a broker answered" lets the caller retry a *stale* endpoint (the app
+/// just restarted and rebound to a new port) without ever re-prompting a human who was
+/// already asked.
+pub enum BrokerAttempt {
+    /// A broker received the request and answered (Approved / Denied / Timeout).
+    Decided(ApprovalDecision),
+    /// We never handed the request to a live broker: no descriptor, connect refused, or the
+    /// transport failed before the request went across. No human was asked, so a retry
+    /// against a freshly-read descriptor is safe.
+    Unreachable,
+}
+
+/// One dial to the broker described by `desc`. FAIL-CLOSED throughout: the arguments travel
+/// over the socket and never touch disk. The dial itself ([`dial_broker`]) makes
+/// the peer prove it holds the descriptor's token before a byte of the request is written,
+/// so a process that merely binds the published endpoint after the app has gone gets
+/// neither the arguments nor a say in the decision (SBS-867).
+///
+/// The key invariant: `Unreachable` is returned ONLY when the request never reached a
+/// broker (so no human saw it). Once the request is written, any later failure - including
+/// the read timeout that means "the human didn't answer" - is a `Decided(Timeout)`, so we
+/// never retry in a way that could double-prompt.
+pub fn try_decide_once(
+    desc: Option<EndpointDescriptor>,
+    req: &mut ApprovalRequest,
+) -> BrokerAttempt {
+    use std::io::{BufRead, BufReader, Write};
+    let Some(desc) = desc else {
+        return BrokerAttempt::Unreachable;
+    };
+    req.token = desc.token.clone();
+    // Connect refused, no answer to the challenge, or a wrong proof: in every case the
+    // request was never written, so no human was asked and a re-dial is safe.
+    let Ok(mut stream) = dial_broker(&desc) else {
+        return BrokerAttempt::Unreachable;
+    };
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS)));
+    let Ok(line) = serde_json::to_string(req) else {
+        // We connected but can't serialize our own request: not a reachability problem, so
+        // don't spin on retry. Fail closed.
+        return BrokerAttempt::Decided(ApprovalDecision::Timeout);
+    };
+    if stream.write_all(line.as_bytes()).is_err() || stream.write_all(b"\n").is_err() {
+        // The request never made it across, so no human was asked: safe to re-dial.
+        return BrokerAttempt::Unreachable;
+    }
+    let _ = stream.flush();
+    let mut resp = String::new();
+    match BufReader::new(stream).read_line(&mut resp) {
+        // Connected and the peer closed with no answer: not a healthy broker. No human was
+        // shown a prompt (the broker's pre-prompt reject paths close silently), so re-dial.
+        Ok(0) => BrokerAttempt::Unreachable,
+        Ok(_) => {
+            let t = resp.trim();
+            if t.is_empty() {
+                BrokerAttempt::Unreachable
+            } else {
+                // A parseable decision is authoritative; an unparseable line is fail-closed
+                // as a Timeout (a real broker answered, so this is not a retry case).
+                BrokerAttempt::Decided(
+                    serde_json::from_str::<ApprovalDecision>(t)
+                        .unwrap_or(ApprovalDecision::Timeout),
+                )
+            }
+        }
+        // A read error AFTER we sent the request is the "human didn't answer in time" path
+        // (read timeout) or a mid-wait drop. Either way the broker had our request, so this
+        // is a genuine no-decision Timeout - never retry (that would re-prompt).
+        Err(_) => BrokerAttempt::Decided(ApprovalDecision::Timeout),
+    }
+}
+
+/// Ask the app broker for a human decision on `req`, reading the endpoint descriptor once.
+/// Collapses an unreachable broker to the `Unreachable` decision (still fail-closed). Kept
+/// as a thin, dependency-free entry point for unit tests; `request_human_decision` is the
+/// production path with the self-healing retry.
+pub fn decide_via_broker(
+    desc: Option<EndpointDescriptor>,
+    req: &mut ApprovalRequest,
+) -> ApprovalDecision {
+    match try_decide_once(desc, req) {
+        BrokerAttempt::Decided(d) => d,
+        BrokerAttempt::Unreachable => ApprovalDecision::Unreachable,
+    }
+}
+
+/// Hold a gated tool call until a human decides via the Toolport app (or it fails closed).
+///
+/// If the first dial can't reach a live broker, re-read the descriptor and retry once: the
+/// app may have just restarted and rebound to a new port, leaving the descriptor we first
+/// read stale. This self-heals that race without ever failing open - two unreachable dials
+/// return `Unreachable`, which is still a deny.
+pub fn request_human_decision(mut req: ApprovalRequest) -> ApprovalDecision {
+    match try_decide_once(read_endpoint_descriptor(), &mut req) {
+        BrokerAttempt::Decided(d) => d,
+        BrokerAttempt::Unreachable => match try_decide_once(read_endpoint_descriptor(), &mut req) {
+            BrokerAttempt::Decided(d) => d,
+            BrokerAttempt::Unreachable => {
+                crate::gatewaylog::append(
+                    "approval broker unreachable after retry; failing closed (Unreachable)",
+                );
+                ApprovalDecision::Unreachable
+            }
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,6 +670,7 @@ mod tests {
             tool_fingerprint: Some("v2:abc".into()),
             url_elicitation: None,
             pii_release: None,
+            agent_rule: None,
         };
         let round: ApprovalRequest =
             serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
@@ -638,6 +780,7 @@ mod tests {
             tool_fingerprint: None,
             url_elicitation: None,
             pii_release: None,
+            agent_rule: None,
         })
         .unwrap();
         assert!(answer_challenge(&req, "tok").is_none());

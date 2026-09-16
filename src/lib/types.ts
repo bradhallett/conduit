@@ -392,7 +392,8 @@ export interface PendingApproval {
     | "untrusted_source"
     | "destructive_and_untrusted"
     | "persistent_code_write"
-    | "pii_cross_server";
+    | "pii_cross_server"
+    | "agent_permission";
   arguments: unknown;
   /** A screened URL-mode elicitation brokered by the desktop because the MCP host
    * did not declare URL elicitation support. */
@@ -411,6 +412,9 @@ export interface PendingApproval {
     server: string;
     values: { token: string; value: string; origins: string[] }[];
   } | null;
+  /** The "ask first" permission rule behind an `agent_permission` ask, e.g.
+   * `Bash(git push*)`. `server` is the agent and `tool` the call kind. */
+  agentRule?: string | null;
   /** Wall-clock epoch-ms when this call auto-denies; the overlay counts down to it. */
   deadlineMs: number;
 }
