@@ -1,8 +1,11 @@
 # Design: One heavy gateway per host
 
-Status: Phase 0 landed (SBS-838). Phases 1-4 remain PROPOSED, and **the current gateway
-topology is unchanged** — every stdio client session still runs its own gateway and its
-own copy of every enabled downstream server.
+Status: Phase 0 landed (SBS-838), and the daemon groundwork is in: the rendezvous, the
+`--daemon` host runtime, and the opt-in `--stdio-adapter` (P2.1 through P2.3), all behind
+explicit flags. **The current gateway topology is unchanged** — every stdio client session
+still runs its own gateway and its own copy of every enabled downstream server until the
+P4.2 default flip. P1.2/P1.3 and the P3 downstream pooling remain. See
+[the plan](one-gateway-per-host-plan.md) for the slice-by-slice status and what is next.
 
 SBS-551 delivered this design plus a slice of Phase 1 (`ActiveRequestContext` and the
 per-request guards). It was closed at that point, which read as "one gateway per host is
