@@ -36,11 +36,14 @@ Landed:
   `SessionState` with a transport face, and `StdioUpstream` is deleted. The upstream
   call/correlation logic and the notification fanout have a single implementation; the
   stdio face writes straight to stdout, the HTTP face queues for the listen stream.
+- P1.2 threading, first increment: the stdio client's declared capabilities and its
+  `${ROOT}` project root moved from `GatewayState` onto the stdio `SessionState`, and the
+  server-request handler and roots refresh read them there.
 
 Still open:
 
-- P1.2 threading: thread `SessionState` through the request path so roots, capabilities,
-  cancellation, search guard, and confirm guard live on the session instead of beside it.
+- P1.2 threading, remainder: discovery/code mode, `MODERN_STDIO_UPSTREAM`, progress
+  routing, and the search/confirm guards still encode a single stdio client.
 - P1.3 `HostState`. `GatewayState` still mixes host and session state.
 - A set of process globals still encode one-stdio-client assumptions (discovery/code mode,
   stdio presence and era, progress routes, `SearchGuard`/`ConfirmGuard`).
@@ -54,19 +57,19 @@ Still open:
 
 ## Delivery shape
 
-| PR  | Slice                                                                       | Behavior change           | Status                                   |
-| --- | --------------------------------------------------------------------------- | ------------------------- | ---------------------------------------- |
-| 1   | P2.1 rendezvous primitives (library module, tested)                         | none (new module only)    | landed (#880)                            |
-| 2   | P2.2a identity role; P2.2b host runtime on the internal endpoint            | none (explicit flag only) | landed (#881)                            |
-| 3   | P1.2 session tables on `SessionStore`; transports unified on `SessionState` | none                      | maps landed (#894 store); threading next |
-| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade            | none                      | not started                              |
-| 5   | P2.2c stdio adapter speaks the daemon session protocol, behind flag         | opt-in only               | landed (#888, #891, #893)                |
-| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback                   | opt-in only               | landed (#892, #893)                      |
-| 7   | P3.1 union catalog built once, allowed-set enforced per session             | opt-in only               | not started                              |
-| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding               | opt-in only, the big win  | not started                              |
-| 9   | P4.1 dogfood flag, telemetry, acceptance run                                | opt-in only               | not started                              |
-| 10  | P4.2 adapter topology becomes default; legacy kill switch remains           | default flip              | not started                              |
-| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease              | separate, later           | not started                              |
+| PR  | Slice                                                                       | Behavior change           | Status                                |
+| --- | --------------------------------------------------------------------------- | ------------------------- | ------------------------------------- |
+| 1   | P2.1 rendezvous primitives (library module, tested)                         | none (new module only)    | landed (#880)                         |
+| 2   | P2.2a identity role; P2.2b host runtime on the internal endpoint            | none (explicit flag only) | landed (#881)                         |
+| 3   | P1.2 session tables on `SessionStore`; transports unified on `SessionState` | none                      | landed; session-scoped globals remain |
+| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade            | none                      | not started                           |
+| 5   | P2.2c stdio adapter speaks the daemon session protocol, behind flag         | opt-in only               | landed (#888, #891, #893)             |
+| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback                   | opt-in only               | landed (#892, #893)                   |
+| 7   | P3.1 union catalog built once, allowed-set enforced per session             | opt-in only               | not started                           |
+| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding               | opt-in only, the big win  | not started                           |
+| 9   | P4.1 dogfood flag, telemetry, acceptance run                                | opt-in only               | not started                           |
+| 10  | P4.2 adapter topology becomes default; legacy kill switch remains           | default flip              | not started                           |
+| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease              | separate, later           | not started                           |
 
 Each of 1 through 8 must leave the default topology untouched and all existing suites
 green. The only PRs that change what a user gets are 10 and 11.
@@ -98,16 +101,16 @@ slice.
 
 ### P1.2 SessionState
 
-Status: store landed (#894), the three session-scoped maps moved onto it, and the two
-transport types are unified. Threading `SessionState` through the request path is the
-remaining work.
+Status: store landed (#894), the three session-scoped maps moved onto it, the two
+transport types are unified, and the stdio session now owns the client's capabilities and
+root. The remaining session-scoped globals follow.
 
 - Introduce `SessionState` owning exactly what the design lists: session id, principal and
   audit label, effective scope, protocol version and capabilities, roots and `${ROOT}`,
   upstream request correlation, outbound queue, cancellation, subscriptions, search guard,
   confirm guard, connection-local notification eligibility. Today it owns the transport
-  face, owner, upstream request correlation, outbound queue, and subscriptions; the rest
-  move in the threading slice.
+  face, owner, upstream request correlation, outbound queue, subscriptions, root, and the
+  stdio client's declared capabilities; the rest move as the request path is threaded.
 - `McpSession` becomes the HTTP transport face of `SessionState`; the stdio path gets the
   same type with a stdio transport face, deleting `StdioUpstream` as a separate concept.
   Landed: one `SessionState` with `SessionTransportFace::{Http, Stdio}`. The upstream
