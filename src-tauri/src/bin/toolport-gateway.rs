@@ -4879,12 +4879,12 @@ struct CallOpts {
 ///
 /// Ephemeral by construction: these live in memory and die with the process, so
 /// no PII reaches disk. Never serialized, never travels in a result.
-struct SessionState {
+struct SessionTables {
     pii: Mutex<SessionStore<pii::SessionMap>>,
     hitl: Mutex<SessionStore<ModernHitlApproval>>,
 }
 
-impl SessionState {
+impl SessionTables {
     fn new() -> Self {
         Self {
             // The map is cleared on session teardown and on a fresh initialize, so the
@@ -4929,9 +4929,9 @@ impl SessionState {
 
 /// This process's session-scoped tables. One per gateway; resolved here until
 /// the request path is threaded with its owner in the unification slice.
-fn session_state() -> &'static SessionState {
-    static STATE: OnceLock<SessionState> = OnceLock::new();
-    STATE.get_or_init(SessionState::new)
+fn session_tables() -> &'static SessionTables {
+    static STATE: OnceLock<SessionTables> = OnceLock::new();
+    STATE.get_or_init(SessionTables::new)
 }
 
 /// True when a browser `Origin` names this machine, so the request came from a page
@@ -5070,7 +5070,7 @@ fn pii_origin_id(server: &str) -> String {
 /// across conversations — and the tokens simply stop resolving rather than
 /// resolving to something wrong.
 fn clear_pii_session(client: Option<&str>) {
-    session_state().clear_pii(client);
+    session_tables().clear_pii(client);
 }
 
 /// Run `f` against one client's map.
@@ -5079,7 +5079,7 @@ fn clear_pii_session(client: Option<&str>) {
 /// failing every tool call because one thread panicked mid-pass would be a worse
 /// outcome than continuing with whatever it already holds.
 fn with_pii_session<T>(client: Option<&str>, f: impl FnOnce(&mut pii::SessionMap) -> T) -> T {
-    session_state().with_pii(client, f)
+    session_tables().with_pii(client, f)
 }
 
 /// Resolve pseudonyms on the owned dispatch copy only, for a call bound to `server`.
@@ -9389,7 +9389,7 @@ fn mtime(path: &Path) -> Option<SystemTime> {
 
 fn notify_tools_changed(
     stdout: &Arc<Mutex<std::io::Stdout>>,
-    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
+    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<SessionState>>>>>,
 ) {
     notify_list_changed(stdout, mcp_sessions, "notifications/tools/list_changed");
 }
@@ -9501,7 +9501,7 @@ fn drain_stdio_deferred(stdout: &Arc<Mutex<std::io::Stdout>>) {
 /// - an MCP session only exists after that session initialized.
 fn notify_list_changed(
     stdout: &Arc<Mutex<std::io::Stdout>>,
-    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
+    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<SessionState>>>>>,
     method: &str,
 ) {
     if !MODERN_STDIO_UPSTREAM.load(Ordering::SeqCst) {
@@ -9523,19 +9523,18 @@ fn notify_list_changed(
     }
     if let Some(sessions) = mcp_sessions {
         let msg = json!({ "jsonrpc": "2.0", "method": method });
-        fanout_mcp_notification(stdout, sessions, &msg);
+        fanout_mcp_notification(sessions, &msg);
     }
 }
 
-/// Queue a server→client JSON-RPC notification on every non-expired HTTP MCP
-/// session (SOU-328). Best-effort: a full outbound queue drops that session's
-/// copy and continues so one stuck client cannot block the others.
+/// Queue a server→client JSON-RPC notification on every non-expired MCP session
+/// (SOU-328). Best-effort: a session that cannot take the message drops its copy
+/// and the rest continue, so one stuck client cannot block the others.
 fn fanout_mcp_notification(
-    stdout: &Arc<Mutex<std::io::Stdout>>,
-    mcp_sessions: &Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
+    mcp_sessions: &Arc<Mutex<HashMap<String, Arc<SessionState>>>>,
     msg: &Value,
 ) {
-    let sessions: Vec<Arc<McpSession>> = mcp_sessions
+    let sessions: Vec<Arc<SessionState>> = mcp_sessions
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .values()
@@ -9548,15 +9547,8 @@ fn fanout_mcp_notification(
         let Some(json) = session.notification_json(msg) else {
             continue;
         };
-        if session.is_modern_stdio() {
-            if let Ok(value) = serde_json::from_str::<Value>(&json) {
-                let mut out = stdout
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let _ = write_json_line(&mut *out, &value);
-            }
-        } else if !session.push_message(json, request_id_key(msg)) {
-            eprintln!("toolport: MCP session outbound queue full; list_changed dropped");
+        if !session.push_message(json, request_id_key(msg)) {
+            eprintln!("toolport: MCP session could not take a notification; dropped");
         }
     }
 }
@@ -9569,7 +9561,7 @@ fn fanout_mcp_notification(
 /// spoofed or colliding updates are dropped and logged.
 fn deliver_resource_updated(
     stdout: &Arc<Mutex<std::io::Stdout>>,
-    mcp_sessions: &Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
+    mcp_sessions: &Arc<Mutex<HashMap<String, Arc<SessionState>>>>,
     subs: &Arc<Mutex<ResourceSubscriptionTable>>,
     producer: &str,
     uri: &str,
@@ -9618,7 +9610,7 @@ fn deliver_resource_updated(
         let _ = write_json_line(&mut *out, &msg);
     }
     if !session_ids.is_empty() {
-        let targets: Vec<Arc<McpSession>> = {
+        let targets: Vec<Arc<SessionState>> = {
             let sessions = mcp_sessions
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -9634,15 +9626,8 @@ fn deliver_resource_updated(
             let Some(json) = session.notification_json(&msg) else {
                 continue;
             };
-            if session.is_modern_stdio() {
-                if let Ok(value) = serde_json::from_str::<Value>(&json) {
-                    let mut out = stdout
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let _ = write_json_line(&mut *out, &value);
-                }
-            } else if !session.push_message(json, None) {
-                eprintln!("toolport: MCP session outbound queue full; resources/updated dropped");
+            if !session.push_message(json, None) {
+                eprintln!("toolport: MCP session could not take resources/updated; dropped");
             }
         }
     }
@@ -9782,7 +9767,7 @@ fn prepare_progress(
 /// dropping anything unroutable or spoofed (SOU-444).
 fn deliver_progress(
     stdio: &std::sync::mpsc::SyncSender<Value>,
-    mcp_sessions: &Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
+    mcp_sessions: &Arc<Mutex<HashMap<String, Arc<SessionState>>>>,
     routes: &Arc<Mutex<ProgressRoutes>>,
     producer: &str,
     note: &Value,
@@ -9854,7 +9839,7 @@ fn deliver_progress(
 /// that minted the token. Bound per downstream via [`bind_progress_sink`].
 fn make_progress_sink(
     stdout: Arc<Mutex<std::io::Stdout>>,
-    mcp_sessions: Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
+    mcp_sessions: Arc<Mutex<HashMap<String, Arc<SessionState>>>>,
     routes: Arc<Mutex<ProgressRoutes>>,
 ) -> ProgressDispatch {
     // One writer thread owns the blocking write to the stdio client, fed by a
@@ -9892,7 +9877,7 @@ fn bind_progress_sink(dispatch: &ProgressDispatch, producer: &str) -> downstream
 /// owns the URI (SOU-398). Bound per downstream via [`bind_resource_updated_sink`].
 fn make_resource_updated_sink(
     stdout: Arc<Mutex<std::io::Stdout>>,
-    mcp_sessions: Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
+    mcp_sessions: Arc<Mutex<HashMap<String, Arc<SessionState>>>>,
     subs: Arc<Mutex<ResourceSubscriptionTable>>,
 ) -> ResourceUpdatedDispatch {
     Arc::new(move |producer: String, uri: String| {
@@ -10396,7 +10381,7 @@ fn reconcile_quarantine(
     router: &Arc<Mutex<Arc<Router>>>,
     stdout: &Arc<Mutex<std::io::Stdout>>,
     profile: Option<&str>,
-    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
+    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<SessionState>>>>>,
 ) -> bool {
     match effective_quarantine(registry, profile) {
         Some(want) => reconcile_to(router, stdout, mcp_sessions, want),
@@ -10416,7 +10401,7 @@ fn reconcile_quarantine(
 fn reconcile_to(
     router: &Arc<Mutex<Arc<Router>>>,
     stdout: &Arc<Mutex<std::io::Stdout>>,
-    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
+    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<SessionState>>>>>,
     want: BTreeSet<String>,
 ) -> bool {
     let changed = {
@@ -10531,7 +10516,7 @@ fn persist_and_emit_with_sessions(
     router: &Arc<Mutex<Arc<Router>>>,
     previous_router: Option<&Router>,
     stdout: &Arc<Mutex<std::io::Stdout>>,
-    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
+    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<SessionState>>>>>,
     profile: Option<&str>,
 ) {
     if router_is_fail_closed(router) {
@@ -10750,7 +10735,7 @@ fn watch_registry(
     client_root: Arc<Mutex<Option<String>>>,
     // Live HTTP MCP sessions so list_changed notifications also fan out over SSE
     // (SOU-328). Empty in pure-stdio mode; same Arc as GatewayState.
-    mcp_sessions: Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
+    mcp_sessions: Arc<Mutex<HashMap<String, Arc<SessionState>>>>,
     // Resource-updated dispatch re-wired into rebuilds after registry reload
     // (SOU-394 / SOU-398).
     resource_updated: Option<ResourceUpdatedDispatch>,
@@ -10818,7 +10803,7 @@ fn watch_tick(
     downstream_dirty: &Arc<AtomicU8>,
     server_handler: &ServerRequestHandler,
     client_root: &Arc<Mutex<Option<String>>>,
-    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
+    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<SessionState>>>>>,
     resource_updated: Option<&ResourceUpdatedDispatch>,
     resource_subs: Option<&Arc<Mutex<ResourceSubscriptionTable>>>,
     // Serializes full rebuilds with self-heal / ${ROOT} (SOU-337). Unused on the
@@ -11188,9 +11173,9 @@ struct GatewayState {
     http_allowed_origins: Vec<String>,
     /// Streamable-HTTP MCP sessions (`Mcp-Session-Id` → state). Only used when
     /// `http` is true; empty for stdio gateways.
-    mcp_sessions: Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
+    mcp_sessions: Arc<Mutex<HashMap<String, Arc<SessionState>>>>,
     /// Client-declared upstream capabilities (stdio gateway). Per-session copy on
-    /// [`McpSession`] for HTTP MCP clients.
+    /// [`SessionState`] for HTTP MCP clients.
     client_upstream: Arc<Mutex<ClientUpstreamCaps>>,
     /// The upstream client's project root path for the `${ROOT}` cwd token
     /// (issue #239), decoded from its first declared root via `file_uri_to_path`.
@@ -11198,7 +11183,7 @@ struct GatewayState {
     /// servers fall back to the gateway cwd until it is set. stdio-only.
     client_root: Arc<Mutex<Option<String>>>,
     /// Forward server-initiated JSON-RPC to the stdio upstream client.
-    stdio_upstream: Arc<StdioUpstream>,
+    stdio_upstream: Arc<SessionState>,
     /// Answers downstream server-initiated RPC (roots, sampling, elicitation).
     server_handler: ServerRequestHandler,
     /// This stdio gateway's single client id + boot `CONDUIT_PROFILE`, kept so the
@@ -11229,92 +11214,6 @@ struct ClientRootsState {
     supported: bool,
     list_changed: bool,
     roots: Vec<Value>,
-}
-
-/// Pending upstream JSON-RPC over stdio (gateway → client request, client → response).
-struct StdioUpstream {
-    stdout: Arc<Mutex<std::io::Stdout>>,
-    pending: Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<Value>>>>,
-    next_id: AtomicI64,
-}
-
-impl StdioUpstream {
-    fn new(stdout: Arc<Mutex<std::io::Stdout>>) -> Self {
-        Self {
-            stdout,
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            next_id: AtomicI64::new(1),
-        }
-    }
-
-    fn call(&self, method: &str, params: Value) -> Result<Value, String> {
-        self.call_timeout(method, params, upstream_rpc_timeout(method))
-    }
-
-    fn call_timeout(
-        &self,
-        method: &str,
-        params: Value,
-        timeout: Duration,
-    ) -> Result<Value, String> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let id_key = id.to_string();
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id_key.clone(), tx);
-        let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        let send = {
-            let mut out = self
-                .stdout
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            write_json_line(&mut *out, &req).map_err(|e| e.to_string())
-        };
-        if let Err(e) = send {
-            self.pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&id_key);
-            return Err(e);
-        }
-        let resp = match rx.recv_timeout(timeout) {
-            Ok(v) => v,
-            Err(_) => {
-                self.pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&id_key);
-                return Err("upstream client did not answer".to_string());
-            }
-        };
-        if let Some(err) = resp.get("error") {
-            return Err(err.to_string());
-        }
-        Ok(resp.get("result").cloned().unwrap_or(Value::Null))
-    }
-
-    /// If `msg` answers a pending upstream call, deliver it and return true.
-    fn try_deliver(&self, msg: &Value) -> bool {
-        if !is_jsonrpc_response(msg) {
-            return false;
-        }
-        let Some(id) = msg.get("id").and_then(rpc_id_key) else {
-            return false;
-        };
-        let tx = self
-            .pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&id);
-        if let Some(tx) = tx {
-            let _ = tx.send(msg.clone());
-            true
-        } else {
-            false
-        }
-    }
 }
 
 fn should_write_legacy_stdio_resource_update(need_stdio: bool, modern_stdio: bool) -> bool {
@@ -11403,7 +11302,7 @@ fn register_modern_subscription(
     cancel: Option<&downstream::CancelContext>,
     owner: Option<&McpSessionOwner>,
     transport: ModernSubscriptionTransport,
-) -> Result<(String, Arc<McpSession>), Value> {
+) -> Result<(String, Arc<SessionState>), Value> {
     let id = req
         .get("id")
         .cloned()
@@ -11485,12 +11384,14 @@ fn register_modern_subscription(
         }
     }
 
-    let session = Arc::new(McpSession::new_modern(
-        owner.cloned(),
-        id,
-        filter,
-        transport,
-    ));
+    let session = Arc::new(match transport {
+        ModernSubscriptionTransport::Http => {
+            SessionState::new_modern(owner.cloned(), id, filter, transport)
+        }
+        ModernSubscriptionTransport::Stdio => {
+            SessionState::new_modern_stdio(id, filter, Arc::clone(&state.stdout))
+        }
+    });
     if transport == ModernSubscriptionTransport::Http {
         let _ = session.try_begin_listen();
     }
@@ -11523,40 +11424,18 @@ fn register_modern_subscription(
             "Toolport: too many active subscription listeners; retry later",
         ));
     }
-    match transport {
-        ModernSubscriptionTransport::Http => {
-            if !session.push_message(acknowledgement, None) {
-                state
-                    .mcp_sessions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&key);
-                cleanup_resource_subs_for_session(state, &key);
-                return Err(error(Value::Null, -32603, "subscription queue is full"));
-            }
-        }
-        ModernSubscriptionTransport::Stdio => {
-            let value = serde_json::from_str::<Value>(&acknowledgement)
-                .map_err(|_| error(Value::Null, -32603, "failed to encode acknowledgement"))?;
-            let mut out = state
-                .stdout
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if write_json_line(&mut *out, &value).is_err() {
-                drop(out);
-                state
-                    .mcp_sessions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&key);
-                cleanup_resource_subs_for_session(state, &key);
-                return Err(error(
-                    Value::Null,
-                    -32603,
-                    "failed to write acknowledgement",
-                ));
-            }
-        }
+    if !session.push_message(acknowledgement, None) {
+        state
+            .mcp_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&key);
+        cleanup_resource_subs_for_session(state, &key);
+        return Err(error(
+            Value::Null,
+            -32603,
+            "failed to deliver acknowledgement",
+        ));
     }
     Ok((key, session))
 }
@@ -11656,10 +11535,29 @@ struct ModernSubscription {
     transport: ModernSubscriptionTransport,
 }
 
-/// Per-session state for streamable-HTTP MCP (POST responses + GET listen stream).
-struct McpSession {
-    /// The authenticated HTTP identity and effective scope that initialized this
-    /// session. `None` is used only by direct unit-test callers.
+/// How a session reaches its upstream client.
+///
+/// Both transports share the same session record, ownership, capability gate, and
+/// server-initiated request correlation. Only the delivery sink differs: an HTTP
+/// session queues messages for the `GET /mcp` listen stream, while a stdio
+/// session writes each message to the process stdout.
+enum SessionTransportFace {
+    /// Streamable HTTP: server-to-client messages queue for an SSE listener.
+    Http,
+    /// One stdio client: server-to-client messages go straight to stdout.
+    Stdio(Arc<Mutex<std::io::Stdout>>),
+}
+
+/// Per-session state, shared by the stdio and streamable-HTTP transports
+/// (one-gateway-per-host P1.2). This is the type the stdio path used to call
+/// `StdioUpstream` and the HTTP path `McpSession`; unifying them removes the
+/// second copy of the upstream call/correlation logic.
+struct SessionState {
+    /// The transport that delivers server-to-client messages.
+    transport: SessionTransportFace,
+    /// The authenticated identity and effective scope that initialized this
+    /// session. `None` is used only by direct unit-test callers and the local
+    /// stdio client, which has no bearer identity.
     owner: Option<McpSessionOwner>,
     last_seen: Mutex<Instant>,
     outbound: Mutex<VecDeque<McpOutboundMessage>>,
@@ -11681,9 +11579,18 @@ struct McpOutboundMessage {
     request_id: Option<String>,
 }
 
-impl McpSession {
-    fn new(owner: Option<McpSessionOwner>) -> Self {
+impl SessionState {
+    fn new_http(owner: Option<McpSessionOwner>) -> Self {
+        Self::with_transport(SessionTransportFace::Http, owner)
+    }
+
+    fn new_stdio(stdout: Arc<Mutex<std::io::Stdout>>) -> Self {
+        Self::with_transport(SessionTransportFace::Stdio(stdout), None)
+    }
+
+    fn with_transport(transport: SessionTransportFace, owner: Option<McpSessionOwner>) -> Self {
         Self {
+            transport,
             owner,
             last_seen: Mutex::new(Instant::now()),
             outbound: Mutex::new(VecDeque::new()),
@@ -11703,7 +11610,7 @@ impl McpSession {
         filter: ModernSubscriptionFilter,
         transport: ModernSubscriptionTransport,
     ) -> Self {
-        let mut session = Self::new(owner);
+        let mut session = Self::new_http(owner);
         session.modern_subscription = Some(ModernSubscription {
             id,
             filter,
@@ -11712,12 +11619,20 @@ impl McpSession {
         session
     }
 
-    fn is_modern_stdio(&self) -> bool {
-        self.modern_subscription
-            .as_ref()
-            .is_some_and(|subscription| {
-                subscription.transport == ModernSubscriptionTransport::Stdio
-            })
+    /// A modern stdio subscription listener: the same session record with a
+    /// stdio transport face, so its notifications reach stdout.
+    fn new_modern_stdio(
+        id: Value,
+        filter: ModernSubscriptionFilter,
+        stdout: Arc<Mutex<std::io::Stdout>>,
+    ) -> Self {
+        let mut session = Self::new_stdio(stdout);
+        session.modern_subscription = Some(ModernSubscription {
+            id,
+            filter,
+            transport: ModernSubscriptionTransport::Stdio,
+        });
+        session
     }
 
     fn modern_subscription_id_key(&self) -> Option<String> {
@@ -11801,7 +11716,7 @@ impl McpSession {
         Ok(resp.get("result").cloned().unwrap_or(Value::Null))
     }
 
-    fn try_deliver_upstream(&self, msg: &Value) -> bool {
+    fn try_deliver(&self, msg: &Value) -> bool {
         if !is_jsonrpc_response(msg) {
             return false;
         }
@@ -11828,6 +11743,10 @@ impl McpSession {
     }
 
     fn is_expired(&self) -> bool {
+        // A stdio session lives as long as the process that owns the connection.
+        if matches!(self.transport, SessionTransportFace::Stdio(_)) {
+            return false;
+        }
         if self.modern_subscription.is_some() {
             return false;
         }
@@ -11835,6 +11754,12 @@ impl McpSession {
             .lock()
             .map(|t| t.elapsed() >= MCP_SESSION_TTL)
             .unwrap_or(true)
+    }
+
+    /// Issue a server-to-client request over whichever transport this session
+    /// uses, with the method's default timeout.
+    fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+        self.upstream_call_timeout(method, params, upstream_rpc_timeout(method))
     }
 
     fn close(&self) {
@@ -11851,18 +11776,34 @@ impl McpSession {
         self.wait.1.notify_all();
     }
 
+    /// Send one server-to-client JSON-RPC message. HTTP queues it for the listen
+    /// stream; stdio writes it straight to the client. Returns false when the
+    /// message could not be delivered (queue full, or a write failure).
     fn push_message(&self, json: String, request_id: Option<String>) -> bool {
-        let mut outbound = self
-            .outbound
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if outbound.len() >= MCP_SESSION_OUTBOUND_MAX {
-            return false;
+        match &self.transport {
+            SessionTransportFace::Stdio(stdout) => {
+                let Ok(value) = serde_json::from_str::<Value>(&json) else {
+                    return false;
+                };
+                let mut out = stdout
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                write_json_line(&mut *out, &value).is_ok()
+            }
+            SessionTransportFace::Http => {
+                let mut outbound = self
+                    .outbound
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if outbound.len() >= MCP_SESSION_OUTBOUND_MAX {
+                    return false;
+                }
+                outbound.push_back(McpOutboundMessage { json, request_id });
+                drop(outbound);
+                self.wait.1.notify_all();
+                true
+            }
         }
-        outbound.push_back(McpOutboundMessage { json, request_id });
-        drop(outbound);
-        self.wait.1.notify_all();
-        true
     }
 
     fn remove_queued_request(&self, request_id: &str) {
@@ -11905,14 +11846,14 @@ impl McpSession {
 
 /// Blocking `Read` adapter for a long-lived `GET /mcp` SSE listen stream.
 struct McpSseReader {
-    session: Arc<McpSession>,
+    session: Arc<SessionState>,
     cleanup: Option<(GatewayState, String)>,
     buf: Vec<u8>,
     pos: usize,
 }
 
 impl McpSseReader {
-    fn new(session: Arc<McpSession>) -> Self {
+    fn new(session: Arc<SessionState>) -> Self {
         Self {
             session,
             cleanup: None,
@@ -11921,7 +11862,7 @@ impl McpSseReader {
         }
     }
 
-    fn with_cleanup(session: Arc<McpSession>, state: GatewayState, key: String) -> Self {
+    fn with_cleanup(session: Arc<SessionState>, state: GatewayState, key: String) -> Self {
         Self {
             session,
             cleanup: Some((state, key)),
@@ -11996,12 +11937,12 @@ fn new_mcp_session_id() -> String {
 fn reap_stale_mcp_sessions(state: &GatewayState) {
     // Collect first so we do not hold the sessions lock across cleanup that may
     // call the router.
-    let stale: Vec<(String, Arc<McpSession>)> = {
+    let stale: Vec<(String, Arc<SessionState>)> = {
         let mut sessions = state
             .mcp_sessions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let stale: Vec<(String, Arc<McpSession>)> = sessions
+        let stale: Vec<(String, Arc<SessionState>)> = sessions
             .iter()
             .filter(|(_, session)| session.is_expired() || session.closed.load(Ordering::SeqCst))
             .map(|(id, session)| (id.clone(), Arc::clone(session)))
@@ -12028,7 +11969,7 @@ fn mint_mcp_session(
     owner: Option<&McpSessionOwner>,
 ) -> Result<String, HttpOut> {
     let sid = new_mcp_session_id();
-    let session = Arc::new(McpSession::new(owner.cloned()));
+    let session = Arc::new(SessionState::new_http(owner.cloned()));
     reap_stale_mcp_sessions(state);
     let mut sessions = state
         .mcp_sessions
@@ -12269,7 +12210,7 @@ const MODERN_HITL_MAX_PENDING: usize = 64;
 const MODERN_HITL_RETENTION: Duration = Duration::from_secs(approval::DEFAULT_TIMEOUT_SECS + 30);
 
 fn modern_hitl_input_required(token: &str) -> Value {
-    let input_request = session_state()
+    let input_request = session_tables()
         .hitl()
         .peek(token, |pending| pending.input_request.clone());
     json!({
@@ -12282,7 +12223,9 @@ fn modern_hitl_input_required(token: &str) -> Value {
 }
 
 fn modern_hitl_reason(token: &str) -> Option<approval::ApprovalReason> {
-    session_state().hitl().peek(token, |pending| pending.reason)
+    session_tables()
+        .hitl()
+        .peek(token, |pending| pending.reason)
 }
 
 fn downstream_input_responses(input_responses: Option<Value>) -> Option<Value> {
@@ -12308,7 +12251,7 @@ fn start_modern_hitl(
 ) -> Result<String, approval::ApprovalDecision> {
     let token = format!("toolport-hitl-{}", new_correlation_id());
     {
-        let mut approvals = session_state().hitl();
+        let mut approvals = session_tables().hitl();
         approvals.reap_expired();
         if approvals.len() >= MODERN_HITL_MAX_PENDING {
             return Err(approval::ApprovalDecision::Unreachable);
@@ -12357,7 +12300,7 @@ fn poll_modern_hitl(
     client: Option<&str>,
     input_responses: Option<Value>,
 ) -> ModernHitlPoll {
-    let (poll, remove) = session_state()
+    let (poll, remove) = session_tables()
         .hitl()
         .with(token, |pending| {
             if pending.name != name
@@ -12411,13 +12354,13 @@ fn poll_modern_hitl(
         })
         .unwrap_or((ModernHitlPoll::Missing, false));
     if remove {
-        session_state().hitl().remove(token);
+        session_tables().hitl().remove(token);
     }
     poll
 }
 
 fn update_modern_hitl_downstream(token: &str, result: &mut Value) {
-    session_state().hitl().with(token, |pending| {
+    session_tables().hitl().with(token, |pending| {
         pending.downstream = MrtrRequest {
             input_responses: None,
             request_state: result.get("requestState").cloned(),
@@ -12428,7 +12371,7 @@ fn update_modern_hitl_downstream(token: &str, result: &mut Value) {
 
 fn finish_modern_hitl(token: Option<&str>) {
     if let Some(token) = token {
-        session_state().hitl().remove(token);
+        session_tables().hitl().remove(token);
     }
 }
 
@@ -12445,8 +12388,8 @@ fn missing_modern_client_capability(id: Value, method: &str) -> Value {
 
 fn make_server_request_handler(
     client_upstream: Arc<Mutex<ClientUpstreamCaps>>,
-    stdio_upstream: Arc<StdioUpstream>,
-    mcp_sessions: Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
+    stdio_upstream: Arc<SessionState>,
+    mcp_sessions: Arc<Mutex<HashMap<String, Arc<SessionState>>>>,
     http: bool,
 ) -> ServerRequestHandler {
     Arc::new(move |req| {
@@ -12484,41 +12427,37 @@ fn make_server_request_handler(
         }
         let params = upstream_rpc_params(method, &screened_request);
         let timeout = upstream_rpc_timeout(method);
-        let result = if http {
+        // The HTTP session is resolved from the request's session id; the stdio
+        // gateway has exactly one, held on state. Either way the call and its
+        // correlation are the same SessionState method.
+        let http_session = if http {
             let sid = active_mcp_session()?;
-            let session = {
-                let sessions = mcp_sessions.lock().ok()?;
-                sessions.get(&sid).cloned()?
-            };
-            let supported = session
+            let sessions = mcp_sessions.lock().ok()?;
+            Some(sessions.get(&sid).cloned()?)
+        } else {
+            None
+        };
+        let supported = match &http_session {
+            Some(session) => session
                 .client_upstream
                 .lock()
                 .map(|caps| client_supports_server_request(&caps, &screened_request))
-                .unwrap_or(false);
-            if !supported {
-                if let Some(screened) = url_elicitation {
-                    return Some(broker_url_elicitation(id, screened));
-                }
-                return Some(ServerRequestAction::Respond(upstream_client_unsupported(
-                    id, method,
-                )));
-            }
-            session.upstream_call_timeout(method, params, timeout)
-        } else {
-            let supported = client_upstream
+                .unwrap_or(false),
+            None => client_upstream
                 .lock()
                 .map(|caps| client_supports_server_request(&caps, &screened_request))
-                .unwrap_or(false);
-            if !supported {
-                if let Some(screened) = url_elicitation {
-                    return Some(broker_url_elicitation(id, screened));
-                }
-                return Some(ServerRequestAction::Respond(upstream_client_unsupported(
-                    id, method,
-                )));
-            }
-            stdio_upstream.call_timeout(method, params, timeout)
+                .unwrap_or(false),
         };
+        if !supported {
+            if let Some(screened) = url_elicitation {
+                return Some(broker_url_elicitation(id, screened));
+            }
+            return Some(ServerRequestAction::Respond(upstream_client_unsupported(
+                id, method,
+            )));
+        }
+        let session = http_session.unwrap_or_else(|| Arc::clone(&stdio_upstream));
+        let result = session.upstream_call_timeout(method, params, timeout);
         Some(ServerRequestAction::Respond(upstream_json_rpc_response(
             id, result,
         )))
@@ -13536,7 +13475,7 @@ struct McpHttpRequestHeaders<'a> {
 }
 
 struct McpListen {
-    session: Arc<McpSession>,
+    session: Arc<SessionState>,
     cleanup: Option<(GatewayState, String)>,
 }
 
@@ -13551,7 +13490,7 @@ impl HttpOut {
         }
     }
 
-    fn mcp_listen(session: Arc<McpSession>) -> Self {
+    fn mcp_listen(session: Arc<SessionState>) -> Self {
         Self {
             status: 200,
             ctype: "text/event-stream",
@@ -13564,7 +13503,7 @@ impl HttpOut {
         }
     }
 
-    fn modern_mcp_listen(state: GatewayState, key: String, session: Arc<McpSession>) -> Self {
+    fn modern_mcp_listen(state: GatewayState, key: String, session: Arc<SessionState>) -> Self {
         Self {
             status: 200,
             ctype: "text/event-stream",
@@ -13601,7 +13540,7 @@ fn mcp_require_session(
     state: &GatewayState,
     session_hdr: Option<&str>,
     owner: Option<&McpSessionOwner>,
-) -> Result<(String, Arc<McpSession>), HttpOut> {
+) -> Result<(String, Arc<SessionState>), HttpOut> {
     let Some(sid) = session_hdr.map(str::trim).filter(|s| !s.is_empty()) else {
         return Err(HttpOut::json_err(
             400,
@@ -14022,7 +13961,7 @@ fn handle_mcp_http(
                 if is_jsonrpc_response(&req) {
                     if let Ok(sessions) = state.mcp_sessions.lock() {
                         if let Some(sess) = sessions.get(session_id) {
-                            if sess.try_deliver_upstream(&req) {
+                            if sess.try_deliver(&req) {
                                 return HttpOut::new(202, "text/plain", String::new())
                                     .with_header("Mcp-Session-Id", session_id);
                             }
@@ -16045,7 +15984,7 @@ fn main() {
     // Single-flight for every router build/swap (startup, watcher self-heal, and
     // ${ROOT} rebuilds). Created up front so the startup build can share it.
     let rebuild_lock = Arc::new(Mutex::new(()));
-    let stdio_upstream = Arc::new(StdioUpstream::new(Arc::clone(&stdout)));
+    let stdio_upstream = Arc::new(SessionState::new_stdio(Arc::clone(&stdout)));
     let server_handler = make_server_request_handler(
         Arc::clone(&client_upstream),
         Arc::clone(&stdio_upstream),
@@ -17749,7 +17688,7 @@ mod tests {
         let stdout = Arc::new(Mutex::new(std::io::stdout()));
         let handler = make_server_request_handler(
             Arc::new(Mutex::new(ClientUpstreamCaps::default())),
-            Arc::new(StdioUpstream::new(stdout)),
+            Arc::new(SessionState::new_stdio(stdout)),
             Arc::new(Mutex::new(HashMap::new())),
             false,
         );
@@ -17806,7 +17745,7 @@ mod tests {
         let stdout = Arc::new(Mutex::new(std::io::stdout()));
         let handler = make_server_request_handler(
             Arc::new(Mutex::new(ClientUpstreamCaps::default())),
-            Arc::new(StdioUpstream::new(stdout)),
+            Arc::new(SessionState::new_stdio(stdout)),
             Arc::new(Mutex::new(HashMap::new())),
             false,
         );
@@ -17834,7 +17773,7 @@ mod tests {
 
     #[test]
     fn initial_modern_hitl_call_starts_mrtr_without_retry_fields() {
-        session_state().hitl().clear();
+        session_tables().hitl().clear();
         let request = json!({
             "params": {
                 "_meta": {
@@ -17971,7 +17910,7 @@ mod tests {
     #[test]
     fn modern_hitl_state_is_bound_to_the_exact_call() {
         let token = format!("test-{}", new_correlation_id());
-        session_state().hitl().insert(
+        session_tables().hitl().insert(
             &token,
             ModernHitlApproval {
                 name: "s__wipe".into(),
@@ -18002,7 +17941,7 @@ mod tests {
     fn session_state_tables_reap_on_close_and_enforce_their_cap() {
         // P1.2: the PII and HITL tables now sit on a SessionStore. Closing a
         // session drops its PII map, and the HITL table stays bounded.
-        let state = SessionState::new();
+        let state = SessionTables::new();
 
         // Reap on close: clearing the client's entry leaves a fresh, empty map.
         state.with_pii(Some("p12-client"), |map| {
@@ -21573,7 +21512,7 @@ mod tests {
         let stdout = Arc::new(Mutex::new(std::io::stdout()));
         let mcp_sessions = Arc::new(Mutex::new(HashMap::new()));
         let client_upstream = Arc::new(Mutex::new(ClientUpstreamCaps::default()));
-        let stdio_upstream = Arc::new(StdioUpstream::new(Arc::clone(&stdout)));
+        let stdio_upstream = Arc::new(SessionState::new_stdio(Arc::clone(&stdout)));
         let server_handler = make_server_request_handler(
             Arc::clone(&client_upstream),
             Arc::clone(&stdio_upstream),
@@ -24067,12 +24006,10 @@ mod tests {
             .is_none());
 
         fanout_mcp_notification(
-            &state.stdout,
             &state.mcp_sessions,
             &json!({ "jsonrpc": "2.0", "method": "notifications/prompts/list_changed" }),
         );
         fanout_mcp_notification(
-            &state.stdout,
             &state.mcp_sessions,
             &json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" }),
         );
@@ -24193,7 +24130,7 @@ mod tests {
         let state = http_state(true);
         let id = json!("listen-1");
         let key = modern_subscription_key(None, &id, ModernSubscriptionTransport::Stdio);
-        let session = Arc::new(McpSession::new_modern(
+        let session = Arc::new(SessionState::new_modern(
             None,
             id.clone(),
             ModernSubscriptionFilter {
@@ -24255,7 +24192,7 @@ mod tests {
         let sid_a = mint_mcp_session(&state, None).ok().unwrap();
         let sid_b = mint_mcp_session(&state, None).ok().unwrap();
         let msg = json!({"jsonrpc":"2.0","method":"notifications/resources/list_changed"});
-        fanout_mcp_notification(&state.stdout, &state.mcp_sessions, &msg);
+        fanout_mcp_notification(&state.mcp_sessions, &msg);
         for sid in [sid_a, sid_b] {
             let sessions = state.mcp_sessions.lock().unwrap();
             let session = sessions.get(&sid).unwrap();
@@ -24599,7 +24536,7 @@ mod tests {
 
     #[test]
     fn mcp_session_outbound_queue_is_bounded() {
-        let session = McpSession::new(None);
+        let session = SessionState::new_http(None);
         for i in 0..MCP_SESSION_OUTBOUND_MAX {
             assert!(session.push_message(
                 json!({"jsonrpc":"2.0","method":"notifications/test","params":{"i":i}}).to_string(),
@@ -24618,7 +24555,7 @@ mod tests {
 
     #[test]
     fn mcp_upstream_timeout_drops_undelivered_request() {
-        let session = McpSession::new(None);
+        let session = SessionState::new_http(None);
         let err = session
             .upstream_call_timeout("roots/list", json!({}), Duration::ZERO)
             .unwrap_err();
@@ -24629,7 +24566,7 @@ mod tests {
 
     #[test]
     fn mcp_upstream_call_fails_immediately_when_queue_is_full() {
-        let session = McpSession::new(None);
+        let session = SessionState::new_http(None);
         for _ in 0..MCP_SESSION_OUTBOUND_MAX {
             assert!(session.push_message("queued".to_string(), None));
         }
@@ -24646,9 +24583,13 @@ mod tests {
 
     #[test]
     fn stdio_upstream_delivery_requires_response_shape() {
-        let upstream = StdioUpstream::new(Arc::new(Mutex::new(std::io::stdout())));
+        let upstream = SessionState::new_stdio(Arc::new(Mutex::new(std::io::stdout())));
         let (tx, rx) = std::sync::mpsc::channel();
-        upstream.pending.lock().unwrap().insert("1".to_string(), tx);
+        upstream
+            .upstream_pending
+            .lock()
+            .unwrap()
+            .insert("1".to_string(), tx);
 
         let request = json!({
             "jsonrpc": "2.0",
@@ -24657,7 +24598,7 @@ mod tests {
             "params": {}
         });
         assert!(!upstream.try_deliver(&request));
-        assert!(upstream.pending.lock().unwrap().contains_key("1"));
+        assert!(upstream.upstream_pending.lock().unwrap().contains_key("1"));
 
         let response = json!({
             "jsonrpc": "2.0",
@@ -24666,12 +24607,12 @@ mod tests {
         });
         assert!(upstream.try_deliver(&response));
         assert_eq!(rx.try_recv().unwrap(), response);
-        assert!(upstream.pending.lock().unwrap().is_empty());
+        assert!(upstream.upstream_pending.lock().unwrap().is_empty());
     }
 
     #[test]
     fn http_upstream_delivery_requires_response_shape() {
-        let session = McpSession::new(None);
+        let session = SessionState::new_http(None);
         let (tx, rx) = std::sync::mpsc::channel();
         session
             .upstream_pending
@@ -24685,29 +24626,33 @@ mod tests {
             "method": "tools/list",
             "params": {}
         });
-        assert!(!session.try_deliver_upstream(&request));
+        assert!(!session.try_deliver(&request));
         assert!(session.upstream_pending.lock().unwrap().contains_key("1"));
 
         let response = json!({ "jsonrpc": "2.0", "id": 1, "result": {} });
-        assert!(session.try_deliver_upstream(&response));
+        assert!(session.try_deliver(&response));
         assert_eq!(rx.try_recv().unwrap(), response);
         assert!(session.upstream_pending.lock().unwrap().is_empty());
     }
 
     #[test]
     fn upstream_delivery_distinguishes_numeric_and_string_ids() {
-        let upstream = StdioUpstream::new(Arc::new(Mutex::new(std::io::stdout())));
+        let upstream = SessionState::new_stdio(Arc::new(Mutex::new(std::io::stdout())));
         let numeric_key = rpc_id_key(&json!(1)).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         upstream
-            .pending
+            .upstream_pending
             .lock()
             .unwrap()
             .insert(numeric_key.clone(), tx);
 
         let string_response = json!({ "jsonrpc": "2.0", "id": "1", "result": {} });
         assert!(!upstream.try_deliver(&string_response));
-        assert!(upstream.pending.lock().unwrap().contains_key(&numeric_key));
+        assert!(upstream
+            .upstream_pending
+            .lock()
+            .unwrap()
+            .contains_key(&numeric_key));
 
         let numeric_response = json!({ "jsonrpc": "2.0", "id": 1, "result": {} });
         assert!(upstream.try_deliver(&numeric_response));
@@ -28366,7 +28311,7 @@ mod tests {
         let client_root = Arc::new(Mutex::new(None));
         let server_handler: ServerRequestHandler = Arc::new(|_| None);
         let rebuild_lock = Arc::new(Mutex::new(()));
-        let session = Arc::new(McpSession::new(None));
+        let session = Arc::new(SessionState::new_http(None));
         let mcp_sessions = Arc::new(Mutex::new(HashMap::from([(
             "routine-watch".to_string(),
             Arc::clone(&session),
