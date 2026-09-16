@@ -15759,6 +15759,7 @@ fn detach_from_client_session() {
 #[cfg(not(unix))]
 fn detach_from_client_session() {}
 
+/// Entry point: classify the command line, then run the requested role.
 fn main() {
     // `--help`/`--version`/an unrecognized flag are decided before anything
     // else touches disk, the keychain, or stdin - see #605. Positional args

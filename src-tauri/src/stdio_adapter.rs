@@ -96,6 +96,7 @@ struct Session {
 }
 
 impl Session {
+    /// Wrap a descriptor in the shared adapter state.
     fn new(descriptor: &DaemonDescriptor) -> Self {
         Self {
             descriptor: descriptor.clone(),
@@ -104,6 +105,7 @@ impl Session {
         }
     }
 
+    /// The negotiated `Mcp-Session-Id`, if `initialize` has answered yet.
     fn session_id(&self) -> Option<String> {
         self.session_id.lock().ok().and_then(|guard| guard.clone())
     }
