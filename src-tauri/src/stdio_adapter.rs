@@ -10,11 +10,16 @@
 //! back to. A transport failure becomes a JSON-RPC error to the client, and the
 //! default stdio role stays the existing in-process gateway (the rollback is the
 //! flag, not a code path).
+//!
+//! Requests run on bounded worker threads, so a client that pipelines a slow call
+//! and a fast one is answered in completion order rather than arrival order.
+//! Notifications stay on the reader thread, which keeps a cancellation ahead of
+//! anything queued behind it.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::daemon::{DaemonDescriptor, Rendezvous};
 use crate::registry;
@@ -32,6 +37,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const LISTEN_POLL: Duration = Duration::from_millis(100);
 /// Backoff between listen-stream reconnects.
 const LISTEN_RECONNECT: Duration = Duration::from_millis(500);
+/// How many requests may be in flight against the daemon at once. A client that
+/// pipelines a slow call and a fast one gets the fast answer without waiting, and
+/// past this cap the reader applies backpressure by joining the oldest worker.
+const MAX_INFLIGHT: usize = 32;
+/// On client EOF, how long to let in-flight requests finish before the session is
+/// deleted. The client is already gone, so this is a courtesy rather than a wait.
+const EOF_GRACE: Duration = Duration::from_secs(5);
 
 /// Whether the command line asked for the adapter role. Kept beside the flag so
 /// the help text and the parser cannot disagree.
@@ -195,12 +207,88 @@ fn response_frames(response: ureq::Response) -> Result<Vec<String>, String> {
         .collect())
 }
 
-/// Read from stdin and proxy to the daemon until EOF. Each message is sent
-/// synchronously; a failed send becomes a JSON-RPC error for that request rather
-/// than a silent drop or a fallback.
+/// Runs one exchange per worker thread, bounded, so a slow call cannot stall the
+/// reader. The job is a closure rather than a `Session` method so the dispatch and
+/// bounding can be tested without a daemon.
+struct Dispatcher {
+    run: Arc<dyn Fn(String) + Send + Sync>,
+    workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    max_inflight: usize,
+}
+
+impl Dispatcher {
+    fn new(run: Arc<dyn Fn(String) + Send + Sync>, max_inflight: usize) -> Self {
+        Self {
+            run,
+            workers: Mutex::new(Vec::new()),
+            max_inflight,
+        }
+    }
+
+    /// Drop handles for workers that have finished, so the live count stays true.
+    fn reap(&self) {
+        if let Ok(mut workers) = self.workers.lock() {
+            workers.retain(|handle| !handle.is_finished());
+        }
+    }
+
+    /// Send one request on a worker thread. When the cap is reached, wait for the
+    /// oldest request instead of growing without bound.
+    fn dispatch(&self, body: String) {
+        self.reap();
+        let run = Arc::clone(&self.run);
+        let mut workers = match self.workers.lock() {
+            Ok(workers) => workers,
+            Err(_) => return,
+        };
+        while workers.len() >= self.max_inflight {
+            let oldest = workers.remove(0);
+            let _ = oldest.join();
+        }
+        workers.push(std::thread::spawn(move || run(body)));
+    }
+
+    /// Let in-flight work settle for `grace`, then stop waiting. Anything still
+    /// running is abandoned to process exit: the client has already gone away.
+    fn drain(&self, grace: Duration) {
+        let deadline = Instant::now() + grace;
+        loop {
+            self.reap();
+            let remaining = self
+                .workers
+                .lock()
+                .map(|workers| workers.len())
+                .unwrap_or(0);
+            if remaining == 0 || Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// Read from stdin and proxy to the daemon until EOF. A request (one carrying an
+/// id) runs on a worker so a slow call does not hold up the ones behind it; a
+/// notification runs inline so its order against the requests around it is kept,
+/// which is what makes a cancellation reach the daemon promptly. A failed exchange
+/// becomes a JSON-RPC error for that request rather than a silent drop or a
+/// fallback.
 fn proxy_stdio(descriptor: &DaemonDescriptor) -> Result<(), String> {
     let session = Arc::new(Session::new(descriptor));
     spawn_listen_stream(Arc::clone(&session));
+
+    let dispatcher = Dispatcher::new(
+        {
+            let session = Arc::clone(&session);
+            Arc::new(move |body: String| {
+                let request = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+                if let Err(error) = session.exchange(&body) {
+                    report_request_error(&session, &request, &error);
+                }
+            })
+        },
+        MAX_INFLIGHT,
+    );
 
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
@@ -228,10 +316,14 @@ fn proxy_stdio(descriptor: &DaemonDescriptor) -> Result<(), String> {
                 continue;
             }
         };
-        if let Err(error) = session.exchange(trimmed) {
+        let is_request = request.get("id").map(|id| !id.is_null()).unwrap_or(false);
+        if is_request {
+            dispatcher.dispatch(trimmed.to_string());
+        } else if let Err(error) = session.exchange(trimmed) {
             report_request_error(&session, &request, &error);
         }
     }
+    dispatcher.drain(EOF_GRACE);
     session.close();
     Ok(())
 }
@@ -394,5 +486,114 @@ mod tests {
             read_bounded_line(&mut reader, 4).unwrap(),
             Some(ClientFrame::Line("ok".to_string()))
         );
+    }
+
+    use std::sync::Condvar;
+
+    /// Build a dispatcher whose jobs record into `completed`, with `slow` blocking
+    /// until `release` is set.
+    fn blocking_dispatcher(
+        release: Arc<(Mutex<bool>, Condvar)>,
+        completed: Arc<Mutex<Vec<String>>>,
+        started: std::sync::mpsc::Sender<String>,
+    ) -> Dispatcher {
+        Dispatcher::new(
+            Arc::new(move |body: String| {
+                if body == "slow" {
+                    let _ = started.send(body.clone());
+                    let (lock, cvar) = &*release;
+                    let mut go = lock.lock().unwrap();
+                    while !*go {
+                        go = cvar.wait(go).unwrap();
+                    }
+                }
+                completed.lock().unwrap().push(body);
+            }),
+            4,
+        )
+    }
+
+    #[test]
+    fn a_slow_exchange_does_not_block_the_next_dispatch() {
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let dispatcher =
+            blocking_dispatcher(Arc::clone(&release), Arc::clone(&completed), started_tx);
+
+        dispatcher.dispatch("slow".to_string());
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the slow job started");
+
+        dispatcher.dispatch("fast".to_string());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !completed.lock().unwrap().iter().any(|body| body == "fast") {
+            assert!(
+                Instant::now() < deadline,
+                "the fast job never completed while the slow one was held"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        {
+            let (lock, cvar) = &*release;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        dispatcher.drain(Duration::from_secs(5));
+        let done = completed.lock().unwrap().clone();
+        assert!(done.contains(&"slow".to_string()), "{done:?}");
+        assert!(done.contains(&"fast".to_string()), "{done:?}");
+    }
+
+    #[test]
+    fn dispatch_applies_backpressure_at_the_cap() {
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let second_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let dispatcher = Arc::new(Dispatcher::new(
+            {
+                let release = Arc::clone(&release);
+                let second_started = Arc::clone(&second_started);
+                Arc::new(move |body: String| {
+                    if body == "first" {
+                        let _ = started_tx.send(body.clone());
+                        let (lock, cvar) = &*release;
+                        let mut go = lock.lock().unwrap();
+                        while !*go {
+                            go = cvar.wait(go).unwrap();
+                        }
+                    } else {
+                        second_started.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                })
+            },
+            1,
+        ));
+
+        dispatcher.dispatch("first".to_string());
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first job started");
+
+        // dispatch blocks at the cap, so run it off-thread and prove the second job
+        // cannot start until the first is released.
+        let second = Arc::clone(&dispatcher);
+        let handle = std::thread::spawn(move || second.dispatch("second".to_string()));
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !second_started.load(std::sync::atomic::Ordering::SeqCst),
+            "the pool ran past its cap"
+        );
+
+        {
+            let (lock, cvar) = &*release;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        handle.join().unwrap();
+        dispatcher.drain(Duration::from_secs(5));
+        assert!(second_started.load(std::sync::atomic::Ordering::SeqCst));
     }
 }
