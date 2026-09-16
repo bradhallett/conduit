@@ -68,7 +68,7 @@ impl<V> SessionStore<V> {
             },
         );
         while self.entries.len() > self.cap {
-            self.evict_oldest();
+            self.remove_oldest();
         }
     }
 
@@ -116,10 +116,62 @@ impl<V> SessionStore<V> {
         self.entries.get(key).map(|entry| f(&entry.value))
     }
 
+    /// Borrow the entry for `key` without refreshing its TTL, or `None` when it is
+    /// absent or already expired. For callers that need several reads in one lock,
+    /// where [`peek`](Self::peek)'s closure would fight the borrow checker.
+    pub fn get(&self, key: &str) -> Option<&V> {
+        if self.is_expired(key) {
+            return None;
+        }
+        self.entries.get(key).map(|entry| &entry.value)
+    }
+
     /// Remove `key`, releasing its value. This is the reap-on-close path: a
     /// transport face calls it when its session ends.
     pub fn remove(&mut self, key: &str) -> Option<V> {
         self.entries.remove(key).map(|entry| entry.value)
+    }
+
+    /// Drop every entry. Used when a process-level table is intentionally reset
+    /// (tests) rather than aged out.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Remove every entry for which `pred` returns true, returning how many were
+    /// removed. This is the reap-on-close path for a table keyed per value rather
+    /// than per principal (a session's shaped cursors, say), where closing the
+    /// session means dropping the values it owns.
+    pub fn remove_where(&mut self, mut pred: impl FnMut(&str, &V) -> bool) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|key, entry| !pred(key, &entry.value));
+        before - self.entries.len()
+    }
+
+    /// Sum `weight` over every value. Lets a caller enforce a budget that is not a
+    /// simple entry count (the shaped-result cache caps total bytes this way).
+    pub fn weight(&self, weight: impl Fn(&V) -> usize) -> usize {
+        self.entries
+            .values()
+            .map(|entry| weight(&entry.value))
+            .sum()
+    }
+
+    /// Drop the oldest entry by insertion order, returning whether one was removed.
+    /// Paired with [`weight`](Self::weight) so a caller can evict to a budget.
+    pub fn remove_oldest(&mut self) -> bool {
+        let oldest = self
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.seq)
+            .map(|(key, _)| key.clone());
+        match oldest {
+            Some(key) => {
+                self.entries.remove(&key);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Drop every expired entry, returning how many were removed.
@@ -135,17 +187,6 @@ impl<V> SessionStore<V> {
         self.entries
             .get(key)
             .is_some_and(|entry| entry.last_seen.elapsed() >= self.ttl)
-    }
-
-    fn evict_oldest(&mut self) {
-        let oldest = self
-            .entries
-            .iter()
-            .min_by_key(|(_, entry)| entry.seq)
-            .map(|(key, _)| key.clone());
-        if let Some(key) = oldest {
-            self.entries.remove(&key);
-        }
     }
 }
 
@@ -239,5 +280,32 @@ mod tests {
         let mut store = SessionStore::new(Duration::from_secs(60), 0);
         store.insert("a", 1);
         assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn remove_where_drops_matching_entries() {
+        let mut store = SessionStore::new(Duration::from_secs(60), 8);
+        store.insert("cursor-1", ("client-a", 1));
+        store.insert("cursor-2", ("client-b", 2));
+        store.insert("cursor-3", ("client-a", 3));
+        assert_eq!(store.remove_where(|_, value| value.0 == "client-a"), 2);
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.peek("cursor-2", |value| value.1), Some(2));
+    }
+
+    #[test]
+    fn weight_sums_values_and_remove_oldest_evicts_in_insert_order() {
+        let mut store = SessionStore::new(Duration::from_secs(60), 8);
+        store.insert("first", 10usize);
+        store.insert("second", 20);
+        assert_eq!(store.weight(|value| *value), 30);
+        assert!(store.remove_oldest());
+        assert_eq!(store.peek("first", |value| *value), None);
+        assert_eq!(store.weight(|value| *value), 20);
+        assert!(store.remove_oldest());
+        assert!(
+            !store.remove_oldest(),
+            "an empty store has nothing to evict"
+        );
     }
 }
