@@ -6,6 +6,15 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Added
+
+- **A Cursor "ask first" rule now prompts in Toolport instead of Cursor.** When the guard
+  is enforcing and a native call matches one of your ask-first rules, the question routes
+  to Toolport's approval window (the one destructive calls use) as its own reason, naming
+  the rule that matched, so agent prompts and tool approvals land in one place. A denial,
+  no answer in time, or Toolport not running all refuse the call, each saying which. The
+  Linux-native settings gained the per-agent switch for it.
+
 ## [1.19.0] - 2026-09-15
 
 Toolport 1.19.0 lets one shared gateway serve clients with different discovery

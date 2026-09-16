@@ -7,42 +7,60 @@ one release.
 
 ## Current state
 
-Grounded in the code as of this plan:
+Grounded in the code as of 2026-09-16 (through #894). Anything marked "not started" below
+is the honest next work, not a claim about ordering.
 
-- Phase 0 landed. `src-tauri/src/topology.rs` defines `GatewayRole` (including the not yet
-  constructed `Daemon` and `StdioAdapter`), `CompatKey`, `LaunchKey`, `TopologySnapshot`,
-  and the topology assertions. Nothing else in the binary uses the module yet.
-- The SBS-551 slice exists: `ActiveRequestContext` and its guards
-  (`toolport-gateway.rs:78` onward, `thread_local! ACTIVE_REQUEST_CONTEXT`). The design
-  calls this "the first boundary needed by the shared host daemon".
-- `GatewayState` (`toolport-gateway.rs:10904`) still mixes host and session state, and a
-  set of process globals still encode one-stdio-client assumptions (discovery/code mode,
+Landed:
+
+- Phase 0. `src-tauri/src/topology.rs` defines `GatewayRole`, `CompatKey`, `LaunchKey`,
+  `TopologySnapshot`, and the topology assertions.
+- P2.1 rendezvous primitives (`src-tauri/src/daemon.rs`, #880), plus the daemon roles:
+  P2.2a identity and P2.2b the full host runtime on the internal endpoint (#881), with a
+  cold-start test (#882).
+- P2.2c the stdio adapter, `--stdio-adapter` (#888), with a bounded worker pool for
+  concurrent requests (#891) and recovery after the daemon dies (#893). Opt-in only; the
+  default stdio role is untouched.
+- P2.3 daemon idle exit (#892) and adapter crash recovery (#893). The lease is the open
+  connection: the daemon exits once nothing has been in flight for `DAEMON_IDLE_GRACE`,
+  and the adapter re-rendezvouses and replays the client handshake on the next request
+  after a failure, without replaying the call that failed. Session TTL reaping
+  (`reap_stale_mcp_sessions`) predates this work.
+- P1.2 first increment: `session_store::SessionStore` (#894), a TTL and cap store for the
+  session-scoped maps, as a tested module with nothing wired to it yet.
+
+Still open:
+
+- P1.2 proper: introduce `SessionState`, move the PII map, shaped-result cursors, and
+  modern HITL approvals onto `SessionStore`, and unify `McpSession`/`StdioUpstream`. This
+  is the next slice and the largest one; it rewires security-sensitive state.
+- P1.3 `HostState`. `GatewayState` still mixes host and session state.
+- A set of process globals still encode one-stdio-client assumptions (discovery/code mode,
   stdio presence and era, progress routes, PII maps, modern HITL approvals, result stash,
   `SearchGuard`/`ConfirmGuard`).
-- There is no `HostState`, `SessionState`, or `RequestContext` type, and no topology
-  feature flag in the registry.
-- Reusable primitives already exist: the approval broker's `EndpointDescriptor` pattern
-  (`approval.rs:21`), `registry::atomic_write` (`registry.rs:377`), and the registry
-  cross-process `FileLock` (`registry.rs:3168`).
-- Client launch: `clients.rs:gateway_entry` builds the stdio entry and sets
-  `TOOLPORT_CLIENT_ID` (`clients.rs:5353`). The desktop app spawns `--http <port>` through
-  `http_bridge.rs:start_with_token_at` and kills it on exit (`desktop.rs:4569`).
+- No `HostState`, `SessionState`, or `RequestContext` type, and no topology feature flag in
+  the registry.
+- The adapter has not been dogfooded against a real client (P4.1).
+- Reusable primitives that already exist: the approval broker's `EndpointDescriptor`
+  (`approval.rs`), `registry::atomic_write`, and the registry cross-process `FileLock`.
+- Client launch: `clients.rs::gateway_entry` builds the stdio entry and sets
+  `TOOLPORT_CLIENT_ID`. The desktop app spawns `--http <port>` through
+  `http_bridge.rs::start_with_token_at` and kills it on exit.
 
 ## Delivery shape
 
-| PR  | Slice                                                               | Behavior change           |
-| --- | ------------------------------------------------------------------- | ------------------------- |
-| 1   | P2.1 rendezvous primitives (library module, tested)                 | none (new module only)    |
-| 2   | P2.2a identity role; P2.2b host runtime on the internal endpoint    | none (explicit flag only) |
-| 3   | P1.2 `SessionState` extracted from `GatewayState`                   | none                      |
-| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade    | none                      |
-| 5   | P2.2c stdio adapter speaks the daemon session protocol, behind flag | opt-in only               |
-| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback           | opt-in only               |
-| 7   | P3.1 union catalog built once, allowed-set enforced per session     | opt-in only               |
-| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding       | opt-in only, the big win  |
-| 9   | P4.1 dogfood flag, telemetry, acceptance run                        | opt-in only               |
-| 10  | P4.2 adapter topology becomes default; legacy kill switch remains   | default flip              |
-| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease      | separate, later           |
+| PR  | Slice                                                               | Behavior change           | Status                         |
+| --- | ------------------------------------------------------------------- | ------------------------- | ------------------------------ |
+| 1   | P2.1 rendezvous primitives (library module, tested)                 | none (new module only)    | landed (#880)                  |
+| 2   | P2.2a identity role; P2.2b host runtime on the internal endpoint    | none (explicit flag only) | landed (#881)                  |
+| 3   | P1.2 `SessionState` extracted from `GatewayState`                   | none                      | started: #894, extraction next |
+| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade    | none                      | not started                    |
+| 5   | P2.2c stdio adapter speaks the daemon session protocol, behind flag | opt-in only               | landed (#888, #891, #893)      |
+| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback           | opt-in only               | landed (#892, #893)            |
+| 7   | P3.1 union catalog built once, allowed-set enforced per session     | opt-in only               | not started                    |
+| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding       | opt-in only, the big win  | not started                    |
+| 9   | P4.1 dogfood flag, telemetry, acceptance run                        | opt-in only               | not started                    |
+| 10  | P4.2 adapter topology becomes default; legacy kill switch remains   | default flip              | not started                    |
+| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease      | separate, later           | not started                    |
 
 Each of 1 through 8 must leave the default topology untouched and all existing suites
 green. The only PRs that change what a user gets are 10 and 11.
@@ -72,6 +90,9 @@ mechanical rewrite of the request path.
 
 ### P1.2 SessionState
 
+Status: started. `session_store::SessionStore` landed as a tested module (#894); the
+extraction below is the remaining work.
+
 - Introduce `SessionState` owning exactly what the design lists: session id, principal and
   audit label, effective scope, protocol version and capabilities, roots and `${ROOT}`,
   upstream request correlation, outbound queue, cancellation, subscriptions, search guard,
@@ -80,7 +101,7 @@ mechanical rewrite of the request path.
   same type with a stdio transport face, deleting `StdioUpstream` as a separate concept.
 - PII maps, shaped-result cursors, and modern HITL approvals stay keyed by principal, but
   move behind a `SessionStore` with explicit TTL and cap, with tests for reap-on-close and
-  reap-on-TTL.
+  reap-on-TTL. The store itself is in place; moving these three maps onto it is next.
 
 ### P1.3 HostState
 
@@ -95,7 +116,7 @@ mechanical rewrite of the request path.
 
 ## Phase 2: rendezvous and the stdio adapter
 
-### P2.1 Rendezvous primitives (this PR)
+### P2.1 Rendezvous primitives (landed, #880)
 
 New library module `src-tauri/src/daemon.rs`, no gateway wiring and no behavior change yet:
 
@@ -120,28 +141,38 @@ concurrent cold starts elect exactly one daemon; a stale descriptor is replaced.
 
 ### P2.2 Host runtime and adapter
 
-- P2.2a (landed): `--daemon` is accepted and the P2.1 identity listener serves
+- P2.2a (landed, #881): `--daemon` is accepted and the P2.1 identity listener serves
   `/host/identity`.
-- P2.2b (this PR): `--daemon` runs the full host runtime on an ephemeral loopback endpoint
+- P2.2b (landed, #881): `--daemon` runs the full host runtime on an ephemeral loopback endpoint
   with a random internal bearer and publishes the descriptor. The internal
   `/host/identity` route is daemon-only, so the user-facing HTTP bridge never exposes the
   compat fingerprint or build. Still explicit-flag only, off the default startup path, and
   with the same registry, router, watcher, audit, and session tables as the HTTP bridge.
-- P2.2c: `--stdio-adapter` performs `Rendezvous::ensure` and speaks the daemon session
-  protocol with Toolport's Streamable HTTP/SSE: one session open, bidirectional JSON-RPC
-  translation, cancellation, oversized frames, and server-initiated RPC correlated back to
-  the originating session. No Node and no `mcp-remote`. Never fall back to the in-process
-  gateway after a request may have reached the daemon. Until it can serve, the default role
-  stays the existing in-process stdio gateway.
+- P2.2c (landed, #888, #891, #893): `--stdio-adapter` performs `Rendezvous::ensure` and
+  speaks the daemon session protocol with Toolport's Streamable HTTP/SSE: one session
+  open, bidirectional JSON-RPC translation, cancellation, oversized frames, and
+  server-initiated RPC correlated back to the originating session. Requests run on a
+  bounded worker pool (notifications stay on the reader, so a cancellation stays ahead of
+  what is queued behind it); a request that fails at the transport level is reported and
+  never replayed, and the next one re-rendezvouses and replays the client handshake. No
+  Node and no `mcp-remote`. The default role is still the existing in-process stdio
+  gateway.
 
-### P2.3 Lifecycle and failure
+### P2.3 Lifecycle and failure (landed, #892, #893)
 
-- Session lease on connect, immediate close on adapter EOF, TTL reaping for crashed
-  adapters with the same subscription/PII/confirmation cleanup as an explicit close.
-- Daemon idle exit after a testable grace period, only with no leases, in-flight calls,
-  pending approvals or server requests, and no active subscriptions.
-- Daemon crash: fail the affected in-flight request with a clear Toolport error, re-rendezvous
-  before the next request, never replay an ambiguous call.
+- Session lease on connect: the lease is the open connection. The adapter holds a long-lived
+  `GET /mcp` listen stream while it is connected and deletes the session on client EOF, so
+  per-session state is released at once. `reap_stale_mcp_sessions` still covers an adapter
+  that dies without the DELETE.
+- Daemon idle exit after `DAEMON_IDLE_GRACE`: landed (#892). It keys on nothing being in
+  flight for the whole grace rather than on the session table, so a session row left behind
+  by a crashed adapter cannot pin the process. Discovery is withdrawn before the exit is
+  final and put back if a client connected in that window. `TOOLPORT_DAEMON_IDLE_GRACE_MS`
+  overrides the grace for tests.
+- Daemon crash: landed (#893). The affected call fails with an error and is never replayed;
+  the next request re-runs the rendezvous and replays the client's `initialize` and
+  `notifications/initialized`, so the replacement gets an equivalent session. Healthy calls
+  share a read gate and run concurrently; recovery takes the write gate.
 - Rollback: `--stdio-adapter` is opt-in; the legacy in-process role stays the default.
 
 ## Phase 3: downstream launch pooling
