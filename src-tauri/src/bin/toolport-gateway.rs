@@ -11174,15 +11174,9 @@ struct GatewayState {
     /// Streamable-HTTP MCP sessions (`Mcp-Session-Id` → state). Only used when
     /// `http` is true; empty for stdio gateways.
     mcp_sessions: Arc<Mutex<HashMap<String, Arc<SessionState>>>>,
-    /// Client-declared upstream capabilities (stdio gateway). Per-session copy on
-    /// [`SessionState`] for HTTP MCP clients.
-    client_upstream: Arc<Mutex<ClientUpstreamCaps>>,
-    /// The upstream client's project root path for the `${ROOT}` cwd token
-    /// (issue #239), decoded from its first declared root via `file_uri_to_path`.
-    /// `None` until roots are fetched, or if the client declares none; `${ROOT}`
-    /// servers fall back to the gateway cwd until it is set. stdio-only.
-    client_root: Arc<Mutex<Option<String>>>,
-    /// Forward server-initiated JSON-RPC to the stdio upstream client.
+    /// Forward server-initiated JSON-RPC to the stdio upstream client, and carry its
+    /// declared capabilities and `${ROOT}` project root. The stdio client has exactly
+    /// one session, so its fields are this gateway's upstream-client state.
     stdio_upstream: Arc<SessionState>,
     /// Answers downstream server-initiated RPC (roots, sampling, elicitation).
     server_handler: ServerRequestHandler,
@@ -11567,6 +11561,14 @@ struct SessionState {
     client_upstream: Mutex<ClientUpstreamCaps>,
     upstream_pending: Mutex<HashMap<String, std::sync::mpsc::Sender<Value>>>,
     next_upstream_id: AtomicI64,
+    /// The upstream client's project root for the `${ROOT}` cwd token (issue #239),
+    /// decoded from its first declared root. `None` until roots are fetched or if the
+    /// client declares none, in which case `${ROOT}` servers use the gateway cwd.
+    ///
+    /// An `Arc` inside the session so the registry watcher can hold the root alone
+    /// (it predates the session and only needs this field) instead of the whole
+    /// session. stdio-only; always `None` for HTTP sessions.
+    client_root: Arc<Mutex<Option<String>>>,
     /// Present only for a 2026-07-28 `subscriptions/listen` request. Legacy
     /// Streamable-HTTP sessions keep this `None` and retain their existing fanout.
     modern_subscription: Option<ModernSubscription>,
@@ -11600,6 +11602,7 @@ impl SessionState {
             client_upstream: Mutex::new(ClientUpstreamCaps::default()),
             upstream_pending: Mutex::new(HashMap::new()),
             next_upstream_id: AtomicI64::new(1),
+            client_root: Arc::new(Mutex::new(None)),
             modern_subscription: None,
         }
     }
@@ -12387,7 +12390,6 @@ fn missing_modern_client_capability(id: Value, method: &str) -> Value {
 }
 
 fn make_server_request_handler(
-    client_upstream: Arc<Mutex<ClientUpstreamCaps>>,
     stdio_upstream: Arc<SessionState>,
     mcp_sessions: Arc<Mutex<HashMap<String, Arc<SessionState>>>>,
     http: bool,
@@ -12443,7 +12445,8 @@ fn make_server_request_handler(
                 .lock()
                 .map(|caps| client_supports_server_request(&caps, &screened_request))
                 .unwrap_or(false),
-            None => client_upstream
+            None => stdio_upstream
+                .client_upstream
                 .lock()
                 .map(|caps| client_supports_server_request(&caps, &screened_request))
                 .unwrap_or(false),
@@ -12467,6 +12470,7 @@ fn make_server_request_handler(
 /// Read the current resolved client project root for the `${ROOT}` cwd token.
 fn current_client_root(state: &GatewayState) -> Option<String> {
     state
+        .stdio_upstream
         .client_root
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -12564,6 +12568,7 @@ fn refresh_client_root(state: &GatewayState) {
         return;
     }
     let supported = state
+        .stdio_upstream
         .client_upstream
         .lock()
         .map(|c| c.roots.supported)
@@ -12585,7 +12590,7 @@ fn refresh_client_root(state: &GatewayState) {
                     .cloned()
                     .unwrap_or_default();
                 // Keep the init-captured field in sync for any downstream consumer.
-                if let Ok(mut caps) = state.client_upstream.lock() {
+                if let Ok(mut caps) = state.stdio_upstream.client_upstream.lock() {
                     caps.roots.roots = roots.clone();
                 }
                 roots
@@ -12623,6 +12628,7 @@ fn refresh_client_root(state: &GatewayState) {
     };
     let changed = {
         let mut cur = state
+            .stdio_upstream
             .client_root
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -12731,7 +12737,7 @@ fn process_request(
     }
 
     if method == "initialize" && !state.http {
-        if let Ok(mut caps) = state.client_upstream.lock() {
+        if let Ok(mut caps) = state.stdio_upstream.client_upstream.lock() {
             capture_client_upstream_from_init(&mut caps, req.get("params"));
         }
         // Fetch the client's roots off-thread and place ${ROOT} servers once known,
@@ -15964,8 +15970,6 @@ fn main() {
     // tool set mid-session propagates to the client instead of being dropped.
     let downstream_dirty = Arc::new(AtomicU8::new(0));
     let mcp_sessions = Arc::new(Mutex::new(HashMap::new()));
-    let client_upstream = Arc::new(Mutex::new(ClientUpstreamCaps::default()));
-    let client_root = Arc::new(Mutex::new(None::<String>));
     // Resource subscription tracking + drain-thread sink (SOU-394).
     let resource_subs = Arc::new(Mutex::new(ResourceSubscriptionTable::default()));
     let resource_updated_sink = Some(make_resource_updated_sink(
@@ -15986,7 +15990,6 @@ fn main() {
     let rebuild_lock = Arc::new(Mutex::new(()));
     let stdio_upstream = Arc::new(SessionState::new_stdio(Arc::clone(&stdout)));
     let server_handler = make_server_request_handler(
-        Arc::clone(&client_upstream),
         Arc::clone(&stdio_upstream),
         Arc::clone(&mcp_sessions),
         http_mode,
@@ -16009,7 +16012,7 @@ fn main() {
         let downstream_dirty = Arc::clone(&downstream_dirty);
         let server_handler = Arc::clone(&server_handler);
         let profile = Arc::clone(&profile);
-        let client_root = Arc::clone(&client_root);
+        let client_root = Arc::clone(&stdio_upstream.client_root);
         let rebuild_lock = Arc::clone(&rebuild_lock);
         let mcp_sessions = Arc::clone(&mcp_sessions);
         let resource_updated = resource_updated_sink.clone();
@@ -16116,7 +16119,7 @@ fn main() {
         let profile = Arc::clone(&profile);
         let client_id = client_id.clone();
         let env_profile = env_profile.clone();
-        let client_root = Arc::clone(&client_root);
+        let client_root = Arc::clone(&stdio_upstream.client_root);
         let mcp_sessions = Arc::clone(&mcp_sessions);
         let resource_updated = resource_updated_sink.clone();
         let resource_subs_watch = Arc::clone(&resource_subs);
@@ -16167,8 +16170,6 @@ fn main() {
         },
         http_allowed_origins: configured_allowed_origins(),
         mcp_sessions,
-        client_upstream,
-        client_root,
         stdio_upstream,
         server_handler,
         client_id: client_id.clone(),
@@ -17687,7 +17688,6 @@ mod tests {
     fn modern_server_requests_become_mrtr_only_with_the_required_capability() {
         let stdout = Arc::new(Mutex::new(std::io::stdout()));
         let handler = make_server_request_handler(
-            Arc::new(Mutex::new(ClientUpstreamCaps::default())),
             Arc::new(SessionState::new_stdio(stdout)),
             Arc::new(Mutex::new(HashMap::new())),
             false,
@@ -17744,7 +17744,6 @@ mod tests {
     fn modern_server_request_without_capability_returns_reserved_error() {
         let stdout = Arc::new(Mutex::new(std::io::stdout()));
         let handler = make_server_request_handler(
-            Arc::new(Mutex::new(ClientUpstreamCaps::default())),
             Arc::new(SessionState::new_stdio(stdout)),
             Arc::new(Mutex::new(HashMap::new())),
             false,
@@ -21511,10 +21510,8 @@ mod tests {
     fn http_state(lazy: bool) -> GatewayState {
         let stdout = Arc::new(Mutex::new(std::io::stdout()));
         let mcp_sessions = Arc::new(Mutex::new(HashMap::new()));
-        let client_upstream = Arc::new(Mutex::new(ClientUpstreamCaps::default()));
         let stdio_upstream = Arc::new(SessionState::new_stdio(Arc::clone(&stdout)));
         let server_handler = make_server_request_handler(
-            Arc::clone(&client_upstream),
             Arc::clone(&stdio_upstream),
             Arc::clone(&mcp_sessions),
             true,
@@ -21543,8 +21540,6 @@ mod tests {
             http_bind_host: "127.0.0.1".to_string(),
             http_allowed_origins: Vec::new(),
             mcp_sessions,
-            client_upstream,
-            client_root: Arc::new(Mutex::new(None)),
             stdio_upstream,
             server_handler,
             client_id: None,
