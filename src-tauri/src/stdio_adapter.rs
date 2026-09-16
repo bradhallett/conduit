@@ -202,14 +202,29 @@ fn proxy_stdio(descriptor: &DaemonDescriptor) -> Result<(), String> {
 
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
-    while let Some(line) = read_bounded_line(&mut reader, MAX_FRAME_BYTES)? {
+    while let Some(frame) = read_bounded_line(&mut reader, MAX_FRAME_BYTES)? {
+        let line = match frame {
+            ClientFrame::Oversized => {
+                write_error(
+                    &session,
+                    serde_json::Value::Null,
+                    -32600,
+                    "request frame exceeds the 16 MiB limit",
+                );
+                continue;
+            }
+            ClientFrame::Line(line) => line,
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
         let request: serde_json::Value = match serde_json::from_str(trimmed) {
             Ok(value) => value,
-            Err(_) => continue,
+            Err(_) => {
+                write_error(&session, serde_json::Value::Null, -32700, "parse error");
+                continue;
+            }
         };
         if let Err(error) = session.exchange(trimmed) {
             report_request_error(&session, &request, &error);
@@ -224,18 +239,9 @@ fn proxy_stdio(descriptor: &DaemonDescriptor) -> Result<(), String> {
 /// logged. Either way the transport problem is stated, never masked by a local
 /// retry.
 fn report_request_error(session: &Session, request: &serde_json::Value, error: &str) {
+    let message = format!("host daemon request failed: {error}");
     match request.get("id") {
-        Some(id) if !id.is_null() => {
-            let message = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {
-                    "code": -32603,
-                    "message": format!("host daemon request failed: {error}"),
-                }
-            });
-            let _ = session.write_message(&message.to_string());
-        }
+        Some(id) if !id.is_null() => write_error(session, id.clone(), -32603, &message),
         _ => {
             eprintln!("toolport-gateway {STDIO_ADAPTER_FLAG}: notification failed: {error}");
         }
@@ -264,8 +270,10 @@ fn spawn_listen_stream(session: Arc<Session>) {
             .call();
         match response {
             Ok(response) => {
-                let reader = BufReader::new(response.into_reader());
-                for line in reader.lines().map_while(Result::ok) {
+                let mut reader = BufReader::new(response.into_reader());
+                while let Ok(Some(ClientFrame::Line(line))) =
+                    read_bounded_line(&mut reader, MAX_FRAME_BYTES)
+                {
                     if let Some(data) = line.strip_prefix("data:") {
                         let data = data.trim();
                         if !data.is_empty() {
@@ -279,12 +287,31 @@ fn spawn_listen_stream(session: Arc<Session>) {
     });
 }
 
+/// One frame read from the client.
+#[derive(Debug, PartialEq, Eq)]
+enum ClientFrame {
+    /// A complete newline-delimited frame.
+    Line(String),
+    /// A frame that exceeded the cap; its bytes were drained and dropped.
+    Oversized,
+}
+
+/// Write a JSON-RPC error to the client.
+fn write_error(session: &Session, id: serde_json::Value, code: i64, message: &str) {
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": code, "message": message }
+    });
+    let _ = session.write_message(&response.to_string());
+}
+
 /// Read one newline-delimited frame, bounded so a client cannot make the adapter
-/// allocate without limit. `None` is EOF; a frame over the cap is skipped.
+/// allocate without limit. `None` is EOF.
 fn read_bounded_line<R: BufRead>(
     reader: &mut R,
     max_bytes: usize,
-) -> Result<Option<String>, String> {
+) -> Result<Option<ClientFrame>, String> {
     let mut buf = Vec::new();
     loop {
         let mut byte = [0u8; 1];
@@ -293,16 +320,21 @@ fn read_bounded_line<R: BufRead>(
                 return Ok(if buf.is_empty() {
                     None
                 } else {
-                    Some(String::from_utf8_lossy(&buf).into_owned())
+                    Some(ClientFrame::Line(
+                        String::from_utf8_lossy(&buf).into_owned(),
+                    ))
                 });
             }
             Ok(_) => {
                 if byte[0] == b'\n' {
-                    return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+                    return Ok(Some(ClientFrame::Line(
+                        String::from_utf8_lossy(&buf).into_owned(),
+                    )));
                 }
                 if buf.len() >= max_bytes {
                     // Drain the rest of this oversized frame so the next read starts
-                    // at the next newline, then skip it.
+                    // at the next newline, then report it rather than dropping it as
+                    // if it were an empty line.
                     loop {
                         let mut discard = [0u8; 1];
                         match reader.read(&mut discard) {
@@ -311,7 +343,7 @@ fn read_bounded_line<R: BufRead>(
                             Ok(_) => {}
                         }
                     }
-                    return Ok(Some(String::new()));
+                    return Ok(Some(ClientFrame::Oversized));
                 }
                 buf.push(byte[0]);
             }
@@ -340,25 +372,25 @@ mod tests {
         let mut reader = std::io::BufReader::new(&b"one\ntwo\n"[..]);
         assert_eq!(
             read_bounded_line(&mut reader, 16).unwrap(),
-            Some("one".to_string())
+            Some(ClientFrame::Line("one".to_string()))
         );
         assert_eq!(
             read_bounded_line(&mut reader, 16).unwrap(),
-            Some("two".to_string())
+            Some(ClientFrame::Line("two".to_string()))
         );
         assert_eq!(read_bounded_line(&mut reader, 16).unwrap(), None);
     }
 
     #[test]
-    fn an_oversized_frame_is_skipped_not_returned() {
+    fn an_oversized_frame_is_reported_and_drained() {
         let mut reader = std::io::BufReader::new(&b"aaaaaaaaaaaa\nok\n"[..]);
         assert_eq!(
             read_bounded_line(&mut reader, 4).unwrap(),
-            Some(String::new())
+            Some(ClientFrame::Oversized)
         );
         assert_eq!(
             read_bounded_line(&mut reader, 4).unwrap(),
-            Some("ok".to_string())
+            Some(ClientFrame::Line("ok".to_string()))
         );
     }
 }

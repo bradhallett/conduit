@@ -70,6 +70,11 @@ impl Harness {
         self.stdin.flush().expect("flush adapter stdin");
     }
 
+    fn send_raw(&mut self, raw: &str) {
+        writeln!(self.stdin, "{raw}").expect("write to adapter stdin");
+        self.stdin.flush().expect("flush adapter stdin");
+    }
+
     fn next_response(&self) -> serde_json::Value {
         let line = self
             .lines
@@ -160,5 +165,19 @@ fn adapter_proxies_a_session_to_the_host_daemon() {
     assert!(
         tools["result"]["tools"].is_array(),
         "tools/list did not return an array: {tools}"
+    );
+
+    // A malformed frame must be answered with a JSON-RPC parse error, not silence.
+    harness.send_raw("this is not json");
+    let parse_error = loop {
+        let message = harness.next_response();
+        if message.get("error").is_some() {
+            break message;
+        }
+    };
+    assert_eq!(parse_error["error"]["code"], -32700);
+    assert!(
+        parse_error["id"].is_null(),
+        "a parse error carries a null id: {parse_error}"
     );
 }
