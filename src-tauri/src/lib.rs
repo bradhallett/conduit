@@ -53,6 +53,7 @@ pub mod searchtrace;
 pub mod secrets;
 pub mod semantic;
 pub mod server_runtime;
+pub mod session_store;
 pub mod shaping;
 pub mod sharing_controller;
 pub mod stacks;
