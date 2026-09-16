@@ -12,12 +12,15 @@
 //! flag, not a code path).
 //!
 //! Requests run on bounded worker threads, so a client that pipelines a slow call
-//! and a fast one is answered in completion order rather than arrival order.
-//! Notifications stay on the reader thread, which keeps a cancellation ahead of
-//! anything queued behind it.
+//! and a fast one is answered in completion order rather than arrival order. The
+//! first request runs inline, so `initialize` establishes the session before
+//! anything can reference it. Notifications stay on the reader thread, which keeps
+//! a cancellation ahead of whatever is queued behind it (MCP cancellation is
+//! best-effort, so one that loses the race simply does not apply).
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -37,10 +40,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const LISTEN_POLL: Duration = Duration::from_millis(100);
 /// Backoff between listen-stream reconnects.
 const LISTEN_RECONNECT: Duration = Duration::from_millis(500);
-/// How many requests may be in flight against the daemon at once. A client that
-/// pipelines a slow call and a fast one gets the fast answer without waiting, and
-/// past this cap the reader applies backpressure by joining the oldest worker.
-const MAX_INFLIGHT: usize = 32;
+/// How many requests may be in flight against the daemon at once. Matches the
+/// in-process gateway's stdio worker cap. Past it the reader runs the request on
+/// its own thread rather than waiting for a worker, so the reader can never be
+/// held off stdin by a worker that is itself waiting on something the reader has
+/// to carry (an elicitation answer, a cancellation).
+const MAX_INFLIGHT: usize = 256;
 /// On client EOF, how long to let in-flight requests finish before the session is
 /// deleted. The client is already gone, so this is a courtesy rather than a wait.
 const EOF_GRACE: Duration = Duration::from_secs(5);
@@ -207,72 +212,109 @@ fn response_frames(response: ureq::Response) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// Releases one slot on drop, so the live count falls even if a worker panics.
+struct InflightGuard(Arc<AtomicUsize>);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Claim one slot below `limit`, or `None` when the cap is already reached.
+fn try_acquire_inflight(inflight: &Arc<AtomicUsize>, limit: usize) -> Option<InflightGuard> {
+    let mut current = inflight.load(Ordering::Relaxed);
+    loop {
+        if current >= limit {
+            return None;
+        }
+        match inflight.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Some(InflightGuard(Arc::clone(inflight))),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 /// Runs one exchange per worker thread, bounded, so a slow call cannot stall the
-/// reader. The job is a closure rather than a `Session` method so the dispatch and
-/// bounding can be tested without a daemon.
+/// reader. Past the cap the reader runs the exchange itself rather than waiting on
+/// a worker, because the reader is the only path a server-initiated answer or a
+/// cancellation can take back to the daemon. The job is a closure rather than a
+/// `Session` method so the dispatch and bounding can be tested without a daemon.
 struct Dispatcher {
     run: Arc<dyn Fn(String) + Send + Sync>,
+    inflight: Arc<AtomicUsize>,
     workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
-    max_inflight: usize,
+    limit: usize,
 }
 
 impl Dispatcher {
-    fn new(run: Arc<dyn Fn(String) + Send + Sync>, max_inflight: usize) -> Self {
+    fn new(run: Arc<dyn Fn(String) + Send + Sync>, limit: usize) -> Self {
         Self {
             run,
+            inflight: Arc::new(AtomicUsize::new(0)),
             workers: Mutex::new(Vec::new()),
-            max_inflight,
+            limit,
         }
     }
 
-    /// Drop handles for workers that have finished, so the live count stays true.
+    /// Join the workers that have finished, so their resources are reclaimed.
     fn reap(&self) {
         if let Ok(mut workers) = self.workers.lock() {
-            workers.retain(|handle| !handle.is_finished());
+            let mut index = 0;
+            while index < workers.len() {
+                if workers[index].is_finished() {
+                    let handle = workers.swap_remove(index);
+                    let _ = handle.join();
+                } else {
+                    index += 1;
+                }
+            }
         }
     }
 
-    /// Send one request on a worker thread. When the cap is reached, wait for the
-    /// oldest request instead of growing without bound.
+    /// Send one request on a worker thread, or inline when the pool is full.
     fn dispatch(&self, body: String) {
         self.reap();
-        let run = Arc::clone(&self.run);
-        let mut workers = match self.workers.lock() {
-            Ok(workers) => workers,
-            Err(_) => return,
-        };
-        while workers.len() >= self.max_inflight {
-            let oldest = workers.remove(0);
-            let _ = oldest.join();
+        match try_acquire_inflight(&self.inflight, self.limit) {
+            Some(guard) => {
+                let run = Arc::clone(&self.run);
+                let handle = std::thread::spawn(move || {
+                    let _guard = guard;
+                    run(body);
+                });
+                if let Ok(mut workers) = self.workers.lock() {
+                    workers.push(handle);
+                }
+            }
+            // At the cap. Running inline keeps the reader moving and, unlike a
+            // blocking join, cannot wait on a worker that needs the reader.
+            None => (self.run)(body),
         }
-        workers.push(std::thread::spawn(move || run(body)));
     }
 
     /// Let in-flight work settle for `grace`, then stop waiting. Anything still
     /// running is abandoned to process exit: the client has already gone away.
     fn drain(&self, grace: Duration) {
         let deadline = Instant::now() + grace;
-        loop {
+        while self.inflight.load(Ordering::Relaxed) > 0 && Instant::now() < deadline {
             self.reap();
-            let remaining = self
-                .workers
-                .lock()
-                .map(|workers| workers.len())
-                .unwrap_or(0);
-            if remaining == 0 || Instant::now() >= deadline {
-                return;
-            }
             std::thread::sleep(Duration::from_millis(20));
         }
+        self.reap();
     }
 }
 
-/// Read from stdin and proxy to the daemon until EOF. A request (one carrying an
-/// id) runs on a worker so a slow call does not hold up the ones behind it; a
-/// notification runs inline so its order against the requests around it is kept,
-/// which is what makes a cancellation reach the daemon promptly. A failed exchange
-/// becomes a JSON-RPC error for that request rather than a silent drop or a
-/// fallback.
+/// Read from stdin and proxy to the daemon until EOF. A request runs on a worker
+/// so a slow call does not hold up the ones behind it, except the first request,
+/// which runs inline so `initialize` establishes the session id before anything
+/// can reference it. A notification always runs inline, keeping its order against
+/// the requests around it. A failed exchange becomes a JSON-RPC error for that
+/// request rather than a silent drop or a fallback.
 fn proxy_stdio(descriptor: &DaemonDescriptor) -> Result<(), String> {
     let session = Arc::new(Session::new(descriptor));
     spawn_listen_stream(Arc::clone(&session));
@@ -317,7 +359,7 @@ fn proxy_stdio(descriptor: &DaemonDescriptor) -> Result<(), String> {
             }
         };
         let is_request = request.get("id").map(|id| !id.is_null()).unwrap_or(false);
-        if is_request {
+        if is_request && session.session_id().is_some() {
             dispatcher.dispatch(trimmed.to_string());
         } else if let Err(error) = session.exchange(trimmed) {
             report_request_error(&session, &request, &error);
@@ -375,6 +417,10 @@ fn spawn_listen_stream(session: Arc<Session>) {
                         }
                     }
                 }
+                // The stream ended without an error (a clean drop or a server
+                // close). Pause before reconnecting so a server that keeps closing
+                // immediately cannot be connected to in a tight loop.
+                std::thread::sleep(LISTEN_RECONNECT);
             }
             Err(_) => std::thread::sleep(LISTEN_RECONNECT),
         }
@@ -548,14 +594,14 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_applies_backpressure_at_the_cap() {
+    fn dispatch_runs_inline_at_the_cap_instead_of_waiting_on_a_worker() {
         let release = Arc::new((Mutex::new(false), Condvar::new()));
-        let second_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let dispatcher = Arc::new(Dispatcher::new(
+        let dispatcher = Dispatcher::new(
             {
                 let release = Arc::clone(&release);
-                let second_started = Arc::clone(&second_started);
+                let second_ran = Arc::clone(&second_ran);
                 Arc::new(move |body: String| {
                     if body == "first" {
                         let _ = started_tx.send(body.clone());
@@ -565,26 +611,25 @@ mod tests {
                             go = cvar.wait(go).unwrap();
                         }
                     } else {
-                        second_started.store(true, std::sync::atomic::Ordering::SeqCst);
+                        second_ran.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
                 })
             },
             1,
-        ));
+        );
 
         dispatcher.dispatch("first".to_string());
         started_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("the first job started");
 
-        // dispatch blocks at the cap, so run it off-thread and prove the second job
-        // cannot start until the first is released.
-        let second = Arc::clone(&dispatcher);
-        let handle = std::thread::spawn(move || second.dispatch("second".to_string()));
-        std::thread::sleep(Duration::from_millis(150));
+        // The cap is 1 and the worker is held, so `second` runs inline on this
+        // thread. dispatch must return once it has run rather than waiting on the
+        // held worker; a blocking join here would hang this test.
+        dispatcher.dispatch("second".to_string());
         assert!(
-            !second_started.load(std::sync::atomic::Ordering::SeqCst),
-            "the pool ran past its cap"
+            second_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the over-cap request did not run inline"
         );
 
         {
@@ -592,8 +637,6 @@ mod tests {
             *lock.lock().unwrap() = true;
             cvar.notify_all();
         }
-        handle.join().unwrap();
         dispatcher.drain(Duration::from_secs(5));
-        assert!(second_started.load(std::sync::atomic::Ordering::SeqCst));
     }
 }
