@@ -6,6 +6,25 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [1.19.0] - 2026-09-15
+
+Toolport 1.19.0 lets one shared gateway serve clients with different discovery
+modes at the same time, stops an over-long routine name from breaking every
+request from a prefixing client, and fixes a placeholder guard that refused real
+HTML and template values. It also carries cross-process rate-limit backoff for
+busy hosts and two dependency security updates.
+
+### Added
+
+- **The shared HTTP gateway can pick a discovery mode per client.** One bridge
+  process previously resolved a single mode at startup and applied it to every
+  client, so it could serve a native-tool-search client the full catalog or a
+  local model the compact meta-tools, but not both. It now honors
+  `clientDiscovery[<http-client-id>]` for the client its bearer token resolves
+  to: set `full` for Claude Code or Codex and `lazy` for Open WebUI in the same
+  process. Only `full` and `lazy` are per-client; `grouped` stays process-wide,
+  and a client without an entry inherits the process mode. (#868)
+
 ### Fixed
 
 - **Two server ids that differ only by `-` and `_` could become one server.** The
@@ -33,6 +52,43 @@ Entries before the rename below shipped under the project's former name, Conduit
   get the same PII, brand-spoof and injection passes as a direct result. They are
   attributed to the script rather than to a server, so a per-server block exemption
   cannot cover a multi-server result. Routines share the same path.
+
+- **The invented-placeholder guard refused real HTML and template values.** A value
+  wrapped in `<...>` or `{{...}}` was treated as an invented placeholder for every
+  parameter, so a sevDesk `headText` carrying `<p>...</p>`, a Home Assistant template
+  like `{{ states('sun.sun') }}`, or a message starting with "Your " was refused before
+  it reached the server. The wrapper now only counts when it holds a single identifier
+  such as `<team_id>` or `{{teamId}}`, and the "Your " prefix only applies to
+  identifier-typed parameters. (#871)
+
+- **One over-long routine name could break every request from a prefixing client.**
+  Advertised routine tool names spent the whole 64-character provider budget before the
+  client added anything, so a routine with an ordinary name became a 73-character name
+  once a client prefixed it, and providers rejected every request. Names now use a
+  12-hex id tail and reserve room for a client prefix. The routine store also logs when
+  it restores a backup or fails to load, instead of dropping an edited routine without
+  a word. (#872)
+
+- **Three Activity panels showed a failed load as an empty result.** Discovery traces,
+  tool identities, and the live inspector rendered a rejected fetch with the same
+  wording as a genuinely empty panel, so a backend failure read as "nothing here". Each
+  now shows an error with a retry, and tool identities no longer disappears on failure.
+  (#728)
+
+- **Session-start fan-out kept re-hitting a rate-limited HTTP provider.** Every stdio
+  session runs its own gateway, and each started with fresh backoff state, so a host
+  with many sessions re-tripped a provider's rate limit on every start. A 429 now
+  records a provider-origin retry window in the data directory that every gateway
+  process on the host honors before any wire traffic, on the request, inline-reply, and
+  subscription paths, with HTTP-date `Retry-After` parsed. It does not remove the
+  duplicate connections; the host daemon remains the structural fix. (#875, #874)
+
+### Security
+
+- **Updated two Rust dependencies for published advisories.** `rustls` 0.23.45
+  addresses RUSTSEC-2026-0285 (TLS 1.3 handshake messages accepted across encryption
+  levels), and `event-listener` 5.4.2 addresses RUSTSEC-2026-0221. Both arrived
+  transitively and are single-package lockfile bumps.
 
 ## [1.18.0] - 2026-08-30
 
