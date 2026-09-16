@@ -181,3 +181,75 @@ fn adapter_proxies_a_session_to_the_host_daemon() {
         "a parse error carries a null id: {parse_error}"
     );
 }
+
+#[test]
+fn the_adapter_recovers_after_the_daemon_dies() {
+    let mut harness = Harness::start();
+
+    harness.send(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "stdio-adapter-recovery", "version": "1" }
+        }
+    }));
+    let _ = harness.response_to(1);
+    harness.send(serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized"
+    }));
+    harness.send(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/list"
+    }));
+    assert!(
+        harness.response_to(2)["result"]["tools"].is_array(),
+        "the session did not start"
+    );
+
+    // Kill the daemon out from under the adapter.
+    kill_daemon(&harness.dir);
+
+    // The call that hits the dead daemon fails with an error, and is not replayed.
+    harness.send(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/list"
+    }));
+    let failed = loop {
+        let message = harness.next_response();
+        if message["id"] == 3 {
+            break message;
+        }
+    };
+    assert!(
+        failed.get("error").is_some(),
+        "the call against a dead daemon should have failed: {failed}"
+    );
+
+    // The next request re-rendezvouses, replays the handshake, and succeeds. The
+    // replayed initialize answer is not forwarded, so only id 4 is expected back.
+    harness.send(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/list"
+    }));
+    let recovered = loop {
+        let message = harness.next_response();
+        if message["id"] == 4 {
+            break message;
+        }
+        assert!(
+            message.get("method").is_some() && message.get("id").is_none(),
+            "unexpected message while recovering: {message}"
+        );
+    };
+    assert!(
+        recovered["result"]["tools"].is_array(),
+        "the adapter did not recover: {recovered}"
+    );
+}

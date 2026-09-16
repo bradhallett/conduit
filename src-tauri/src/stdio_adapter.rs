@@ -20,7 +20,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -65,14 +65,15 @@ pub fn run_stdio_adapter() -> ! {
         std::process::exit(1);
     };
     let compat = CompatKey::new(env!("CARGO_PKG_VERSION"), dir.display().to_string());
-    let descriptor = match Rendezvous::new(&dir, compat).ensure(spawn_daemon) {
+    let rendezvous = Rendezvous::new(&dir, compat);
+    let descriptor = match rendezvous.ensure(spawn_daemon) {
         Ok(descriptor) => descriptor,
         Err(error) => {
             eprintln!("toolport-gateway {STDIO_ADAPTER_FLAG}: {error}");
             std::process::exit(1);
         }
     };
-    match proxy_stdio(&descriptor) {
+    match proxy_stdio(rendezvous, descriptor) {
         Ok(()) => std::process::exit(0),
         Err(error) => {
             eprintln!("toolport-gateway {STDIO_ADAPTER_FLAG}: {error}");
@@ -104,22 +105,45 @@ fn spawn_daemon() -> Result<(), String> {
         .map_err(|error| format!("could not start the host daemon: {error}"))
 }
 
-/// Shared adapter state: the daemon it talks to, the negotiated session id, and
-/// the one stdout both the request loop and the listen stream may write to.
+/// Shared adapter state: the rendezvous used to (re)find the daemon, the daemon it
+/// currently talks to, the negotiated session id, the client handshake to replay if
+/// the daemon is replaced, and the one stdout every path writes to.
 struct Session {
-    descriptor: DaemonDescriptor,
+    rendezvous: Rendezvous,
+    descriptor: Mutex<DaemonDescriptor>,
+    /// Set when a daemon call failed at the transport level. The next request
+    /// re-rendezvouses instead of replaying the call that failed.
+    stale: AtomicBool,
+    /// Serializes recovery so only one caller re-rendezvouses at a time.
+    recovering: Mutex<()>,
     session_id: Mutex<Option<String>>,
+    /// The client's `initialize` and its `notifications/initialized`, kept so a
+    /// replacement daemon can be given an equivalent session.
+    handshake_initialize: Mutex<Option<String>>,
+    handshake_initialized: Mutex<Option<String>>,
     stdout: Mutex<std::io::Stdout>,
 }
 
 impl Session {
-    /// Wrap a descriptor in the shared adapter state.
-    fn new(descriptor: &DaemonDescriptor) -> Self {
+    fn new(rendezvous: Rendezvous, descriptor: DaemonDescriptor) -> Self {
         Self {
-            descriptor: descriptor.clone(),
+            rendezvous,
+            descriptor: Mutex::new(descriptor),
+            stale: AtomicBool::new(false),
+            recovering: Mutex::new(()),
             session_id: Mutex::new(None),
+            handshake_initialize: Mutex::new(None),
+            handshake_initialized: Mutex::new(None),
             stdout: Mutex::new(std::io::stdout()),
         }
+    }
+
+    /// The daemon this adapter is currently talking to.
+    fn descriptor(&self) -> DaemonDescriptor {
+        self.descriptor
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
     }
 
     /// The negotiated `Mcp-Session-Id`, if `initialize` has answered yet.
@@ -138,33 +162,124 @@ impl Session {
         out.flush().map_err(|error| error.to_string())
     }
 
-    /// POST one message to `/mcp` and forward every JSON-RPC frame the daemon
-    /// answers with. `202 Accepted` (a notification) has no body to forward.
-    fn exchange(&self, body: &str) -> Result<(), String> {
-        let url = format!("http://{}/mcp", self.descriptor.endpoint);
+    /// Remember the client's handshake so a replacement daemon can be given an
+    /// equivalent session. A fresh `initialize` starts it over.
+    fn remember_handshake(&self, body: &str) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+            return;
+        };
+        match value.get("method").and_then(|method| method.as_str()) {
+            Some("initialize") => {
+                if let Ok(mut initialize) = self.handshake_initialize.lock() {
+                    *initialize = Some(body.to_string());
+                }
+                if let Ok(mut initialized) = self.handshake_initialized.lock() {
+                    *initialized = None;
+                }
+            }
+            Some("notifications/initialized") => {
+                let has_initialize = self
+                    .handshake_initialize
+                    .lock()
+                    .map(|initialize| initialize.is_some())
+                    .unwrap_or(false);
+                if has_initialize {
+                    if let Ok(mut initialized) = self.handshake_initialized.lock() {
+                        *initialized = Some(body.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// POST one message to `/mcp`. `forward` writes the daemon's JSON-RPC frames to
+    /// stdout; a replayed handshake does not, because the client already has its
+    /// answer. A transport failure marks the daemon stale and is returned as-is.
+    fn post(&self, body: &str, forward: bool) -> Result<(), String> {
+        let descriptor = self.descriptor();
+        let url = format!("http://{}/mcp", descriptor.endpoint);
         let mut request = ureq::post(&url)
-            .set(
-                "Authorization",
-                &format!("Bearer {}", self.descriptor.token),
-            )
+            .set("Authorization", &format!("Bearer {}", descriptor.token))
             .set("Content-Type", "application/json")
             .set("Accept", "application/json, text/event-stream")
             .timeout(REQUEST_TIMEOUT);
         if let Some(session) = self.session_id() {
             request = request.set("Mcp-Session-Id", &session);
         }
-        let response = request
-            .send_string(body)
-            .map_err(|error| error.to_string())?;
+        let response = match request.send_string(body) {
+            Ok(response) => response,
+            Err(error) => {
+                // The daemon is gone or unreachable. The next request re-rendezvouses;
+                // the call that hit this is never retried.
+                self.stale.store(true, Ordering::SeqCst);
+                return Err(error.to_string());
+            }
+        };
         if let Some(session) = response.header("Mcp-Session-Id") {
             if let Ok(mut guard) = self.session_id.lock() {
                 *guard = Some(session.to_string());
             }
         }
-        for message in response_frames(response)? {
-            self.write_message(&message)?;
+        let frames = response_frames(response)?;
+        if forward {
+            for message in frames {
+                self.write_message(&message)?;
+            }
         }
         Ok(())
+    }
+
+    /// Re-rendezvous after a daemon failure, then replay the client's handshake so
+    /// the new session is equivalent. A no-op when nothing has failed.
+    fn ensure_live(&self) -> Result<(), String> {
+        if !self.stale.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let _recovering = self
+            .recovering
+            .lock()
+            .map_err(|_| "recovery lock poisoned".to_string())?;
+        if !self.stale.swap(false, Ordering::SeqCst) {
+            // Another caller already recovered while we waited.
+            return Ok(());
+        }
+        let descriptor = self
+            .rendezvous
+            .ensure(spawn_daemon)
+            .map_err(|error| format!("the host daemon could not be reached again: {error}"))?;
+        if let Ok(mut guard) = self.descriptor.lock() {
+            *guard = descriptor;
+        }
+        // The session belonged to the daemon that went away.
+        if let Ok(mut guard) = self.session_id.lock() {
+            *guard = None;
+        }
+        let initialize = self
+            .handshake_initialize
+            .lock()
+            .ok()
+            .and_then(|value| value.clone());
+        if let Some(body) = initialize {
+            self.post(&body, false)?;
+        }
+        let initialized = self
+            .handshake_initialized
+            .lock()
+            .ok()
+            .and_then(|value| value.clone());
+        if let Some(body) = initialized {
+            self.post(&body, false)?;
+        }
+        Ok(())
+    }
+
+    /// POST one client message: re-establish the daemon first if it failed, remember
+    /// the handshake, then forward the daemon's answer to the client.
+    fn exchange(&self, body: &str) -> Result<(), String> {
+        self.ensure_live()?;
+        self.remember_handshake(body);
+        self.post(body, true)
     }
 
     /// Close the daemon-side session on client EOF so its per-session state is
@@ -173,12 +288,10 @@ impl Session {
         let Some(session) = self.session_id() else {
             return;
         };
-        let url = format!("http://{}/mcp", self.descriptor.endpoint);
+        let descriptor = self.descriptor();
+        let url = format!("http://{}/mcp", descriptor.endpoint);
         let _ = ureq::delete(&url)
-            .set(
-                "Authorization",
-                &format!("Bearer {}", self.descriptor.token),
-            )
+            .set("Authorization", &format!("Bearer {}", descriptor.token))
             .set("Mcp-Session-Id", &session)
             .timeout(Duration::from_secs(5))
             .call();
@@ -314,9 +427,10 @@ impl Dispatcher {
 /// which runs inline so `initialize` establishes the session id before anything
 /// can reference it. A notification always runs inline, keeping its order against
 /// the requests around it. A failed exchange becomes a JSON-RPC error for that
-/// request rather than a silent drop or a fallback.
-fn proxy_stdio(descriptor: &DaemonDescriptor) -> Result<(), String> {
-    let session = Arc::new(Session::new(descriptor));
+/// request rather than a silent drop or a fallback, and a daemon that went away is
+/// re-found before the next request.
+fn proxy_stdio(rendezvous: Rendezvous, descriptor: DaemonDescriptor) -> Result<(), String> {
+    let session = Arc::new(Session::new(rendezvous, descriptor));
     spawn_listen_stream(Arc::clone(&session));
 
     let dispatcher = Dispatcher::new(
@@ -394,11 +508,11 @@ fn spawn_listen_stream(session: Arc<Session>) {
             std::thread::sleep(LISTEN_POLL);
             continue;
         };
-        let url = format!("http://{}/mcp", session.descriptor.endpoint);
+        let url = format!("http://{}/mcp", session.descriptor().endpoint);
         let response = ureq::get(&url)
             .set(
                 "Authorization",
-                &format!("Bearer {}", session.descriptor.token),
+                &format!("Bearer {}", session.descriptor().token),
             )
             .set("Accept", "text/event-stream")
             .set("Mcp-Session-Id", &session_id)
