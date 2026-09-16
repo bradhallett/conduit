@@ -90,6 +90,22 @@ busy hosts and two dependency security updates.
   levels), and `event-listener` 5.4.2 addresses RUSTSEC-2026-0221. Both arrived
   transitively and are single-package lockfile bumps.
 
+### Thanks
+
+Two of the fixes here came from outside, and the reports behind two more did.
+
+- **[Vermitrude](https://github.com/Vermitrude)** - the fix that makes the three
+  Activity panels say a load failed instead of showing an empty result, across discovery
+  traces, tool identities, and the live inspector (#728).
+- **[bradhallett](https://github.com/bradhallett)** - cross-process 429 backoff, so
+  session-start fan-out stops re-tripping a rate-limited HTTP provider, and the report
+  behind it with the connect counts that made the case (#874).
+- **[TheOriginal92](https://github.com/TheOriginal92)** - reported the placeholder guard
+  refusing real HTML and Jinja values, with the repro and a proposed fix (#871).
+- **[unifirer](https://github.com/unifirer)** - reported the advertised routine name
+  overflowing the provider limit and breaking every request from a prefixing client
+  (#872).
+
 ## [1.18.0] - 2026-08-30
 
 Toolport 1.18.0 adds a native GTK shell for Arch and other current-GTK Linux
