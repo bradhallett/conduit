@@ -22,9 +22,9 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{BufRead, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
@@ -14859,10 +14859,69 @@ fn daemon_identity_json() -> String {
     .to_string()
 }
 
+/// Epoch milliseconds of the last accepted or finished HTTP request. Only the host
+/// daemon's idle watchdog reads it; no other role consults it.
+static LAST_ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
+
+fn activity_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// How long the host daemon may sit with nothing in flight and no live session
+/// before it exits. Defaults to the operational grace; the env override exists so a
+/// test can watch the exit without waiting minutes.
+fn daemon_idle_grace() -> Duration {
+    conduit_lib::brand::env_var(
+        "TOOLPORT_DAEMON_IDLE_GRACE_MS",
+        "CONDUIT_DAEMON_IDLE_GRACE_MS",
+    )
+    .and_then(|value| value.trim().parse::<u64>().ok())
+    .map(Duration::from_millis)
+    .unwrap_or(conduit_lib::daemon::DAEMON_IDLE_GRACE)
+}
+
+/// Exit the daemon once it has been idle for `grace`. A live MCP session is what a
+/// connected adapter, its subscriptions, and its pending work all reduce to, so
+/// "no in-flight request and no session" is the whole idle condition. The
+/// descriptor is cleared before exiting so the next adapter starts a fresh daemon
+/// instead of probing a dead endpoint.
+fn spawn_daemon_idle_watchdog(
+    state: GatewayState,
+    inflight: Arc<AtomicUsize>,
+    descriptor_path: std::path::PathBuf,
+    grace: Duration,
+) {
+    let poll = Duration::from_millis(200).min(grace);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(poll);
+        if inflight.load(Ordering::Relaxed) > 0 {
+            continue;
+        }
+        reap_stale_mcp_sessions(&state);
+        let live_session = state
+            .mcp_sessions
+            .lock()
+            .map(|sessions| !sessions.is_empty())
+            .unwrap_or(true);
+        if live_session {
+            continue;
+        }
+        let idle_ms = activity_now_ms().saturating_sub(LAST_ACTIVITY_MS.load(Ordering::Relaxed));
+        if idle_ms >= grace.as_millis() as u64 {
+            glog("daemon: idle exit");
+            conduit_lib::daemon::clear_descriptor(&descriptor_path);
+            std::process::exit(0);
+        }
+    });
+}
+
 /// Run the host daemon: one runtime for this host, served on an internal loopback
 /// endpoint with a random bearer and advertised through the rendezvous
-/// descriptor. Phase 2: reachable by an adapter or a manual probe; the stdio
-/// adapter speaks to it in the next slice, and the idle/lease lifecycle after that.
+/// descriptor. Reachable by an adapter or a manual probe, and exits on its own
+/// once it has been idle past the grace period.
 fn serve_daemon(state: GatewayState) -> ! {
     let Some(dir) = registry::conduit_dir() else {
         eprintln!("toolport-gateway --daemon: no data directory could be resolved");
@@ -14911,7 +14970,15 @@ fn serve_daemon(state: GatewayState) -> ! {
     ));
     let search = Arc::new(SearchGuard::default());
     let confirm = Arc::new(ConfirmGuard::new());
-    serve_http_loop(server, state, Some(token), search, confirm, false);
+    LAST_ACTIVITY_MS.store(activity_now_ms(), Ordering::Relaxed);
+    let inflight = Arc::new(AtomicUsize::new(0));
+    spawn_daemon_idle_watchdog(
+        state.clone(),
+        Arc::clone(&inflight),
+        descriptor_path.clone(),
+        daemon_idle_grace(),
+    );
+    serve_http_loop_with_inflight(server, state, Some(token), search, confirm, false, inflight);
     conduit_lib::daemon::clear_descriptor(&descriptor_path);
     std::process::exit(0);
 }
@@ -15214,6 +15281,7 @@ fn serve_http_loop_with_inflight(
     inflight: Arc<AtomicUsize>,
 ) {
     for request in server.incoming_requests() {
+        LAST_ACTIVITY_MS.store(activity_now_ms(), Ordering::Relaxed);
         let Some(guard) = try_acquire_inflight(&inflight, MAX_HTTP_INFLIGHT) else {
             respond_http_overloaded(request);
             continue;
@@ -15234,6 +15302,9 @@ fn serve_http_loop_with_inflight(
                 &confirm,
                 allow_insecure_open,
             );
+            // Stamp on completion too, so a request that ran longer than the grace
+            // still gives the daemon a full grace after it finished.
+            LAST_ACTIVITY_MS.store(activity_now_ms(), Ordering::Relaxed);
         });
     }
 }
