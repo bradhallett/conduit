@@ -28110,6 +28110,20 @@ mod tests {
             !Arc::ptr_eq(asking.stdio_inflight(), other.stdio_inflight()),
             "each connection counts its own in-flight requests"
         );
+
+        // And a connection hands out the SAME state every time. Without this, an accessor
+        // that fabricated fresh state per call would satisfy every assertion above while
+        // breaking production: `main` would register the request in one registry and the
+        // worker would look for it in another, so no cancellation would ever be delivered.
+        let asking_again = asking.cancellations();
+        assert!(
+            asking_again.cancel(&id, Some("user")),
+            "a second handle from the same connection sees the request the first registered"
+        );
+        assert!(
+            Arc::ptr_eq(asking.stdio_inflight(), asking.stdio_inflight()),
+            "a connection hands out the same in-flight counter every time"
+        );
     }
 
     fn set_of(names: &[&str]) -> BTreeSet<String> {

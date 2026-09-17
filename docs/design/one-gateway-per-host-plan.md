@@ -81,8 +81,7 @@ Still open:
   its trust flag, router, catalog snapshot, routine candidates and advisor, ready/dirty
   flags, rebuild lock, listener config, server handler, resource subscriptions and the
   `resources/updated` sink), together with its session table, its daemon runtime (daemon
-  flag and activity lease), its rebuild streak map, its quarantine read flag, and the
-  progress token counter. What remains outside is `DISCOVERY_MODE`, `CODE_MODE`, the
+  flag and activity lease), its rebuild streak map, and its quarantine read flag. What remains outside is `DISCOVERY_MODE`, `CODE_MODE`, the
   principal-keyed `session_tables()` store, and the `PROGRESS_*` dispatch and routes, which
   are read inside the dispatch core (see the P1.3 section for why those need the core's
   signatures changed rather than a field move).
@@ -193,10 +192,9 @@ read goes through the context (`serving_modern_client`, `active_mcp_session`,
 thread-local as a scoped adapter as long as it is populated from the explicit value and
 cannot outlive the request, which the guards already ensure.
 
-What remains is not per-request but session- and host-scoped: the `STDIO_*` handshake
-flags and `PROGRESS_*`. Those are single-stdio-client assumptions and move in P1.2
-(`SessionState`) and P1.3 (`HostState`), so the isolation work lands with the types that own
-it instead of as a mechanical rewrite of the request path. The PII and HITL tables already
+What remains is not per-request but session- and host-scoped: `PROGRESS_*` and the host
+policy. Those move in P1.2 (`SessionState`) and P1.3 (`HostState`), so the isolation work
+lands with the types that own it instead of as a mechanical rewrite of the request path. The PII and HITL tables already
 moved onto a `SessionStore` owner, the two transport types are unified, and the stdio
 client's protocol era, its progress hand-off queue, and the search and confirm guards are
 session state; the handshake flags and deferral queue moved onto the session in the same
@@ -216,7 +214,8 @@ routing that P1.3 takes.
   confirm guard, connection-local notification eligibility. Today it owns the transport
   face, owner, upstream request correlation, outbound queue, subscriptions, root, the
   stdio client's declared capabilities, its 2026-07-28 era flag, its progress hand-off
-  queue, its guard pair, and its handshake flags and deferral queue; discovery/code mode plus
+  queue, its guard pair, its handshake flags and deferral queue, its broken-stdout latch, and its
+  cancellation registry and in-flight cap; discovery/code mode plus
   the progress routes are host-scoped by decision.
 - `McpSession` becomes the HTTP transport face of `SessionState`; the stdio path gets the
   same type with a stdio transport face, deleting `StdioUpstream` as a separate concept.
@@ -254,8 +253,8 @@ ownership did not rewrite several hundred lines.
   profile handle, the MCP session table, the stdio client's session, and its client id and
   boot profile. One invariant test asserts that a second facade shares the host, so one
   host still has exactly one live router and one registry.
-- Landed, second increment: the host now also owns its session table, its daemon runtime,
-  and the progress token counter. `mcp_sessions` moved onto `HostState` (the readers did
+- Landed, second increment: the host now also owns its session table and its daemon
+  runtime. `mcp_sessions` moved onto `HostState` (the readers did
   not change at all, which is what the `Deref` facade buys), `daemon_mode` and
   `last_activity_ms` replaced the process statics of the same names with `touch_activity()`
   and `idle_for()` on the host, and the progress token counter moved onto `ProgressRoutes`
