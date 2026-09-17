@@ -11747,6 +11747,12 @@ struct SessionState {
     /// while the client was starting, and a client that cached an empty `tools/list`
     /// would otherwise never learn to re-fetch.
     stdio_deferred_list_changed: Mutex<Vec<String>>,
+    /// Set once a write to this peer's stdout has failed, so the reader loop stops
+    /// instead of grinding through requests it can never answer. Per connection by
+    /// decision: it used to be one `Arc<AtomicBool>` owned by `main` and threaded
+    /// through the worker spawn, which is a per-process flag describing a per-session
+    /// condition. A second stdio client's write failure must not stop this one's loop.
+    stdio_broken: AtomicBool,
     /// Present only for a 2026-07-28 `subscriptions/listen` request. Legacy
     /// Streamable-HTTP sessions keep this `None` and retain their existing fanout.
     modern_subscription: Option<ModernSubscription>,
@@ -11787,6 +11793,7 @@ impl SessionState {
             stdio_client_ready: AtomicBool::new(false),
             stdio_responded: AtomicBool::new(false),
             stdio_deferred_list_changed: Mutex::new(Vec::new()),
+            stdio_broken: AtomicBool::new(false),
             modern_subscription: None,
         }
     }
@@ -11823,6 +11830,16 @@ impl SessionState {
     /// once. Two conditions, not one - see [`Self::stdio_responded`].
     fn stdio_may_speak(&self) -> bool {
         self.stdio_client_ready() && self.stdio_responded()
+    }
+
+    /// Whether a write to this peer has failed, so its reader loop should stop.
+    fn stdio_broken(&self) -> bool {
+        self.stdio_broken.load(Ordering::SeqCst)
+    }
+
+    /// Record that a write to this peer failed. Idempotent.
+    fn mark_stdio_broken(&self) {
+        self.stdio_broken.store(true, Ordering::SeqCst);
     }
 
     /// Whether this stdio peer is on the modern era. `false` for an HTTP face.
@@ -13246,16 +13263,12 @@ fn process_request(
     )
 }
 
-fn write_stdio_response(
-    stdio: &SessionState,
-    response: &Value,
-    stdout_broken: &Arc<AtomicBool>,
-) -> bool {
+fn write_stdio_response(stdio: &SessionState, response: &Value) -> bool {
     let Some(stdout) = stdio.stdio_stdout() else {
         // No stdio face means there is nobody to answer. Treat it as a broken pipe
         // so the reader loop stops instead of grinding through requests it can
         // never reply to.
-        stdout_broken.store(true, Ordering::SeqCst);
+        stdio.mark_stdio_broken();
         return false;
     };
     let result = {
@@ -13265,7 +13278,7 @@ fn write_stdio_response(
         write_json_line(&mut *out, response)
     };
     if let Err(err) = result {
-        stdout_broken.store(true, Ordering::SeqCst);
+        stdio.mark_stdio_broken();
         glog(&format!(
             "stdio client write failed; stopping reader loop: {err}"
         ));
@@ -13279,7 +13292,6 @@ fn handle_stdio_request(
     req: Value,
     request_key: String,
     cancel_registry: downstream::CancelRegistry,
-    stdout_broken: Arc<AtomicBool>,
 ) {
     let cancel_context = cancel_registry.context(request_key.clone());
     // The guards are the stdio session's own: one connection, one search streak,
@@ -13323,7 +13335,7 @@ fn handle_stdio_request(
         // the first thing it reads. This is the second of the two conditions in
         // `stdio_may_speak`; the peer's post-handshake message is the other, and
         // either one may land last.
-        if write_stdio_response(&state.stdio_upstream, &resp, &stdout_broken) {
+        if write_stdio_response(&state.stdio_upstream, &resp) {
             state.stdio_upstream.mark_stdio_responded();
             drain_stdio_deferred(&state.stdio_upstream);
         }
@@ -16488,12 +16500,11 @@ fn main() {
     // confirmations) lives on its session, so the loop holds no guards of its own.
     let cancel_registry = downstream::CancelRegistry::new();
     let stdio_inflight = Arc::new(AtomicUsize::new(0));
-    let stdout_broken = Arc::new(AtomicBool::new(false));
     let mut stdio_workers = Vec::new();
     let mut stdin = stdin.lock();
     loop {
         reap_finished_workers(&mut stdio_workers);
-        if stdout_broken.load(Ordering::SeqCst) {
+        if state.stdio_upstream.stdio_broken() {
             break;
         }
         let line = match read_bounded_line(&mut stdin, MAX_STDIO_LINE_BYTES) {
@@ -16555,7 +16566,7 @@ fn main() {
             ));
             let id = req.get("id").cloned().unwrap_or(Value::Null);
             let resp = error(id, -32600, "duplicate in-flight request id");
-            if !write_stdio_response(&state.stdio_upstream, &resp, &stdout_broken) {
+            if !write_stdio_response(&state.stdio_upstream, &resp) {
                 break;
             }
             continue;
@@ -16563,15 +16574,8 @@ fn main() {
 
         let state = state.clone();
         let cancel_registry = cancel_registry.clone();
-        let stdout_broken_for_worker = Arc::clone(&stdout_broken);
         let job = move || {
-            handle_stdio_request(
-                state,
-                req,
-                request_key,
-                cancel_registry,
-                stdout_broken_for_worker,
-            );
+            handle_stdio_request(state, req, request_key, cancel_registry);
         };
         if let Some(handle) = spawn_or_run_stdio_inflight(&stdio_inflight, job) {
             stdio_workers.push(handle);
@@ -27805,9 +27809,13 @@ mod tests {
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Serializes the tests that drive the process-wide stdio handshake statics.
+    /// Serializes the four tests that drive the stdio handshake.
     ///
-    /// Distinct from `ENV_LOCK`: these tests are not asserting anything about the
+    /// The flags and deferral queue are per-session now, so this is no longer protecting
+    /// shared state: it serializes the WRITES. Every one of these tests builds a session
+    /// over the test process's own stdout, and a released deferral writes `list_changed`
+    /// to it, so without this the four interleave frames into one stream and the output
+    /// becomes unreadable. Distinct from `ENV_LOCK`: these tests assert nothing about the
     /// environment, and borrowing that lock would couple two unrelated groups.
     static STDIO_HANDSHAKE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -27816,8 +27824,8 @@ mod tests {
     /// [`test_stdio_session`] and cannot observe another test's handshake. This used
     /// to be a process-wide `StdioHandshakeGuard` plus the `STDIO_HANDSHAKE_LOCK`
     /// above it, because the flags were process globals shared with the reconcile
-    /// tests in this same binary. That lock is kept only for the reconcile tests,
-    /// which still exercise shared router state.
+    /// tests in this same binary. The lock itself is still needed, but for a different
+    /// reason now: it serializes writes to the shared process stdout, not shared flags.
     ///
     /// How many times `method` is sitting in a session's deferral queue.
     ///
@@ -27993,6 +28001,39 @@ mod tests {
         Arc::new(SessionState::new_stdio(Arc::new(Mutex::new(
             std::io::stdout(),
         ))))
+    }
+
+    /// The broken-stdout latch is per session, and a reply to a peer with no stdio
+    /// face sets only that peer's latch.
+    ///
+    /// The no-face branch of [`write_stdio_response`] is the reachable unit seam for
+    /// this flag: a session with no stdio face cannot be answered, so the reply path
+    /// reports the pipe broken. Driving that branch is what makes this a test of the
+    /// behavior rather than of the field: asserting `mark_stdio_broken` then
+    /// `stdio_broken` would only prove the accessor round-trips.
+    ///
+    /// The third assertion is the discriminating one. A re-globalized flag would still
+    /// report `false` from the first reply and `true` from the second, so only
+    /// "an unrelated session is untouched" fails when the flag stops being per-session.
+    #[test]
+    fn a_broken_stdout_latch_belongs_to_one_session() {
+        let httpless = SessionState::new_http(None);
+        let other = test_stdio_session();
+
+        let answered = write_stdio_response(&httpless, &json!({ "jsonrpc": "2.0", "id": 1 }));
+
+        assert!(
+            !answered,
+            "a peer with no stdio face cannot be answered, so the write reports failure"
+        );
+        assert!(
+            httpless.stdio_broken(),
+            "the failed write marks the peer it was addressed to"
+        );
+        assert!(
+            !other.stdio_broken(),
+            "one connection's write failure must not mark another session broken"
+        );
     }
 
     fn set_of(names: &[&str]) -> BTreeSet<String> {
@@ -30993,8 +31034,13 @@ mod tests {
 
         // The handshake flags are per-session too, which is the stronger half of this
         // claim: one peer completing its handshake must not make the gateway think the
-        // other one has. Drive the legacy peer all the way through and assert the
-        // modern peer's own readiness is untouched.
+        // other one has. Drive the legacy peer through BOTH halves of the handshake and
+        // assert the modern peer's own state is untouched.
+        //
+        // Both halves are checked deliberately. Readiness and respondedness are separate
+        // conditions in [`SessionState::stdio_may_speak`], so a per-session `ready` with a
+        // process-wide `responded` would still let one peer's answer unlock another peer's
+        // traffic. Re-globalizing either flag alone must fail this test.
         mark_stdio_client_ready(&legacy);
         legacy.mark_stdio_responded();
         assert!(
@@ -31004,6 +31050,10 @@ mod tests {
         assert!(
             !modern.stdio_client_ready(),
             "one connection's handshake must not mark another session ready"
+        );
+        assert!(
+            !modern.stdio_responded(),
+            "one connection's answer must not mark another session responded"
         );
         assert!(
             !modern.stdio_may_speak(),
