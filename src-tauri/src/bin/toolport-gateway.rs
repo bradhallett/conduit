@@ -1056,45 +1056,6 @@ static PROGRESS_DISPATCH: std::sync::OnceLock<ProgressDispatch> = std::sync::Onc
 static PROGRESS_ROUTES: std::sync::OnceLock<Arc<Mutex<ProgressRoutes>>> =
     std::sync::OnceLock::new();
 
-/// Whether the raw-stdio peer has finished the MCP handshake, so the server may
-/// put its own traffic on stdout.
-///
-/// MCP forbids a server sending any request or notification before the client's
-/// `notifications/initialized`, and a client is entitled to enforce that. The
-/// rule matters here because the gateway's startup work is asynchronous: the
-/// background catalog build finishes on its own thread and calls
-/// [`notify_tools_changed`] whenever it is done. A client that spawns the
-/// gateway process first and only sends `initialize` some seconds later (Grok
-/// Code does exactly this - it spawns at session create and handshakes lazily)
-/// therefore reads `notifications/tools/list_changed` as the FIRST frame of the
-/// stream, before it has sent anything at all. Its transport rejects the frame
-/// and the handshake never completes: the server looks like it simply never
-/// answered `initialize` (SBS-1019).
-static STDIO_CLIENT_READY: AtomicBool = AtomicBool::new(false);
-
-/// `list_changed` methods withheld by [`notify_list_changed`], replayed in order
-/// once the handshake completes.
-///
-/// Withheld rather than dropped: the catalog really did change while the client
-/// was still starting up, and a client that cached an empty `tools/list` would
-/// otherwise never learn to re-fetch.
-static STDIO_DEFERRED_LIST_CHANGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-/// Whether any reply has actually reached stdout yet.
-///
-/// The gateway's first frame must be an answer to something the client asked,
-/// whatever that something was. `initialize` is the usual case but not the only
-/// one: `server/discover` is a documented probe, and a client that treats the
-/// first frame it reads as that probe's result fails exactly the way SBS-1019
-/// failed `initialize`.
-///
-/// Ordering against the write rather than against the request is what makes
-/// "after the handshake" mean what it says. Requests carry an id, so the stdio
-/// loop hands them to a worker thread, while a no-id notification is processed
-/// inline on the reader thread - so a client that pipelines its opening frames
-/// can mark the peer ready while the worker still holds the reply.
-static STDIO_RESPONDED: AtomicBool = AtomicBool::new(false);
-
 /// Where progress for the request being served should be delivered, or `None`
 /// when there is no channel to deliver it on.
 ///
@@ -9441,21 +9402,12 @@ fn notify_tools_changed(
 /// a client that is not going to finish at all.
 const STDIO_HANDSHAKE_WAIT: Duration = Duration::from_secs(10);
 
-/// Whether the gateway may put its own traffic on stdio right now.
-///
-/// Two conditions, not one. The peer must have spoken past `initialize`, and it
-/// must already have been answered at least once - see [`STDIO_RESPONDED`] for
-/// why the second is not implied by the first.
-fn stdio_may_speak() -> bool {
-    STDIO_CLIENT_READY.load(Ordering::SeqCst) && STDIO_RESPONDED.load(Ordering::SeqCst)
-}
-
 /// Block until the raw-stdio peer has handshaked, up to `timeout`. Returns
 /// whether it did.
-fn await_stdio_client_ready(timeout: Duration) -> bool {
+fn await_stdio_client_ready(stdio: &SessionState, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        if stdio_may_speak() {
+        if stdio.stdio_may_speak() {
             return true;
         }
         if Instant::now() >= deadline {
@@ -9475,7 +9427,8 @@ fn write_stdio_list_changed(stdout: &Arc<Mutex<std::io::Stdout>>, method: &str) 
 }
 
 /// Record that the raw-stdio peer finished the handshake, and replay whatever
-/// [`notify_list_changed`] withheld while it had not. See [`STDIO_CLIENT_READY`].
+/// [`notify_list_changed`] withheld while it had not. See
+/// [`SessionState::stdio_client_ready`].
 ///
 /// Called for `notifications/initialized` and, deliberately, for any other
 /// post-`initialize` stdio request too: `initialized` is required but not every
@@ -9488,7 +9441,7 @@ fn write_stdio_list_changed(stdout: &Arc<Mutex<std::io::Stdout>>, method: &str) 
 /// takes the queue lock, which is what stops a racing `notify_list_changed` from
 /// pushing onto a list that was just emptied.
 fn mark_stdio_client_ready(stdio: &SessionState) {
-    if STDIO_CLIENT_READY.swap(true, Ordering::SeqCst) {
+    if stdio.stdio_client_ready.swap(true, Ordering::SeqCst) {
         return;
     }
     drain_stdio_deferred(stdio);
@@ -9504,11 +9457,12 @@ fn mark_stdio_client_ready(stdio: &SessionState) {
 /// directly by its own caller. It cannot be pushed onto a list that was just
 /// emptied, which would strand it until the next catalog change.
 fn drain_stdio_deferred(stdio: &SessionState) {
-    if !stdio_may_speak() {
+    if !stdio.stdio_may_speak() {
         return;
     }
     let deferred = {
-        let mut queue = STDIO_DEFERRED_LIST_CHANGED
+        let mut queue = stdio
+            .stdio_deferred_list_changed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::mem::take(&mut *queue)
@@ -9543,7 +9497,8 @@ fn drain_stdio_deferred(stdio: &SessionState) {
 /// list changes.
 ///
 /// Before the handshake the stdio copy is queued rather than written: see
-/// [`STDIO_CLIENT_READY`] for why putting it on the wire early breaks the client
+/// [`SessionState::stdio_client_ready`] for why putting it on the wire early breaks
+/// the client
 /// that is still on its way to sending `initialize`. The HTTP fanout is not gated
 /// - an MCP session only exists after that session initialized.
 ///
@@ -9558,10 +9513,11 @@ fn notify_list_changed(
     if let Some(stdout) = stdio.stdio_stdout() {
         if !stdio.is_modern_upstream() {
             let ready = {
-                let mut queue = STDIO_DEFERRED_LIST_CHANGED
+                let mut queue = stdio
+                    .stdio_deferred_list_changed
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let ready = stdio_may_speak();
+                let ready = stdio.stdio_may_speak();
                 // Deduped: replaying "the tool list changed" twice tells the client
                 // nothing the first replay did not.
                 if !ready && !queue.iter().any(|queued| queued == method) {
@@ -11775,6 +11731,22 @@ struct SessionState {
     /// process. Unused (and never created) for an HTTP face or a client that never
     /// asks for progress.
     stdio_progress: OnceLock<std::sync::mpsc::SyncSender<Value>>,
+    /// Whether this stdio peer has spoken past `initialize`. Connection-local by
+    /// decision: as a process global it silently assumed one stdio client per host,
+    /// and a second connection would have inherited the first one's handshake and
+    /// started emitting unsolicited frames to a peer that had not spoken yet
+    /// (SBS-1019). Always `false` for an HTTP face.
+    stdio_client_ready: AtomicBool,
+    /// Whether any reply has actually reached this peer's stdout yet. Kept separate
+    /// from `stdio_client_ready` because the first frame must answer something the
+    /// client asked: a pipelined `server/discover` can be answered by a worker after
+    /// the reader has already marked the peer ready.
+    stdio_responded: AtomicBool,
+    /// `list_changed` methods withheld from this peer until its handshake completes,
+    /// replayed in order. Withheld rather than dropped: the catalog really did change
+    /// while the client was starting, and a client that cached an empty `tools/list`
+    /// would otherwise never learn to re-fetch.
+    stdio_deferred_list_changed: Mutex<Vec<String>>,
     /// Present only for a 2026-07-28 `subscriptions/listen` request. Legacy
     /// Streamable-HTTP sessions keep this `None` and retain their existing fanout.
     modern_subscription: Option<ModernSubscription>,
@@ -11812,6 +11784,9 @@ impl SessionState {
             next_upstream_id: AtomicI64::new(1),
             client_root: Arc::new(Mutex::new(None)),
             stdio_progress: OnceLock::new(),
+            stdio_client_ready: AtomicBool::new(false),
+            stdio_responded: AtomicBool::new(false),
+            stdio_deferred_list_changed: Mutex::new(Vec::new()),
             modern_subscription: None,
         }
     }
@@ -11825,6 +11800,29 @@ impl SessionState {
     /// Record that this stdio peer declared 2026-07-28 (see [`Self::modern_upstream`]).
     fn mark_modern_upstream(&self) {
         self.modern_upstream.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether this peer has spoken past `initialize`.
+    fn stdio_client_ready(&self) -> bool {
+        self.stdio_client_ready.load(Ordering::SeqCst)
+    }
+
+    /// Whether any reply has reached this peer's stdout yet.
+    fn stdio_responded(&self) -> bool {
+        self.stdio_responded.load(Ordering::SeqCst)
+    }
+
+    /// Record that a reply reached this peer's stdout. Read by [`stdio_may_speak`]
+    /// to keep the first frame an answer to something the client asked.
+    fn mark_stdio_responded(&self) {
+        self.stdio_responded.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the gateway may put its own traffic on this stdio connection right
+    /// now: the peer must have spoken past `initialize` AND been answered at least
+    /// once. Two conditions, not one - see [`Self::stdio_responded`].
+    fn stdio_may_speak(&self) -> bool {
+        self.stdio_client_ready() && self.stdio_responded()
     }
 
     /// Whether this stdio peer is on the modern era. `false` for an HTTP face.
@@ -12850,7 +12848,8 @@ fn refresh_client_root(state: &GatewayState) {
     // agreed to be asked. Waiting costs nothing in practice, because the handshake
     // completes a few milliseconds later; a client that never finishes it falls
     // through to the ProcessCwd root it would have used anyway.
-    let handshaked = !supported || await_stdio_client_ready(STDIO_HANDSHAKE_WAIT);
+    let handshaked =
+        !supported || await_stdio_client_ready(&state.stdio_upstream, STDIO_HANDSHAKE_WAIT);
     let new_root = if supported && handshaked {
         match state.stdio_upstream.call("roots/list", json!({})) {
             Ok(result) => {
@@ -13325,7 +13324,7 @@ fn handle_stdio_request(
         // `stdio_may_speak`; the peer's post-handshake message is the other, and
         // either one may land last.
         if write_stdio_response(&state.stdio_upstream, &resp, &stdout_broken) {
-            STDIO_RESPONDED.store(true, Ordering::SeqCst);
+            state.stdio_upstream.mark_stdio_responded();
             drain_stdio_deferred(&state.stdio_upstream);
         }
     }
@@ -27812,56 +27811,21 @@ mod tests {
     /// environment, and borrowing that lock would couple two unrelated groups.
     static STDIO_HANDSHAKE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Restores every stdio handshake static on the way out, panic or not.
+    /// The handshake flags and the deferral queue are per-session state now, so the
+    /// tests below need no shared-state guard: each one builds its own session via
+    /// [`test_stdio_session`] and cannot observe another test's handshake. This used
+    /// to be a process-wide `StdioHandshakeGuard` plus the `STDIO_HANDSHAKE_LOCK`
+    /// above it, because the flags were process globals shared with the reconcile
+    /// tests in this same binary. That lock is kept only for the reconcile tests,
+    /// which still exercise shared router state.
     ///
-    /// They are `static`s shared with the rest of this test binary - the
-    /// reconcile tests reach the same queue through `notify_tools_changed` - and
-    /// `cargo test` runs those in parallel threads of one process. A flag left
-    /// flipped by a failing test would change what an unrelated one observes.
+    /// How many times `method` is sitting in a session's deferral queue.
     ///
-    /// The protocol era is deliberately NOT here. It lives on the session under
-    /// test (P1.2), so one test's peer cannot mute another test's.
-    struct StdioHandshakeGuard;
-
-    /// Every method these tests emit starts with this, so cleanup can find its
-    /// own leftovers without touching anything a concurrent test queued.
-    const TEST_METHOD_PREFIX: &str = "notifications/toolport-test-";
-
-    impl StdioHandshakeGuard {
-        fn clear() {
-            STDIO_CLIENT_READY.store(false, Ordering::SeqCst);
-            STDIO_RESPONDED.store(false, Ordering::SeqCst);
-            // Drop this test's own queued methods. Deliberately not a whole
-            // `mem::take`: the queue is shared with reconcile tests running on
-            // other threads, and taking it would swallow entries they queued.
-            STDIO_DEFERRED_LIST_CHANGED
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .retain(|method| !method.starts_with(TEST_METHOD_PREFIX));
-        }
-    }
-
-    impl Drop for StdioHandshakeGuard {
-        fn drop(&mut self) {
-            Self::clear();
-        }
-    }
-
-    /// Clear the statics now and hand back the guard that clears them again on
-    /// scope exit, so a panicking test leaves nothing behind either.
-    fn reset_stdio_handshake() -> StdioHandshakeGuard {
-        let guard = StdioHandshakeGuard;
-        StdioHandshakeGuard::clear();
-        guard
-    }
-
-    /// How many times `method` is sitting in the deferral queue.
-    ///
-    /// Counted per method rather than asserting on the whole queue: unrelated
-    /// tests push `notifications/tools/list_changed` through `reconcile_to` from
-    /// other threads, so the queue's total length is not this test's to predict.
-    fn deferred_count(method: &str) -> usize {
-        STDIO_DEFERRED_LIST_CHANGED
+    /// Counted per method rather than asserting on the whole queue, so a method a
+    /// different code path queued cannot change what this asserts.
+    fn deferred_count(stdio: &SessionState, method: &str) -> usize {
+        stdio
+            .stdio_deferred_list_changed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
@@ -27891,7 +27855,6 @@ mod tests {
         let _serial = STDIO_HANDSHAKE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _restore = reset_stdio_handshake();
         let stdio = test_stdio_session();
         // A name no other test emits, so a concurrent `reconcile_to` cannot add
         // to or subtract from what is asserted below.
@@ -27902,7 +27865,7 @@ mod tests {
         notify_list_changed(&stdio, None, method);
         notify_list_changed(&stdio, None, method);
         assert_eq!(
-            deferred_count(method),
+            deferred_count(&stdio, method),
             1,
             "held back, and held back once: a second replay tells the client nothing"
         );
@@ -27910,19 +27873,19 @@ mod tests {
         // The peer speaks again, but nothing has been answered yet, so the
         // gateway still has no business putting a frame on the wire.
         mark_stdio_client_ready(&stdio);
-        assert!(STDIO_CLIENT_READY.load(Ordering::SeqCst));
+        assert!(stdio.stdio_client_ready());
         assert_eq!(
-            deferred_count(method),
+            deferred_count(&stdio, method),
             1,
             "still held: the client has not read a reply from us yet"
         );
 
         // Its reply lands. The held notification is released, not dropped - the
         // catalog really did change while the client could not be told.
-        STDIO_RESPONDED.store(true, Ordering::SeqCst);
+        stdio.mark_stdio_responded();
         drain_stdio_deferred(&stdio);
         assert_eq!(
-            deferred_count(method),
+            deferred_count(&stdio, method),
             0,
             "the queue is drained on release, not left to replay forever"
         );
@@ -27930,11 +27893,11 @@ mod tests {
         // From here it goes straight out with nothing queued.
         let after = "notifications/toolport-test-handshake/after";
         notify_list_changed(&stdio, None, after);
-        assert_eq!(deferred_count(after), 0);
+        assert_eq!(deferred_count(&stdio, after), 0);
 
         // A second release must not re-drain or re-announce.
         mark_stdio_client_ready(&stdio);
-        assert_eq!(deferred_count(method), 0);
+        assert_eq!(deferred_count(&stdio, method), 0);
     }
 
     /// The peer opened with an id-bearing request - `initialize`, or the
@@ -27951,32 +27914,31 @@ mod tests {
         let _serial = STDIO_HANDSHAKE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _restore = reset_stdio_handshake();
         let stdio = test_stdio_session();
         let method = "notifications/toolport-test-initorder/list_changed";
 
         // The opening request has been read, but no reply has been written.
         notify_list_changed(&stdio, None, method);
-        assert_eq!(deferred_count(method), 1);
+        assert_eq!(deferred_count(&stdio, method), 1);
 
         // The pipelined follow-up marks the peer ready on the reader thread.
         mark_stdio_client_ready(&stdio);
-        assert!(STDIO_CLIENT_READY.load(Ordering::SeqCst));
+        assert!(stdio.stdio_client_ready());
         assert_eq!(
-            deferred_count(method),
+            deferred_count(&stdio, method),
             1,
             "still withheld: the peer has not been answered yet"
         );
         // And a notification arriving in this window must not slip out either.
         let during = "notifications/toolport-test-initorder/during";
         notify_list_changed(&stdio, None, during);
-        assert_eq!(deferred_count(during), 1);
+        assert_eq!(deferred_count(&stdio, during), 1);
 
         // The worker writes the reply; now the queue may go.
-        STDIO_RESPONDED.store(true, Ordering::SeqCst);
+        stdio.mark_stdio_responded();
         drain_stdio_deferred(&stdio);
-        assert_eq!(deferred_count(method), 0);
-        assert_eq!(deferred_count(during), 0);
+        assert_eq!(deferred_count(&stdio, method), 0);
+        assert_eq!(deferred_count(&stdio, during), 0);
     }
 
     /// A client that spawned early, had a notification queued for it, and only
@@ -27991,21 +27953,20 @@ mod tests {
         let _serial = STDIO_HANDSHAKE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _restore = reset_stdio_handshake();
         let stdio = test_stdio_session();
         let method = "notifications/toolport-test-modern/list_changed";
 
         // Queued while the peer's version was still unknown.
         notify_list_changed(&stdio, None, method);
-        assert_eq!(deferred_count(method), 1);
+        assert_eq!(deferred_count(&stdio, method), 1);
 
         // Its first post-`initialize` message declares the modern version, which
         // `process_request` records before it marks the peer ready.
         stdio.mark_modern_upstream();
-        STDIO_RESPONDED.store(true, Ordering::SeqCst);
+        stdio.mark_stdio_responded();
         mark_stdio_client_ready(&stdio);
         assert_eq!(
-            deferred_count(method),
+            deferred_count(&stdio, method),
             0,
             "dropped on release, not carried forward to replay later"
         );
@@ -28013,7 +27974,7 @@ mod tests {
         // And nothing new is banked for it either.
         let later = "notifications/toolport-test-modern/later";
         notify_list_changed(&stdio, None, later);
-        assert_eq!(deferred_count(later), 0);
+        assert_eq!(deferred_count(&stdio, later), 0);
     }
 
     /// The router wrapped the way the gateway holds it, plus the stdio session
@@ -31000,7 +30961,6 @@ mod tests {
         let _serial = STDIO_HANDSHAKE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _restore = reset_stdio_handshake();
         let modern = test_stdio_session();
         let legacy = test_stdio_session();
         modern.mark_modern_upstream();
@@ -31015,15 +30975,39 @@ mod tests {
         // and nothing is banked for it either.
         notify_list_changed(&modern, None, method);
         assert_eq!(
-            deferred_count(method),
+            deferred_count(&modern, method),
             0,
             "nothing withheld for a modern peer"
         );
         notify_list_changed(&legacy, None, method);
         assert_eq!(
-            deferred_count(method),
+            deferred_count(&legacy, method),
             1,
             "the legacy peer still queues the notification for its handshake"
+        );
+        assert_eq!(
+            deferred_count(&modern, method),
+            0,
+            "and the legacy peer's queue is not the modern peer's"
+        );
+
+        // The handshake flags are per-session too, which is the stronger half of this
+        // claim: one peer completing its handshake must not make the gateway think the
+        // other one has. Drive the legacy peer all the way through and assert the
+        // modern peer's own readiness is untouched.
+        mark_stdio_client_ready(&legacy);
+        legacy.mark_stdio_responded();
+        assert!(
+            legacy.stdio_may_speak(),
+            "the peer that handshaked may be spoken to"
+        );
+        assert!(
+            !modern.stdio_client_ready(),
+            "one connection's handshake must not mark another session ready"
+        );
+        assert!(
+            !modern.stdio_may_speak(),
+            "a peer that never handshaked must not be treated as speakable"
         );
     }
 

@@ -51,15 +51,20 @@ Landed:
 
 Still open:
 
-- P1.2 threading, remainder: the `STDIO_*` handshake statics (`STDIO_CLIENT_READY`,
-  `STDIO_RESPONDED`, `STDIO_DEFERRED_LIST_CHANGED`) still encode one stdio client. They
-  move with the stdio connection object, after the deferred queue is keyed per session.
-  Three more single-stdio assumptions go with that move: the reader's `CancelRegistry` and
-  in-flight cap are per-process and keyed by client-chosen JSON-RPC ids, so two stdio
-  connections could cancel each other; `write_stdio_response`'s no-face branch flips the
-  process-wide `stdout_broken` for what is a per-session condition; and stdio PII/HITL
-  lookups collapse to `PII_LOCAL_SESSION`, so two stdio clients on one host would share one
-  pseudonym map and clearing one would clear the other.
+- P1.2 threading, remainder: the three `STDIO_*` handshake statics landed. `STDIO_CLIENT_READY`,
+  `STDIO_RESPONDED`, and `STDIO_DEFERRED_LIST_CHANGED` are gone; the flags and the deferral
+  queue are fields on the stdio `SessionState`, read through `stdio_client_ready()`,
+  `stdio_responded()`, `mark_stdio_responded()`, and `stdio_may_speak()`. The test module's
+  `StdioHandshakeGuard` (and the shared-state reset it did on drop) is deleted, because each
+  test now builds its own session and cannot observe another's handshake. This closes the
+  half of the single-stdio assumption that said a second connection inherits the first one's
+  handshake.
+  Three more single-stdio assumptions remain and are NOT part of that move: the reader's
+  `CancelRegistry` and in-flight cap are per-process and keyed by client-chosen JSON-RPC ids,
+  so two stdio connections could cancel each other; `write_stdio_response`'s no-face branch
+  flips the process-wide `stdout_broken` for what is a per-session condition; and stdio
+  PII/HITL lookups collapse to `PII_LOCAL_SESSION`, so two stdio clients on one host would
+  share one pseudonym map and clearing one would clear the other.
 - P1.3 `HostState` (in progress). The host runtime now lives on `HostState` (registry and
   its trust flag, router, catalog snapshot, routine candidates and advisor, ready/dirty
   flags, rebuild lock, listener config, server handler, resource subscriptions and the
@@ -114,19 +119,19 @@ Still open:
 
 ## Delivery shape
 
-| PR  | Slice                                                                                                              | Behavior change                             | Status                                                             |
-| --- | ------------------------------------------------------------------------------------------------------------------ | ------------------------------------------- | ------------------------------------------------------------------ |
-| 1   | P2.1 rendezvous primitives (library module, tested)                                                                | none (new module only)                      | landed (#880)                                                      |
-| 2   | P2.2a identity role; P2.2b host runtime on the internal endpoint                                                   | none (explicit flag only)                   | landed (#881)                                                      |
-| 3   | P1.2 session tables on `SessionStore`; transports unified on `SessionState`; era, progress, and guards per session | none default; HTTP confirm scoping narrowed | landed; handshake statics remain                                   |
-| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade                                                   | none                                        | in progress: three increments landed, dispatch-core statics remain |
-| 5   | P2.2c stdio adapter speaks the daemon session protocol, behind flag                                                | opt-in only                                 | landed (#888, #891, #893)                                          |
-| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback                                                          | opt-in only                                 | landed (#892, #893)                                                |
-| 7   | P3.1 union catalog built once, allowed-set enforced per session                                                    | opt-in only                                 | not started                                                        |
-| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding                                                      | opt-in only, the big win                    | not started                                                        |
-| 9   | P4.1 dogfood flag, telemetry, acceptance run                                                                       | opt-in only                                 | not started                                                        |
-| 10  | P4.2 adapter topology becomes default; legacy kill switch remains                                                  | default flip                                | not started                                                        |
-| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease                                                     | separate, later                             | not started                                                        |
+| PR  | Slice                                                                                                                               | Behavior change                             | Status                                                             |
+| --- | ----------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- | ------------------------------------------------------------------ |
+| 1   | P2.1 rendezvous primitives (library module, tested)                                                                                 | none (new module only)                      | landed (#880)                                                      |
+| 2   | P2.2a identity role; P2.2b host runtime on the internal endpoint                                                                    | none (explicit flag only)                   | landed (#881)                                                      |
+| 3   | P1.2 session tables on `SessionStore`; transports unified on `SessionState`; era, progress, guards, and stdio handshake per session | none default; HTTP confirm scoping narrowed | landed; three stdio assumptions remain                             |
+| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade                                                                    | none                                        | in progress: three increments landed, dispatch-core statics remain |
+| 5   | P2.2c stdio adapter speaks the daemon session protocol, behind flag                                                                 | opt-in only                                 | landed (#888, #891, #893)                                          |
+| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback                                                                           | opt-in only                                 | landed (#892, #893)                                                |
+| 7   | P3.1 union catalog built once, allowed-set enforced per session                                                                     | opt-in only                                 | not started                                                        |
+| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding                                                                       | opt-in only, the big win                    | not started                                                        |
+| 9   | P4.1 dogfood flag, telemetry, acceptance run                                                                                        | opt-in only                                 | not started                                                        |
+| 10  | P4.2 adapter topology becomes default; legacy kill switch remains                                                                   | default flip                                | not started                                                        |
+| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease                                                                      | separate, later                             | not started                                                        |
 
 Each of 1 through 8 must leave the default topology untouched and all existing suites
 green. The only PRs that change what a user gets are 10 and 11.
@@ -182,15 +187,16 @@ flags and `PROGRESS_*`. Those are single-stdio-client assumptions and move in P1
 it instead of as a mechanical rewrite of the request path. The PII and HITL tables already
 moved onto a `SessionStore` owner, the two transport types are unified, and the stdio
 client's protocol era, its progress hand-off queue, and the search and confirm guards are
-session state; the handshake statics are the last of the session-scoped state.
+session state; the handshake flags and deferral queue moved onto the session in the same
+increment.
 
 ### P1.2 SessionState
 
 Status: store landed (#894), the three session-scoped maps moved onto it, the two
 transport types are unified, and the stdio session now owns the client's capabilities and
-root, its declared protocol era, its progress hand-off, and its search and confirm guards.
-The remaining globals are the `STDIO_*` handshake statics plus the host policy and routing
-that P1.3 takes.
+root, its declared protocol era, its progress hand-off, its search and confirm guards, and
+its own handshake flags and deferral queue. The remaining globals are the host policy and
+routing that P1.3 takes.
 
 - Introduce `SessionState` owning exactly what the design lists: session id, principal and
   audit label, effective scope, protocol version and capabilities, roots and `${ROOT}`,
@@ -198,8 +204,8 @@ that P1.3 takes.
   confirm guard, connection-local notification eligibility. Today it owns the transport
   face, owner, upstream request correlation, outbound queue, subscriptions, root, the
   stdio client's declared capabilities, its 2026-07-28 era flag, its progress hand-off
-  queue, and its guard pair; the `STDIO_*` handshake statics move with the stdio connection
-  object, and discovery/code mode plus the progress routes are host-scoped by decision.
+  queue, its guard pair, and its handshake flags and deferral queue; discovery/code mode plus
+  the progress routes are host-scoped by decision.
 - `McpSession` becomes the HTTP transport face of `SessionState`; the stdio path gets the
   same type with a stdio transport face, deleting `StdioUpstream` as a separate concept.
   Landed: one `SessionState` with `SessionTransportFace::{Http, Stdio}`. The upstream
@@ -364,10 +370,11 @@ Where the fourth increment starts, and the decision it has to make before writin
   build one host from their own handles (a `host_from_parts` test helper), which is what makes
   the collapse assert the same thing it used to. The only parameter kept is `resource_updated_override`, because the watcher tests
   need to drive a rebuild with no sink wired, which a host field cannot express.
-- Sequencing question, for the maintainer rather than for the code: this increment and the
-  stdio handshake statics are all that Phase 1 has left, and neither is a prerequisite for
-  the pooling work. The three remaining P1.3 holders are host-scoped by decision rather than
-  isolation gaps (host policy, one table per host, one dispatch per host), and the P1.2
+- Sequencing question, for the maintainer rather than for the code: this increment is all
+  Phase 1 has left apart from the three remaining stdio assumptions noted above, and neither
+  is a prerequisite for the pooling work. The three remaining P1.3 holders are host-scoped by
+  decision rather than isolation gaps (host policy, one table per host, one dispatch per
+  host), and the P1.2
   remainder only affects the stdio handshake path. P3.1 and P3.2 are therefore free to start
   first; the plan keeps the original order by preference, so that pooling is built on state
   that is already fully host-owned. That is a choice about risk, not a dependency.
