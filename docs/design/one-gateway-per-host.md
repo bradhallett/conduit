@@ -4,9 +4,9 @@ Status: Phase 0 landed (SBS-838), and the daemon groundwork is in: the rendezvou
 `--daemon` host runtime, and the opt-in `--stdio-adapter` (P2.1 through P2.3), all behind
 explicit flags. **The current gateway topology is unchanged** — every stdio client session
 still runs its own gateway and its own copy of every enabled downstream server until the
-P4.2 default flip. P1.2 is landed apart from two stdio assumptions (the per-process cancel
-registry, and stdio PII/HITL collapsing to one local session); the handshake flags and the
-broken-stdout latch are session state.
+P4.2 default flip. P1.2 is landed apart from one stdio assumption (stdio PII/HITL collapsing
+to one local session, which needs an asserted identity to key on); the handshake flags, the
+broken-stdout latch, and the cancel registry and in-flight cap are session state.
 P1.3 is three increments in: the host runtime, the session table and daemon runtime, and the
 rebuild streaks and quarantine read state have moved onto `HostState`. What is left there is
 discovery and code mode, the principal-keyed session store, and the progress dispatch and

@@ -65,11 +65,18 @@ Still open:
   `SessionState::stdio_broken` (read via `stdio_broken()`, set via `mark_stdio_broken()`).
   Both callers lost the parameter. The flag is genuinely per-connection: a write failure on
   one stdio client used to stop every reader loop on the host.
-  Two single-stdio assumptions remain and are NOT part of these moves: the reader's
-  `CancelRegistry` and in-flight cap are per-process and keyed by client-chosen JSON-RPC ids,
-  so two stdio connections could cancel each other; and stdio PII/HITL lookups collapse to
-  `PII_LOCAL_SESSION`, so two stdio clients on one host would share one pseudonym map and
-  clearing one would clear the other.
+  The stdio reader's cancellation and in-flight cap followed in the same shape: the
+  `CancelRegistry` and its `Arc<AtomicUsize>` were created in `main` and threaded into
+  `handle_stdio_request`, and they are now `SessionState::cancellations` and
+  `SessionState::stdio_inflight`. The registry is keyed by the client's own JSON-RPC ids,
+  which are client-chosen, so shared across a host one client cancelling its id 7 would have
+  cancelled another client's id 7, and one client's queue depth would have throttled another's.
+  `handle_stdio_request` lost the parameter.
+  One single-stdio assumption remains and is NOT part of these moves: stdio PII/HITL lookups
+  collapse to `PII_LOCAL_SESSION`, so two stdio clients on one host would share one pseudonym
+  map and clearing one would clear the other. That one is a policy decision about identity
+  rather than a field move, because a second stdio client has no asserted identity to key on
+  until the daemon session protocol supplies one.
 - P1.3 `HostState` (in progress). The host runtime now lives on `HostState` (registry and
   its trust flag, router, catalog snapshot, routine candidates and advisor, ready/dirty
   flags, rebuild lock, listener config, server handler, resource subscriptions and the
@@ -124,19 +131,19 @@ Still open:
 
 ## Delivery shape
 
-| PR  | Slice                                                                                                                                                    | Behavior change                             | Status                                                             |
-| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- | ------------------------------------------------------------------ |
-| 1   | P2.1 rendezvous primitives (library module, tested)                                                                                                      | none (new module only)                      | landed (#880)                                                      |
-| 2   | P2.2a identity role; P2.2b host runtime on the internal endpoint                                                                                         | none (explicit flag only)                   | landed (#881)                                                      |
-| 3   | P1.2 session tables on `SessionStore`; transports unified on `SessionState`; era, progress, guards, stdio handshake, and broken-stdout latch per session | none default; HTTP confirm scoping narrowed | landed; two stdio assumptions remain                               |
-| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade                                                                                         | none                                        | in progress: three increments landed, dispatch-core statics remain |
-| 5   | P2.2c stdio adapter speaks the daemon session protocol, behind flag                                                                                      | opt-in only                                 | landed (#888, #891, #893)                                          |
-| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback                                                                                                | opt-in only                                 | landed (#892, #893)                                                |
-| 7   | P3.1 union catalog built once, allowed-set enforced per session                                                                                          | opt-in only                                 | not started                                                        |
-| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding                                                                                            | opt-in only, the big win                    | not started                                                        |
-| 9   | P4.1 dogfood flag, telemetry, acceptance run                                                                                                             | opt-in only                                 | not started                                                        |
-| 10  | P4.2 adapter topology becomes default; legacy kill switch remains                                                                                        | default flip                                | not started                                                        |
-| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease                                                                                           | separate, later                             | not started                                                        |
+| PR  | Slice                                                                                                                                                                           | Behavior change                             | Status                                                             |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------- | ------------------------------------------------------------------ |
+| 1   | P2.1 rendezvous primitives (library module, tested)                                                                                                                             | none (new module only)                      | landed (#880)                                                      |
+| 2   | P2.2a identity role; P2.2b host runtime on the internal endpoint                                                                                                                | none (explicit flag only)                   | landed (#881)                                                      |
+| 3   | P1.2 session tables on `SessionStore`; transports unified on `SessionState`; era, progress, guards, handshake, broken-stdout latch, cancellation, and in-flight cap per session | none default; HTTP confirm scoping narrowed | landed; one stdio assumption remains (PII)                         |
+| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade                                                                                                                | none                                        | in progress: three increments landed, dispatch-core statics remain |
+| 5   | P2.2c stdio adapter speaks the daemon session protocol, behind flag                                                                                                             | opt-in only                                 | landed (#888, #891, #893)                                          |
+| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback                                                                                                                       | opt-in only                                 | landed (#892, #893)                                                |
+| 7   | P3.1 union catalog built once, allowed-set enforced per session                                                                                                                 | opt-in only                                 | not started                                                        |
+| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding                                                                                                                   | opt-in only, the big win                    | not started                                                        |
+| 9   | P4.1 dogfood flag, telemetry, acceptance run                                                                                                                                    | opt-in only                                 | not started                                                        |
+| 10  | P4.2 adapter topology becomes default; legacy kill switch remains                                                                                                               | default flip                                | not started                                                        |
+| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease                                                                                                                  | separate, later                             | not started                                                        |
 
 Each of 1 through 8 must leave the default topology untouched and all existing suites
 green. The only PRs that change what a user gets are 10 and 11.
@@ -376,12 +383,11 @@ Where the fourth increment starts, and the decision it has to make before writin
   the collapse assert the same thing it used to. The only parameter kept is `resource_updated_override`, because the watcher tests
   need to drive a rebuild with no sink wired, which a host field cannot express.
 - Sequencing question, for the maintainer rather than for the code: this increment is all
-  Phase 1 has left apart from the two remaining stdio assumptions noted above, and neither
-  is a prerequisite for the pooling work. The three remaining P1.3 holders are host-scoped by
-  decision rather than isolation gaps (host policy, one table per host, one dispatch per
-  host), and the P1.2
-  remainder only touches the stdio cancel registry and the local-session PII fallback. P3.1
-  and P3.2 are therefore free to start
+  Phase 1 has left apart from the one remaining stdio assumption noted above (the PII
+  fallback), and it is not a prerequisite for the pooling work. The three remaining P1.3
+  holders are host-scoped by decision rather than isolation gaps (host policy, one table per
+  host, one dispatch per host), and the P1.2
+  remainder is now only the local-session PII fallback. P3.1 and P3.2 are therefore free to start
   first; the plan keeps the original order by preference, so that pooling is built on state
   that is already fully host-owned. That is a choice about risk, not a dependency.
 

@@ -11753,6 +11753,15 @@ struct SessionState {
     /// through the worker spawn, which is a per-process flag describing a per-session
     /// condition. A second stdio client's write failure must not stop this one's loop.
     stdio_broken: AtomicBool,
+    /// Cancellation for this connection's in-flight requests. Per connection by
+    /// decision: the registry is keyed by the CLIENT's JSON-RPC id, which is
+    /// client-chosen, so two stdio clients on one host would collide. One client
+    /// cancelling its id 7 could cancel another's id 7.
+    cancellations: downstream::CancelRegistry,
+    /// How many requests this connection is running on workers, against a cap, so a
+    /// client cannot spawn unbounded workers. Per connection for the same reason as
+    /// the registry: it is this peer's concurrency, not the host's.
+    stdio_inflight: Arc<AtomicUsize>,
     /// Present only for a 2026-07-28 `subscriptions/listen` request. Legacy
     /// Streamable-HTTP sessions keep this `None` and retain their existing fanout.
     modern_subscription: Option<ModernSubscription>,
@@ -11794,6 +11803,8 @@ impl SessionState {
             stdio_responded: AtomicBool::new(false),
             stdio_deferred_list_changed: Mutex::new(Vec::new()),
             stdio_broken: AtomicBool::new(false),
+            cancellations: downstream::CancelRegistry::new(),
+            stdio_inflight: Arc::new(AtomicUsize::new(0)),
             modern_subscription: None,
         }
     }
@@ -11840,6 +11851,18 @@ impl SessionState {
     /// Record that a write to this peer failed. Idempotent.
     fn mark_stdio_broken(&self) {
         self.stdio_broken.store(true, Ordering::SeqCst);
+    }
+
+    /// This connection's cancellation registry, as a shared handle the reader loop and
+    /// each worker both use. Keyed by the client's own request ids, so it has to be
+    /// one registry per connection.
+    fn cancellations(&self) -> downstream::CancelRegistry {
+        self.cancellations.clone()
+    }
+
+    /// This connection's in-flight request counter, for its worker cap.
+    fn stdio_inflight(&self) -> &Arc<AtomicUsize> {
+        &self.stdio_inflight
     }
 
     /// Whether this stdio peer is on the modern era. `false` for an HTTP face.
@@ -13287,12 +13310,10 @@ fn write_stdio_response(stdio: &SessionState, response: &Value) -> bool {
     true
 }
 
-fn handle_stdio_request(
-    state: GatewayState,
-    req: Value,
-    request_key: String,
-    cancel_registry: downstream::CancelRegistry,
-) {
+fn handle_stdio_request(state: GatewayState, req: Value, request_key: String) {
+    // The connection's own registry, so a cancel carries the reason to the worker
+    // that is running this request and nothing else.
+    let cancel_registry = state.stdio_upstream.cancellations();
     let cancel_context = cancel_registry.context(request_key.clone());
     // The guards are the stdio session's own: one connection, one search streak,
     // one set of pending confirmations (P1.2).
@@ -16498,8 +16519,11 @@ fn main() {
     let stdin = std::io::stdin();
     // Every stdio client's cross-request state (search streak, pending
     // confirmations) lives on its session, so the loop holds no guards of its own.
-    let cancel_registry = downstream::CancelRegistry::new();
-    let stdio_inflight = Arc::new(AtomicUsize::new(0));
+    // This connection's own cancellation registry and worker counter. Both are keyed
+    // by, or bound to, one client's requests, so they live on the session rather than
+    // in `main`: two stdio clients would otherwise share one registry and one cap.
+    let cancel_registry = state.stdio_upstream.cancellations();
+    let stdio_inflight = Arc::clone(state.stdio_upstream.stdio_inflight());
     let mut stdio_workers = Vec::new();
     let mut stdin = stdin.lock();
     loop {
@@ -16573,9 +16597,8 @@ fn main() {
         }
 
         let state = state.clone();
-        let cancel_registry = cancel_registry.clone();
         let job = move || {
-            handle_stdio_request(state, req, request_key, cancel_registry);
+            handle_stdio_request(state, req, request_key);
         };
         if let Some(handle) = spawn_or_run_stdio_inflight(&stdio_inflight, job) {
             stdio_workers.push(handle);
@@ -28033,6 +28056,59 @@ mod tests {
         assert!(
             !other.stdio_broken(),
             "one connection's write failure must not mark another session broken"
+        );
+    }
+
+    /// The cancellation registry and the in-flight counter belong to one connection.
+    ///
+    /// Both are keyed by, or bound to, one client's requests: the registry by the
+    /// client's own JSON-RPC ids, the counter by how many of its requests are on
+    /// workers. Shared across a host, one client cancelling its id 7 would cancel
+    /// another client's id 7, and one client's queue depth would throttle another's.
+    ///
+    /// The two assertions that matter are the cross-session ones. `is_cancelled` on the
+    /// peer that asked, plus `!is_cancelled` on the peer that did not, is what fails
+    /// when the registry stops being per-connection; a test that only cancelled and
+    /// re-checked one session would pass either way.
+    #[test]
+    fn a_cancellation_belongs_to_one_connection() {
+        let asking = test_stdio_session();
+        let other = test_stdio_session();
+
+        let asking_registry = asking.cancellations();
+        let other_registry = other.cancellations();
+        let id = "1".to_string();
+
+        assert!(
+            asking_registry.begin_client_request(id.clone()),
+            "a fresh connection accepts its first request id"
+        );
+        assert!(
+            other_registry.begin_client_request(id.clone()),
+            "the same id on another connection is that connection's own request, not a duplicate"
+        );
+
+        // Cancel through the asking connection's context, which is how the dispatch
+        // observes it, then check both registries.
+        let asking_context = asking_registry.context(id.clone());
+        assert!(
+            asking_registry.cancel(&id, Some("user")),
+            "the owning connection cancels its own in-flight request"
+        );
+        assert!(
+            asking_context.is_cancelled(),
+            "the connection that cancelled sees it"
+        );
+        assert!(
+            !other_registry.context(id.clone()).is_cancelled(),
+            "one connection cancelling its id must not cancel another's"
+        );
+
+        // The in-flight cap is per connection too: the counter a session hands out is
+        // its own, so one peer's queue depth cannot throttle another's.
+        assert!(
+            !Arc::ptr_eq(asking.stdio_inflight(), other.stdio_inflight()),
+            "each connection counts its own in-flight requests"
         );
     }
 
