@@ -60,11 +60,11 @@ Still open:
   half of the single-stdio assumption that said a second connection inherits the first one's
   handshake.
   `stdout_broken` followed in the same shape: it was one `Arc<AtomicBool>` owned by `main` and
-  threaded through `write_stdio_response`, `handle_stdio_request`, and the worker spawn, and
-  it is now `SessionState::stdio_broken` (read via `stdio_broken()`, set via
-  `mark_stdio_broken()`). Both callers lost the parameter. The flag is genuinely
-  per-connection: a write failure on one stdio client used to stop every reader loop on the
-  host.
+  threaded through `write_stdio_response`, `handle_stdio_request`, and the worker spawn (10
+  occurrences across 6 distinct sites, none in tests), and it is now
+  `SessionState::stdio_broken` (read via `stdio_broken()`, set via `mark_stdio_broken()`).
+  Both callers lost the parameter. The flag is genuinely per-connection: a write failure on
+  one stdio client used to stop every reader loop on the host.
   Two single-stdio assumptions remain and are NOT part of these moves: the reader's
   `CancelRegistry` and in-flight cap are per-process and keyed by client-chosen JSON-RPC ids,
   so two stdio connections could cancel each other; and stdio PII/HITL lookups collapse to

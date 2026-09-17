@@ -27809,9 +27809,13 @@ mod tests {
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Serializes the tests that drive the process-wide stdio handshake statics.
+    /// Serializes the four tests that drive the stdio handshake.
     ///
-    /// Distinct from `ENV_LOCK`: these tests are not asserting anything about the
+    /// The flags and deferral queue are per-session now, so this is no longer protecting
+    /// shared state: it serializes the WRITES. Every one of these tests builds a session
+    /// over the test process's own stdout, and a released deferral writes `list_changed`
+    /// to it, so without this the four interleave frames into one stream and the output
+    /// becomes unreadable. Distinct from `ENV_LOCK`: these tests assert nothing about the
     /// environment, and borrowing that lock would couple two unrelated groups.
     static STDIO_HANDSHAKE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -27820,8 +27824,8 @@ mod tests {
     /// [`test_stdio_session`] and cannot observe another test's handshake. This used
     /// to be a process-wide `StdioHandshakeGuard` plus the `STDIO_HANDSHAKE_LOCK`
     /// above it, because the flags were process globals shared with the reconcile
-    /// tests in this same binary. That lock is kept only for the reconcile tests,
-    /// which still exercise shared router state.
+    /// tests in this same binary. The lock itself is still needed, but for a different
+    /// reason now: it serializes writes to the shared process stdout, not shared flags.
     ///
     /// How many times `method` is sitting in a session's deferral queue.
     ///
