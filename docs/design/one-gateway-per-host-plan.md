@@ -98,6 +98,11 @@ Still open:
   test-only `DataDirTestEnv` guard (ENV_LOCK plus a scratch override) on every test that
   can reach either writer. Any future per-call `conduit_dir()` resolution needs the same
   treatment, or the leak returns under a third name.
+- Unrelated and still open: several tests leak their own scratch directories under the temp
+  dir, because a panicking test skips its cleanup and a failing run leaves the directory
+  behind. A long local session accumulated about 1,900 of them (`toolport-pii-release-*` was
+  the largest group). Worth one small cleanup pass with a Drop guard on those specific
+  tests; it does not affect correctness, but it makes the temp dir useless as a signal.
 - The adapter has not been dogfooded against a real client (P4.1), but it has an early
   synthetic signal: with one stdio downstream (9 tools) and three client sessions, the
   legacy arm ran 3 gateways and 3 downstream copies while the `--daemon` + `--stdio-adapter`
