@@ -103,14 +103,9 @@ Still open:
   behind. A long local session accumulated about 1,900 of them (`toolport-pii-release-*` was
   the largest group). Worth one small cleanup pass with a Drop guard on those specific
   tests; it does not affect correctness, but it makes the temp dir useless as a signal.
-- The adapter has not been dogfooded against a real client (P4.1), but it has an early
-  synthetic signal: with one stdio downstream (9 tools) and three client sessions, the
-  legacy arm ran 3 gateways and 3 downstream copies while the `--daemon` + `--stdio-adapter`
-  arm ran 1 daemon, 3 thin adapters, and 1 downstream copy, with all three sessions
-  answering a real `tools/call` on both arms. That is the pooling factor moving from 3.0 to
-  1.0. It is a small local fixture, not the acceptance run, and it says nothing about
-  cold-start or first-call latency, so the Phase 0 baseline numbers still stand as the
-  real-machine measurement.
+- The adapter has not been dogfooded against a real client (P4.1). It does have the
+  synthetic per-session-count measurement in the delivery-shape section above, which is a
+  process-count signal on a one-downstream fixture and not a substitute for the real run.
 - Reusable primitives that already exist: the approval broker's `EndpointDescriptor`
   (`approval.rs`), `registry::atomic_write`, and the registry cross-process `FileLock`.
 - Client launch: `clients.rs::gateway_entry` builds the stdio entry and sets
@@ -135,6 +130,34 @@ Still open:
 
 Each of 1 through 8 must leave the default topology untouched and all existing suites
 green. The only PRs that change what a user gets are 10 and 11.
+
+### Early dogfood signal (synthetic, not the P4.1 acceptance run)
+
+The primary success metric is "another ordinary client session adds no router and no
+root-independent downstream copy", so the structural claim was measured across session
+counts rather than at one point. One local fixture: a private `TOOLPORT_DATA_DIR` and
+registry, one stdio downstream (`mock-mcp-server`, 9 tools), the real gateway binary, and
+N concurrent client sessions driven with a real MCP handshake and a real `tools/call` on
+each. Both arms answered every call.
+
+| sessions | legacy gateways / downstream copies | daemon + adapters / downstream copies |
+| -------- | ----------------------------------- | ------------------------------------- |
+| 1        | 1 / 1                               | 2 / 1                                 |
+| 3        | 3 / 3                               | 4 / 1                                 |
+| 6        | 6 / 6                               | 7 / 1                                 |
+
+Downstream copies track the session count exactly on the legacy arm and stay at 1 on the
+daemon arm, which is the metric moving as designed. The six-session row reproduced
+identically on three separate runs, and the three-session row on two (process counts, not
+just assertions).
+
+Two honest caveats. At one session the daemon arm is strictly worse on process count
+(2 against 1), because there is nothing yet to share and the adapter is pure overhead; the
+crossover is somewhere between one and three sessions, and this fixture does not pinpoint
+it. And this measures process counts and the pooling factor only. It does not reproduce the
+Phase 0 baseline's order of magnitude, because that machine ran ~9 downstream servers per
+client against this fixture's one, so it says nothing about the resident-memory win or
+about cold-start and first-call latency. Those still need the real-machine run.
 
 ## Phase 1: explicit HostState, SessionState, RequestContext
 
@@ -272,12 +295,30 @@ Where the fourth increment starts, and the decision it has to make before writin
 
 - Remaining holders, with the readers that keep them off `HostState`: `DISCOVERY_MODE`
   (`discovery_mode()` is read by `grouped_discovery`, `enabled_summary`, `watch_tick`,
-  `handle_stdio_request`, and `main`); `CODE_MODE` (`code_mode_enabled()` is read by
-  `gateway_capabilities`, `append_routine_tool_defs`, `grouped_tool_defs`,
-  `advise_after_direct_call`, both `save_routine_*_dispatch` helpers,
-  `handle_request_with_cancel`, and `http_tool_defs`); and the `session_tables()` store
-  (`clear_pii_session`, the `modern_hitl_*` family, and the HTTP/SSE reader's drop path).
-- The decision: `handle_request` is a wrapper whose 62 call sites are all tests, and
+  `handle_stdio_request`, and `main` (which passes the mode into `process_request`),
+  plus `set_discovery_mode`'s guard; `grouped_discovery()` is itself read by
+  `gateway_capabilities`, `handle_request`, and `handle_http_with_headers`); `CODE_MODE`
+  (`code_mode_enabled()` is read by `gateway_capabilities`, `append_routine_tool_defs`,
+  `grouped_tool_defs`, `advise_after_direct_call`, both `save_routine_*_dispatch` helpers,
+  `handle_request_with_cancel` (twice), the routine and script dispatch helpers (three
+  sites), and `http_tool_defs` (twice)); and the
+  `session_tables()` store, whose nine production sites are inside `clear_pii_session`,
+  `with_pii_session`, and the `modern_hitl_*` family. The HTTP session-close and
+  re-handshake paths reach those helpers as callers rather than reading `session_tables()`
+  themselves, so threading the store means threading those four helpers.
+- Measured size of this increment, so the next attempt starts from it rather than
+  rediscovering it. The holders are not a small mechanical move: `session_tables` has 22
+  production and 41 test call sites across its eight helpers; `CODE_MODE` has 12 production
+  and 12 test; `DISCOVERY_MODE` has 9 production and 18 test. On top of the call sites, each
+  reader currently takes its inputs as separate parameters (`reg`, `router`, `cached`) rather
+  than a host, so moving a holder means changing those signatures as well, and the eight
+  `HostState` literals (one production, seven in tests) need the new fields initialized.
+  Adding the field first and migrating the readers afterwards is the tempting half-step and
+  it must not be committed that way: while both the static and the host field exist, there
+  are two sources of truth and whichever the readers still call wins silently. Land the
+  field and its readers in one pass, or leave the static alone.
+- The decision: `handle_request` is a wrapper whose 61 call sites are all tests (it was 62
+  before the third increment shifted one), and
   `execute_call` is reached through `run_routine_dispatch`, `execute_script_dispatch`, and
   `execute_script_dispatch_with_candidate`. Threading `host: &HostState` through that chain
   is mechanical except for how the tests receive their host. Tests that assert PII or HITL
@@ -286,11 +327,16 @@ Where the fourth increment starts, and the decision it has to make before writin
   whole test, so the fixture-shaped answer is a host built once in the test body and passed
   to every call; a per-call `&http_state(false)` would silently reset the store between
   calls and quietly weaken exactly those tests.
-- Also worth folding into that slice: `watch_tick` and `watch_registry` now take the host
-  _and_ clones of its own fields (rebuild lock, server handler, resource subscriptions,
-  `mcp_sessions`), so a caller could pair one host with another host's router or cache. The
-  seven throwaway hosts in the watcher tests do exactly that on purpose. Production is
-  consistent, and collapsing those parameters into the host removes the hazard.
+- Done in this slice: `watch_tick` and `watch_registry` used to take the host _and_ clones of
+  its own fields (registry, trust flag, router, catalog, dirty flag, server handler,
+  session table, resource subscriptions, rebuild lock, `resources/updated` sink), so a
+  caller could pair one host with another host's router or cache. Those parameters are gone;
+  every host-scoped value is read off the single `host` argument. `watch_tick` went 19 → 10
+  parameters and `watch_registry` 18 → 9. The four watcher tests that passed a throwaway
+  `http_state(false)` beside their own locals now build one host from their own handles (a
+  `host_from_parts` test helper), which is what makes the collapse assert the same thing it
+  used to. The only parameter kept is `resource_updated_override`, because the watcher tests
+  need to drive a rebuild with no sink wired, which a host field cannot express.
 - Sequencing question, for the maintainer rather than for the code: this increment and the
   stdio handshake statics are all that Phase 1 has left, and neither is a prerequisite for
   the pooling work. The three remaining P1.3 holders are host-scoped by decision rather than

@@ -10777,34 +10777,20 @@ struct TickOutcome {
 #[allow(clippy::too_many_arguments)]
 fn watch_registry(
     path: PathBuf,
-    registry: Arc<Mutex<Registry>>,
-    // Republished with every registry swap so the HTTP auth path never reads a
-    // recovered or defaulted registry as "no clients configured" (SBS-900).
-    registry_trusted: Arc<AtomicBool>,
-    router: Arc<Mutex<Arc<Router>>>,
     // The gateway's stdio client session: the refresh paths tell that connection
     // its catalog changed, and its declared era decides which frame may be sent.
     stdio: Arc<SessionState>,
-    cached_tools: SharedCatalog,
     profile: Arc<Mutex<Option<String>>>,
     client_id: Option<String>,
     env_profile: Option<String>,
     http_mode: bool,
-    downstream_dirty: Arc<AtomicU8>,
-    server_handler: ServerRequestHandler,
     // Shared ${ROOT} path (issue #239) so a registry-change rebuild keeps placing
     // ${ROOT} servers in the client's project root instead of resetting to fallback.
     client_root: Arc<Mutex<Option<String>>>,
-    // Live HTTP MCP sessions so list_changed notifications also fan out over SSE
-    // (SOU-328). Empty in pure-stdio mode; same Arc as GatewayState.
-    mcp_sessions: Arc<Mutex<HashMap<String, Arc<SessionState>>>>,
-    // Resource-updated dispatch re-wired into rebuilds after registry reload
-    // (SOU-394 / SOU-398).
-    resource_updated: Option<ResourceUpdatedDispatch>,
-    // Subscription table so rebuilds re-issue resources/subscribe.
-    resource_subs: Option<Arc<Mutex<ResourceSubscriptionTable>>>,
-    // Single-flight with startup self-heal and ${ROOT} rebuilds (SOU-337).
-    rebuild_lock: Arc<Mutex<()>>,
+    // Overrides the host's `resources/updated` sink for this watcher only. `None`
+    // keeps the host's own sink, which is what every production caller wants; a test
+    // passes `Some(None)` to watch a rebuild with no sink wired.
+    resource_updated_override: Option<Option<ResourceUpdatedDispatch>>,
     host: Arc<HostState>,
 ) {
     eprintln!("toolport: watching registry at {}", path.display());
@@ -10814,7 +10800,8 @@ fn watch_registry(
         // Router-relevant slice (everything except the `team` block) as of the initial build,
         // so a team-metadata-only rewrite from the desktop sync loop doesn't force a rebuild.
         last_relevant: router_relevant(
-            &registry
+            &host
+                .registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         ),
@@ -10823,22 +10810,13 @@ fn watch_registry(
         std::thread::sleep(Duration::from_millis(1000));
         let _ = watch_tick(
             &path,
-            &registry,
-            &registry_trusted,
-            &router,
             &stdio,
-            &cached_tools,
             &profile,
             client_id.as_deref(),
             env_profile.as_deref(),
             http_mode,
-            &downstream_dirty,
-            &server_handler,
             &client_root,
-            Some(&mcp_sessions),
-            resource_updated.as_ref(),
-            resource_subs.as_ref(),
-            &rebuild_lock,
+            resource_updated_override.clone(),
             &mut state,
             &host,
         );
@@ -10854,28 +10832,38 @@ fn watch_registry(
 #[allow(clippy::too_many_arguments)]
 fn watch_tick(
     path: &Path,
-    registry: &Arc<Mutex<Registry>>,
-    // Published together with every swap of `registry` (SBS-900).
-    registry_trusted: &Arc<AtomicBool>,
-    router: &Arc<Mutex<Arc<Router>>>,
     stdio: &SessionState,
-    cached_tools: &SharedCatalog,
     profile: &Arc<Mutex<Option<String>>>,
     client_id: Option<&str>,
     env_profile: Option<&str>,
     http_mode: bool,
-    downstream_dirty: &Arc<AtomicU8>,
-    server_handler: &ServerRequestHandler,
     client_root: &Arc<Mutex<Option<String>>>,
-    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<SessionState>>>>>,
-    resource_updated: Option<&ResourceUpdatedDispatch>,
-    resource_subs: Option<&Arc<Mutex<ResourceSubscriptionTable>>>,
-    // Serializes full rebuilds with self-heal / ${ROOT} (SOU-337). Unused on the
-    // in-place list_changed refresh branch, which does not spawn.
-    rebuild_lock: &Arc<Mutex<()>>,
+    // Same override as [`watch_registry`]: `None` uses the host's own sink.
+    resource_updated_override: Option<Option<ResourceUpdatedDispatch>>,
     state: &mut WatchLoopState,
     host: &HostState,
 ) -> TickOutcome {
+    // Everything host-scoped in this tick comes off the host, so a caller cannot pair
+    // one host with another host's router, cache, session table, or rebuild lock.
+    let registry = &host.registry;
+    let registry_trusted = &host.registry_trusted;
+    let router = &host.router;
+    let cached_tools = &host.cached_tools;
+    let downstream_dirty = &host.downstream_dirty;
+    let server_handler = &host.server_handler;
+    let rebuild_lock = &host.rebuild_lock;
+    // Own the resolved sink so `resource_updated` can be handed out as `Option<&_>`
+    // regardless of which source won.
+    let resolved_resource_updated;
+    let resource_updated = match resource_updated_override {
+        Some(sink) => {
+            resolved_resource_updated = sink;
+            resolved_resource_updated.as_ref()
+        }
+        None => host.resource_updated_sink.as_ref(),
+    };
+    let mcp_sessions = Some(&host.mcp_sessions);
+    let resource_subs = Some(&host.resource_subs);
     // Re-approving a tool rewrites quarantine.json, which is NOT the registry file
     // this loop watches, so it has to be reconciled on its own. Deliberately ahead of
     // the early-continue below: a release changes neither the registry mtime nor the
@@ -16448,41 +16436,26 @@ fn main() {
     }
 
     if let Some(path) = registry::resolved_path() {
-        let registry = Arc::clone(&registry);
-        let registry_trusted = Arc::clone(&registry_trusted);
-        let router = Arc::clone(&router);
+        // Only what is genuinely not host state: the stdio session, the profile slots,
+        // the client identity, and the ${ROOT} slot. The host carries its own registry,
+        // router, cache, session table, handler, sink, subscriptions, and rebuild lock,
+        // so this closure cannot pair one host with another host's fields.
         let stdio = Arc::clone(&stdio_upstream);
-        let cached_tools = Arc::clone(&cached_tools);
-        let downstream_dirty = Arc::clone(&downstream_dirty);
-        let server_handler = Arc::clone(&host.server_handler);
         let profile = Arc::clone(&profile);
         let client_id = client_id.clone();
         let env_profile = env_profile.clone();
         let client_root = Arc::clone(&stdio_upstream.client_root);
-        let mcp_sessions = Arc::clone(&mcp_sessions);
-        let resource_updated = host.resource_updated_sink.clone();
-        let resource_subs_watch = Arc::clone(&host.resource_subs);
-        let rebuild_lock = Arc::clone(&host.rebuild_lock);
         let host_for_watch = Arc::clone(&host);
         std::thread::spawn(move || {
             watch_registry(
                 path,
-                registry,
-                registry_trusted,
-                router,
                 stdio,
-                cached_tools,
                 profile,
                 client_id,
                 env_profile,
                 http_mode,
-                downstream_dirty,
-                server_handler,
                 client_root,
-                mcp_sessions,
-                resource_updated,
-                Some(resource_subs_watch),
-                rebuild_lock,
+                None,
                 host_for_watch,
             )
         });
@@ -21896,6 +21869,55 @@ mod tests {
         let mut r = Router::new();
         r.add(ds);
         r
+    }
+
+    /// One host whose host-scoped fields ARE the Arcs a watcher test builds locally.
+    ///
+    /// The watcher tests assert on their own registry/router/cache handles, so they cannot
+    /// use [`http_state`], which builds fresh ones. This wires the test's pieces into a
+    /// single [`HostState`] and hands it back: the test keeps its locals, and `watch_tick`
+    /// sees one host whose fields are all that test's own. Pairs with the collapse of
+    /// `watch_tick`'s host-sourced parameters, which is what removes the old hazard of a
+    /// caller pairing one host with another host's router or cache.
+    #[allow(clippy::too_many_arguments)]
+    fn host_from_parts(
+        registry: Arc<Mutex<Registry>>,
+        registry_trusted: Arc<AtomicBool>,
+        router: Arc<Mutex<Arc<Router>>>,
+        cached_tools: SharedCatalog,
+        downstream_dirty: Arc<AtomicU8>,
+        server_handler: ServerRequestHandler,
+        rebuild_lock: Arc<Mutex<()>>,
+        // The test's own session table, when it asserts list_changed fanout to it.
+        mcp_sessions: Option<Arc<Mutex<HashMap<String, Arc<SessionState>>>>>,
+        // The test's own `resources/updated` sink, when it asserts rebuild fanout.
+        resource_updated_sink: Option<ResourceUpdatedDispatch>,
+    ) -> HostState {
+        HostState {
+            registry,
+            registry_trusted,
+            router,
+            cached_tools,
+            routine_candidates: CandidateRegistry::default(),
+            routine_advisor: AdvisorLedger::default(),
+            ready: Arc::new(AtomicBool::new(true)),
+            downstream_dirty,
+            rebuild_lock,
+            lazy: false,
+            http: true,
+            http_bind_host: "127.0.0.1".to_string(),
+            http_allowed_origins: Vec::new(),
+            server_handler,
+            resource_subs: Arc::new(Mutex::new(ResourceSubscriptionTable::default())),
+            // Host state now, not a parameter: the watcher reads both off the host, so
+            // these are the test's own handles when it supplies them and empty otherwise.
+            resource_updated_sink,
+            rebuild_shrink_streaks: Mutex::new(HashMap::new()),
+            quarantine_read_failed: AtomicBool::new(false),
+            mcp_sessions: mcp_sessions.unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new()))),
+            daemon_mode: AtomicBool::new(false),
+            last_activity_ms: AtomicU64::new(0),
+        }
     }
 
     fn http_state(lazy: bool) -> GatewayState {
@@ -28542,26 +28564,31 @@ mod tests {
             last_routines_mtime: None,
         };
 
+        // One host whose fields are this test's own handles, so the tick
+        // cannot read another host's router or cache.
+        let watch_host = host_from_parts(
+            Arc::clone(&registry),
+            Arc::clone(&registry_trusted),
+            Arc::clone(&router),
+            Arc::clone(&cached_tools),
+            Arc::clone(&downstream_dirty),
+            Arc::clone(&server_handler),
+            Arc::clone(&rebuild_lock),
+            None,
+            None,
+        );
+
         let _ = watch_tick(
             &reg_path,
-            &registry,
-            &registry_trusted,
-            &router,
             &stdio,
-            &cached_tools,
             &profile_slot,
             None,
             Some("Default"),
             true,
-            &downstream_dirty,
-            &server_handler,
             &client_root,
             None,
-            None,
-            None,
-            &rebuild_lock,
             &mut state,
-            &http_state(false),
+            &watch_host,
         );
         assert!(
             profile_slot.lock().unwrap().is_none(),
@@ -28618,26 +28645,31 @@ mod tests {
             last_relevant: json!({}),
             last_routines_mtime: None,
         };
+
+        // One host whose fields are this test's own handles, so the tick
+        // cannot read another host's router or cache.
+        let watch_host = host_from_parts(
+            Arc::clone(&registry),
+            Arc::clone(&registry_trusted),
+            Arc::clone(&router),
+            Arc::clone(&cached_tools),
+            Arc::clone(&downstream_dirty),
+            Arc::clone(&server_handler),
+            Arc::clone(&rebuild_lock),
+            None,
+            None,
+        );
         let _ = watch_tick(
             &reg_path,
-            &registry,
-            &registry_trusted,
-            &router,
             &stdio,
-            &cached_tools,
             &profile_slot,
             None,
             None,
             true,
-            &downstream_dirty,
-            &server_handler,
             &client_root,
             None,
-            None,
-            None,
-            &rebuild_lock,
             &mut state,
-            &http_state(false),
+            &watch_host,
         );
 
         let live = registry.lock().unwrap_or_else(|e| e.into_inner());
@@ -28702,26 +28734,31 @@ mod tests {
 
         // First tick: pick up the quarantined tool from disk.
         let rebuild_lock = Arc::new(Mutex::new(()));
+
+        // One host whose fields are this test's own handles, so the tick
+        // cannot read another host's router or cache.
+        let watch_host = host_from_parts(
+            Arc::clone(&registry),
+            Arc::clone(&registry_trusted),
+            Arc::clone(&router),
+            Arc::clone(&cached_tools),
+            Arc::clone(&downstream_dirty),
+            Arc::clone(&server_handler),
+            Arc::clone(&rebuild_lock),
+            None,
+            None,
+        );
         let load = watch_tick(
             &reg_path,
-            &registry,
-            &registry_trusted,
-            &router,
             &stdio,
-            &cached_tools,
             &profile_slot,
             None,
             None,
             false,
-            &downstream_dirty,
-            &server_handler,
             &client_root,
             None,
-            None,
-            None,
-            &rebuild_lock,
             &mut state,
-            &http_state(false),
+            &watch_host,
         );
         assert!(
             load.idle_after_quarantine,
@@ -28736,24 +28773,15 @@ mod tests {
         // Steady state: still idle, no re-filter.
         let steady = watch_tick(
             &reg_path,
-            &registry,
-            &registry_trusted,
-            &router,
             &stdio,
-            &cached_tools,
             &profile_slot,
             None,
             None,
             false,
-            &downstream_dirty,
-            &server_handler,
             &client_root,
             None,
-            None,
-            None,
-            &rebuild_lock,
             &mut state,
-            &http_state(false),
+            &watch_host,
         );
         assert!(steady.idle_after_quarantine);
         assert!(!steady.quarantine_changed);
@@ -28762,24 +28790,15 @@ mod tests {
         assert!(conduit_lib::integrity::release(profile, "srv__wipe").unwrap());
         let after = watch_tick(
             &reg_path,
-            &registry,
-            &registry_trusted,
-            &router,
             &stdio,
-            &cached_tools,
             &profile_slot,
             None,
             None,
             false,
-            &downstream_dirty,
-            &server_handler,
             &client_root,
             None,
-            None,
-            None,
-            &rebuild_lock,
             &mut state,
-            &http_state(false),
+            &watch_host,
         );
         assert!(
             after.idle_after_quarantine,
@@ -28837,26 +28856,31 @@ mod tests {
             last_relevant: router_relevant(&Registry::default()),
         };
 
+        // One host whose fields are this test's own handles, so the tick
+        // cannot read another host's router or cache.
+        let watch_host = host_from_parts(
+            Arc::clone(&registry),
+            Arc::clone(&registry_trusted),
+            Arc::clone(&router),
+            Arc::clone(&cached_tools),
+            Arc::clone(&downstream_dirty),
+            Arc::clone(&server_handler),
+            Arc::clone(&rebuild_lock),
+            Some(Arc::clone(&mcp_sessions)),
+            None,
+        );
+
         let outcome = watch_tick(
             &path,
-            &registry,
-            &registry_trusted,
-            &router,
             &stdio,
-            &cached_tools,
             &profile,
             None,
             None,
             false,
-            &downstream_dirty,
-            &server_handler,
             &client_root,
-            Some(&mcp_sessions),
-            None,
-            None,
-            &rebuild_lock,
+            Some(None),
             &mut state,
-            &http_state(false),
+            &watch_host,
         );
 
         assert!(!outcome.idle_after_quarantine);
@@ -28885,24 +28909,15 @@ mod tests {
         routines::append_immutable(routine).unwrap();
         let catalog_change = watch_tick(
             &path,
-            &registry,
-            &registry_trusted,
-            &router,
             &stdio,
-            &cached_tools,
             &profile,
             None,
             None,
             false,
-            &downstream_dirty,
-            &server_handler,
             &client_root,
-            Some(&mcp_sessions),
-            None,
-            None,
-            &rebuild_lock,
+            Some(None),
             &mut state,
-            &http_state(false),
+            &watch_host,
         );
         assert!(!catalog_change.idle_after_quarantine);
         assert!(
