@@ -376,11 +376,12 @@ Where the fourth increment starts, and the decision it has to make before writin
   the collapse assert the same thing it used to. The only parameter kept is `resource_updated_override`, because the watcher tests
   need to drive a rebuild with no sink wired, which a host field cannot express.
 - Sequencing question, for the maintainer rather than for the code: this increment is all
-  Phase 1 has left apart from the three remaining stdio assumptions noted above, and neither
+  Phase 1 has left apart from the two remaining stdio assumptions noted above, and neither
   is a prerequisite for the pooling work. The three remaining P1.3 holders are host-scoped by
   decision rather than isolation gaps (host policy, one table per host, one dispatch per
   host), and the P1.2
-  remainder only affects the stdio handshake path. P3.1 and P3.2 are therefore free to start
+  remainder only touches the stdio cancel registry and the local-session PII fallback. P3.1
+  and P3.2 are therefore free to start
   first; the plan keeps the original order by preference, so that pooling is built on state
   that is already fully host-owned. That is a choice about risk, not a dependency.
 
