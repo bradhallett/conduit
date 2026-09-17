@@ -65,6 +65,10 @@ Still open:
   flips the process-wide `stdout_broken` for what is a per-session condition; and stdio
   PII/HITL lookups collapse to `PII_LOCAL_SESSION`, so two stdio clients on one host would
   share one pseudonym map and clearing one would clear the other.
+  Of those three, `stdout_broken` is the next slice and the smallest: it is already an
+  `Arc<AtomicBool>` threaded through `write_stdio_response`, `handle_stdio_request`, and the
+  worker spawn in `main` (6 production sites, no test sites), so it moves onto
+  `SessionState` the same way the handshake flags just did, and the parameter disappears.
 - P1.3 `HostState` (in progress). The host runtime now lives on `HostState` (registry and
   its trust flag, router, catalog snapshot, routine candidates and advisor, ready/dirty
   flags, rebuild lock, listener config, server handler, resource subscriptions and the
