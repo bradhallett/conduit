@@ -11207,9 +11207,11 @@ fn watch_tick(
 // two transports, so behavior can never drift between them.
 // ---------------------------------------------------------------------------
 
-/// Thread-safe gateway state shared by both transports (cheap Arc clones).
-#[derive(Clone)]
-struct GatewayState {
+/// Host-scoped gateway state (one-gateway-per-host P1.3): the pieces a single
+/// host runtime owns exactly once and shares with every session it serves. None
+/// of it carries session identity, so two sessions on one host share one
+/// registry, one router, one catalog, and one rebuild lock.
+struct HostState {
     registry: Arc<Mutex<Registry>>,
     /// Whether `registry` above is a faithful copy of what is on disk, i.e.
     /// whether an EMPTY field in it means the user configured nothing (SBS-900).
@@ -11236,10 +11238,6 @@ struct GatewayState {
     /// does not take it (no spawn).
     rebuild_lock: Arc<Mutex<()>>,
     lazy: bool,
-    /// Live-updated: the registry watcher keeps this in sync with
-    /// `registry.client_scopes` for a scoped client, so a profile switch reaches
-    /// every reader here without a gateway restart.
-    profile: Arc<Mutex<Option<String>>>,
     /// True when this process is the HTTP/OpenAPI bridge (vs a stdio client's
     /// gateway). The bridge connects the union of all registered clients' servers.
     http: bool,
@@ -11248,6 +11246,37 @@ struct GatewayState {
     /// request. Both empty for stdio.
     http_bind_host: String,
     http_allowed_origins: Vec<String>,
+    /// Answers downstream server-initiated RPC (roots, sampling, elicitation).
+    server_handler: ServerRequestHandler,
+    /// Upstream resource subscriptions (session → URI) for SOU-394 fanout.
+    resource_subs: Arc<Mutex<ResourceSubscriptionTable>>,
+    /// Shared dispatch `(producer, uri)` that delivers `notifications/resources/updated`
+    /// to subscribed clients after ownership check (SOU-394 / SOU-398). Bound per
+    /// server at connect/reconnect.
+    resource_updated_sink: Option<ResourceUpdatedDispatch>,
+}
+
+/// Thread-safe gateway state shared by both transports (cheap Arc clones).
+///
+/// A facade over [`HostState`] plus what belongs to this connection: the resolved
+/// profile, the MCP session table, and the stdio client's own session. The
+/// `Deref` impl below is deliberate. It lets the host-scoped call sites keep
+/// reading `state.registry`, `state.router`, and friends while ownership moves
+/// into `HostState`, so this slice does not have to rewrite several hundred lines
+/// just to spell `state.host.registry`.
+///
+/// One consequence to know about: a `move` closure that names a host field captures
+/// the whole host (Rust truncates capture paths at an overloaded deref). Clone the
+/// facade, or borrow it, rather than moving one field out of it.
+#[derive(Clone)]
+struct GatewayState {
+    /// The host runtime. Cloning the facade shares it, as it must: one host, one
+    /// registry, one router.
+    host: Arc<HostState>,
+    /// Live-updated: the registry watcher keeps this in sync with
+    /// `registry.client_scopes` for a scoped client, so a profile switch reaches
+    /// every reader here without a gateway restart.
+    profile: Arc<Mutex<Option<String>>>,
     /// Streamable-HTTP MCP sessions (`Mcp-Session-Id` → state). Only used when
     /// `http` is true; empty for stdio gateways.
     mcp_sessions: Arc<Mutex<HashMap<String, Arc<SessionState>>>>,
@@ -11255,19 +11284,19 @@ struct GatewayState {
     /// declared capabilities and `${ROOT}` project root. The stdio client has exactly
     /// one session, so its fields are this gateway's upstream-client state.
     stdio_upstream: Arc<SessionState>,
-    /// Answers downstream server-initiated RPC (roots, sampling, elicitation).
-    server_handler: ServerRequestHandler,
     /// This stdio gateway's single client id + boot `CONDUIT_PROFILE`, kept so the
     /// root-change handler can recompute the effective (folder-scoped) profile off the
     /// request thread without re-reading env. Process constants; unused in HTTP mode.
     client_id: Option<String>,
     env_profile: Option<String>,
-    /// Upstream resource subscriptions (session → URI) for SOU-394 fanout.
-    resource_subs: Arc<Mutex<ResourceSubscriptionTable>>,
-    /// Shared dispatch `(producer, uri)` that delivers `notifications/resources/updated`
-    /// to subscribed clients after ownership check (SOU-394 / SOU-398). Bound per
-    /// server at connect/reconnect.
-    resource_updated_sink: Option<ResourceUpdatedDispatch>,
+}
+
+impl std::ops::Deref for GatewayState {
+    type Target = HostState;
+
+    fn deref(&self) -> &HostState {
+        &self.host
+    }
 }
 
 /// Client capabilities the upstream MCP client declared at `initialize`.
@@ -16387,33 +16416,35 @@ fn main() {
     }
 
     let state = GatewayState {
-        registry: Arc::clone(&registry),
-        registry_trusted: Arc::clone(&registry_trusted),
-        router: Arc::clone(&router),
-        cached_tools: Arc::clone(&cached_tools),
-        routine_candidates: CandidateRegistry::default(),
-        routine_advisor: AdvisorLedger::default(),
-        ready: Arc::clone(&ready),
-        downstream_dirty: Arc::clone(&downstream_dirty),
-        rebuild_lock,
-        lazy,
+        host: Arc::new(HostState {
+            registry: Arc::clone(&registry),
+            registry_trusted: Arc::clone(&registry_trusted),
+            router: Arc::clone(&router),
+            cached_tools: Arc::clone(&cached_tools),
+            routine_candidates: CandidateRegistry::default(),
+            routine_advisor: AdvisorLedger::default(),
+            ready: Arc::clone(&ready),
+            downstream_dirty: Arc::clone(&downstream_dirty),
+            rebuild_lock,
+            lazy,
+            http: http_mode,
+            http_bind_host: if http_mode {
+                conduit_lib::brand::env_var("TOOLPORT_HTTP_HOST", "CONDUIT_HTTP_HOST")
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| "127.0.0.1".to_string())
+            } else {
+                String::new()
+            },
+            http_allowed_origins: configured_allowed_origins(),
+            server_handler,
+            resource_subs,
+            resource_updated_sink,
+        }),
         profile: Arc::clone(&profile),
-        http: http_mode,
-        http_bind_host: if http_mode {
-            conduit_lib::brand::env_var("TOOLPORT_HTTP_HOST", "CONDUIT_HTTP_HOST")
-                .filter(|v| !v.trim().is_empty())
-                .unwrap_or_else(|| "127.0.0.1".to_string())
-        } else {
-            String::new()
-        },
-        http_allowed_origins: configured_allowed_origins(),
         mcp_sessions,
         stdio_upstream,
-        server_handler,
         client_id: client_id.clone(),
         env_profile: env_profile.clone(),
-        resource_subs,
-        resource_updated_sink,
     };
 
     // Native HTTP/OpenAPI transport: a first-class path for HTTP tool clients
@@ -21756,29 +21787,85 @@ mod tests {
             Arc::clone(&resource_subs),
         ));
         GatewayState {
-            registry: Arc::new(Mutex::new(Registry::default())),
-            // Tests stand in for a clean boot load; the ones that care flip it.
-            registry_trusted: Arc::new(AtomicBool::new(true)),
-            router: Arc::new(Mutex::new(Arc::new(Router::new()))),
-            cached_tools: Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default()))),
-            routine_candidates: CandidateRegistry::default(),
-            routine_advisor: AdvisorLedger::default(),
-            ready: Arc::new(AtomicBool::new(true)),
-            downstream_dirty: Arc::new(AtomicU8::new(0)),
-            rebuild_lock: Arc::new(Mutex::new(())),
-            lazy,
+            host: Arc::new(HostState {
+                registry: Arc::new(Mutex::new(Registry::default())),
+                // Tests stand in for a clean boot load; the ones that care flip it.
+                registry_trusted: Arc::new(AtomicBool::new(true)),
+                router: Arc::new(Mutex::new(Arc::new(Router::new()))),
+                cached_tools: Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default()))),
+                routine_candidates: CandidateRegistry::default(),
+                routine_advisor: AdvisorLedger::default(),
+                ready: Arc::new(AtomicBool::new(true)),
+                downstream_dirty: Arc::new(AtomicU8::new(0)),
+                rebuild_lock: Arc::new(Mutex::new(())),
+                lazy,
+                http: true,
+                http_bind_host: "127.0.0.1".to_string(),
+                http_allowed_origins: Vec::new(),
+                server_handler,
+                resource_subs,
+                resource_updated_sink,
+            }),
             profile: Arc::new(Mutex::new(None)),
-            http: true,
-            http_bind_host: "127.0.0.1".to_string(),
-            http_allowed_origins: Vec::new(),
             mcp_sessions,
             stdio_upstream,
-            server_handler,
             client_id: None,
             env_profile: None,
-            resource_subs,
-            resource_updated_sink,
         }
+    }
+
+    /// Swap the host's live router, the way a rebuild does: the field's identity is
+    /// the lock, not the `Arc<Router>` inside it. Takes either form so callers can
+    /// hand over a plain router or an already-shared one.
+    fn swap_router(state: &GatewayState, router: impl Into<Arc<Router>>) {
+        *state
+            .router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = router.into();
+    }
+
+    /// P1.3: one host, several sessions. Cloning the facade is what happens per
+    /// session (and per request), so a clone must share the host runtime rather
+    /// than copy it: one registry, one live router, one rebuild lock. Two clones
+    /// that each owned a router would double-spawn downstream children on the next
+    /// rebuild and let the loser's Drop kill mid-flight work.
+    #[test]
+    fn one_host_backs_every_session_with_the_same_router_and_registry() {
+        let first = http_state(true);
+        let second = first.clone();
+
+        assert!(
+            Arc::ptr_eq(&first.host, &second.host),
+            "a session clone must share the host, not duplicate it"
+        );
+        assert!(
+            Arc::ptr_eq(&first.router, &second.router),
+            "one host owns exactly one live router"
+        );
+        assert!(Arc::ptr_eq(&first.registry, &second.registry));
+        assert!(Arc::ptr_eq(&first.rebuild_lock, &second.rebuild_lock));
+        assert!(Arc::ptr_eq(&first.cached_tools, &second.cached_tools));
+
+        // One live router means a rebuild seen through one session is seen through
+        // every other one. A second router behind its own lock would fail here.
+        let (router, _calls, _catalog) = counting_router(false);
+        assert!(
+            first.router.lock().unwrap().aggregated_tools().is_empty(),
+            "the fixture starts with no routes"
+        );
+        swap_router(&second, router);
+        // Lock once per statement: both facades share one mutex, so holding two
+        // guards at the same time would deadlock this test against itself.
+        let routes_seen_from_first = first.router.lock().unwrap().aggregated_tools().len();
+        let routes_seen_from_second = second.router.lock().unwrap().aggregated_tools().len();
+        assert!(
+            routes_seen_from_first > 0,
+            "a router swapped in for one session must be the host's router"
+        );
+        assert_eq!(routes_seen_from_first, routes_seen_from_second);
+        let first_router = Arc::as_ptr(&*first.router.lock().unwrap());
+        let second_router = Arc::as_ptr(&*second.router.lock().unwrap());
+        assert_eq!(first_router, second_router);
     }
 
     /// Minimal raw HTTP/1.1 client for the concurrency test: one request per
@@ -22042,8 +22129,8 @@ mod tests {
         .unwrap();
         let mut router = Router::new();
         router.add(ds);
-        let mut state = http_state(false);
-        state.router = Arc::new(Mutex::new(Arc::new(router)));
+        let state = http_state(false);
+        swap_router(&state, router);
 
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let port = server.server_addr().to_ip().unwrap().port();
@@ -22796,8 +22883,8 @@ mod tests {
         // execute_call(), which is where the audit entry is recorded.
         let (router, _calls, _catalog) = counting_router(false);
 
-        let mut state = http_state(true);
-        state.router = Arc::new(Mutex::new(router));
+        let state = http_state(true);
+        swap_router(&state, router);
 
         let search = SearchGuard::default();
         let confirm = ConfirmGuard::new();
@@ -23273,8 +23360,8 @@ mod tests {
         // SBS-937: Open WebUI, n8n and generated OpenAPI clients branch on the
         // status code. A 200 carrying error text runs their success path.
         let (router, calls, _catalog) = counting_router(false);
-        let mut state = http_state(true);
-        state.router = Arc::new(Mutex::new(router));
+        let state = http_state(true);
+        swap_router(&state, router);
         let search = SearchGuard::default();
         let confirm = ConfirmGuard::new();
         let post = |path: &str| {
