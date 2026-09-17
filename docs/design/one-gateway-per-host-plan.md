@@ -81,8 +81,7 @@ Still open:
   its trust flag, router, catalog snapshot, routine candidates and advisor, ready/dirty
   flags, rebuild lock, listener config, server handler, resource subscriptions and the
   `resources/updated` sink), together with its session table, its daemon runtime (daemon
-  flag and activity lease), its rebuild streak map, its quarantine read flag, and the
-  progress token counter. What remains outside is `DISCOVERY_MODE`, `CODE_MODE`, the
+  flag and activity lease), its rebuild streak map, and its quarantine read flag. What remains outside is `DISCOVERY_MODE`, `CODE_MODE`, the
   principal-keyed `session_tables()` store, and the `PROGRESS_*` dispatch and routes, which
   are read inside the dispatch core (see the P1.3 section for why those need the core's
   signatures changed rather than a field move).
@@ -254,8 +253,8 @@ ownership did not rewrite several hundred lines.
   profile handle, the MCP session table, the stdio client's session, and its client id and
   boot profile. One invariant test asserts that a second facade shares the host, so one
   host still has exactly one live router and one registry.
-- Landed, second increment: the host now also owns its session table, its daemon runtime,
-  and the progress token counter. `mcp_sessions` moved onto `HostState` (the readers did
+- Landed, second increment: the host now also owns its session table and its daemon
+  runtime. `mcp_sessions` moved onto `HostState` (the readers did
   not change at all, which is what the `Deref` facade buys), `daemon_mode` and
   `last_activity_ms` replaced the process statics of the same names with `touch_activity()`
   and `idle_for()` on the host, and the progress token counter moved onto `ProgressRoutes`
