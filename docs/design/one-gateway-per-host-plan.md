@@ -59,16 +59,17 @@ Still open:
   test now builds its own session and cannot observe another's handshake. This closes the
   half of the single-stdio assumption that said a second connection inherits the first one's
   handshake.
-  Three more single-stdio assumptions remain and are NOT part of that move: the reader's
+  `stdout_broken` followed in the same shape: it was one `Arc<AtomicBool>` owned by `main` and
+  threaded through `write_stdio_response`, `handle_stdio_request`, and the worker spawn, and
+  it is now `SessionState::stdio_broken` (read via `stdio_broken()`, set via
+  `mark_stdio_broken()`). Both callers lost the parameter. The flag is genuinely
+  per-connection: a write failure on one stdio client used to stop every reader loop on the
+  host.
+  Two single-stdio assumptions remain and are NOT part of these moves: the reader's
   `CancelRegistry` and in-flight cap are per-process and keyed by client-chosen JSON-RPC ids,
-  so two stdio connections could cancel each other; `write_stdio_response`'s no-face branch
-  flips the process-wide `stdout_broken` for what is a per-session condition; and stdio
-  PII/HITL lookups collapse to `PII_LOCAL_SESSION`, so two stdio clients on one host would
-  share one pseudonym map and clearing one would clear the other.
-  Of those three, `stdout_broken` is the next slice and the smallest: it is already an
-  `Arc<AtomicBool>` threaded through `write_stdio_response`, `handle_stdio_request`, and the
-  worker spawn in `main` (6 production sites, no test sites), so it moves onto
-  `SessionState` the same way the handshake flags just did, and the parameter disappears.
+  so two stdio connections could cancel each other; and stdio PII/HITL lookups collapse to
+  `PII_LOCAL_SESSION`, so two stdio clients on one host would share one pseudonym map and
+  clearing one would clear the other.
 - P1.3 `HostState` (in progress). The host runtime now lives on `HostState` (registry and
   its trust flag, router, catalog snapshot, routine candidates and advisor, ready/dirty
   flags, rebuild lock, listener config, server handler, resource subscriptions and the
