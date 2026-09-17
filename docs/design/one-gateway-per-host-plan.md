@@ -54,9 +54,19 @@ Still open:
 - P1.2 threading, remainder: the `STDIO_*` handshake statics (`STDIO_CLIENT_READY`,
   `STDIO_RESPONDED`, `STDIO_DEFERRED_LIST_CHANGED`) still encode one stdio client. They
   move with the stdio connection object, after the deferred queue is keyed per session.
+  Three more single-stdio assumptions go with that move: the reader's `CancelRegistry` and
+  in-flight cap are per-process and keyed by client-chosen JSON-RPC ids, so two stdio
+  connections could cancel each other; `write_stdio_response`'s no-face branch flips the
+  process-wide `stdout_broken` for what is a per-session condition; and stdio PII/HITL
+  lookups collapse to `PII_LOCAL_SESSION`, so two stdio clients on one host would share one
+  pseudonym map and clearing one would clear the other.
 - P1.3 `HostState`. `GatewayState` still mixes host and session state, and owns the
   host-scoped policy and routing globals: `DISCOVERY_MODE`, `CODE_MODE`,
-  `PROGRESS_DISPATCH`, `PROGRESS_ROUTES`.
+  `PROGRESS_DISPATCH`, `PROGRESS_ROUTES`. Six more host-scoped statics live outside it and
+  move in the same pass: `DAEMON_MODE` (process role), `LAST_ACTIVITY_MS` (daemon idle
+  lease), `QUARANTINE_READ_FAILED`, `PROGRESS_TOKEN_SEQ`, `REBUILD_SHRINK_STREAKS`, and the
+  principal-keyed `session_tables()` store. `GatewayState.stdio_upstream` is also
+  constructed unconditionally, including in HTTP/daemon mode where there is no connection.
 - Discovery and code mode are host policy, not session state, by decision. Both are
   resolved from the registry (which the watcher refreshes live) plus a process env
   override, so every session on one host sees the same switch; the per-client part of
@@ -84,19 +94,19 @@ Still open:
 
 ## Delivery shape
 
-| PR  | Slice                                                                                                              | Behavior change           | Status                           |
-| --- | ------------------------------------------------------------------------------------------------------------------ | ------------------------- | -------------------------------- |
-| 1   | P2.1 rendezvous primitives (library module, tested)                                                                | none (new module only)    | landed (#880)                    |
-| 2   | P2.2a identity role; P2.2b host runtime on the internal endpoint                                                   | none (explicit flag only) | landed (#881)                    |
-| 3   | P1.2 session tables on `SessionStore`; transports unified on `SessionState`; era, progress, and guards per session | none                      | landed; handshake statics remain |
-| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade                                                   | none                      | not started                      |
-| 5   | P2.2c stdio adapter speaks the daemon session protocol, behind flag                                                | opt-in only               | landed (#888, #891, #893)        |
-| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback                                                          | opt-in only               | landed (#892, #893)              |
-| 7   | P3.1 union catalog built once, allowed-set enforced per session                                                    | opt-in only               | not started                      |
-| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding                                                      | opt-in only, the big win  | not started                      |
-| 9   | P4.1 dogfood flag, telemetry, acceptance run                                                                       | opt-in only               | not started                      |
-| 10  | P4.2 adapter topology becomes default; legacy kill switch remains                                                  | default flip              | not started                      |
-| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease                                                     | separate, later           | not started                      |
+| PR  | Slice                                                                                                              | Behavior change                             | Status                           |
+| --- | ------------------------------------------------------------------------------------------------------------------ | ------------------------------------------- | -------------------------------- |
+| 1   | P2.1 rendezvous primitives (library module, tested)                                                                | none (new module only)                      | landed (#880)                    |
+| 2   | P2.2a identity role; P2.2b host runtime on the internal endpoint                                                   | none (explicit flag only)                   | landed (#881)                    |
+| 3   | P1.2 session tables on `SessionStore`; transports unified on `SessionState`; era, progress, and guards per session | none default; HTTP confirm scoping narrowed | landed; handshake statics remain |
+| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade                                                   | none                                        | not started                      |
+| 5   | P2.2c stdio adapter speaks the daemon session protocol, behind flag                                                | opt-in only                                 | landed (#888, #891, #893)        |
+| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback                                                          | opt-in only                                 | landed (#892, #893)              |
+| 7   | P3.1 union catalog built once, allowed-set enforced per session                                                    | opt-in only                                 | not started                      |
+| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding                                                      | opt-in only, the big win                    | not started                      |
+| 9   | P4.1 dogfood flag, telemetry, acceptance run                                                                       | opt-in only                                 | not started                      |
+| 10  | P4.2 adapter topology becomes default; legacy kill switch remains                                                  | default flip                                | not started                      |
+| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease                                                     | separate, later                             | not started                      |
 
 Each of 1 through 8 must leave the default topology untouched and all existing suites
 green. The only PRs that change what a user gets are 10 and 11.
