@@ -66,7 +66,8 @@ owned at the wrong boundaries:
   its rebuild streaks, and its quarantine read state too. Process globals also encoded
   single-client assumptions: discovery/code mode, stdio presence (the `STDIO_*` handshake
   statics), and the progress dispatch and token table. The stdio era, the per-connection
-  progress hand-off, the PII maps, the result stash, and the pending modern HITL approvals
+  progress hand-off, the broken-stdout latch, the cancellation registry and in-flight cap, the
+  PII maps, the result stash, and the pending modern HITL approvals
   have since moved onto session state, and `GatewayState` no longer holds a stdout; see
   [the plan](one-gateway-per-host-plan.md) for what landed when.
 - Streamable HTTP already has useful session primitives: authenticated owner and scope,

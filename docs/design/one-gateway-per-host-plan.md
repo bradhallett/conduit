@@ -193,10 +193,9 @@ read goes through the context (`serving_modern_client`, `active_mcp_session`,
 thread-local as a scoped adapter as long as it is populated from the explicit value and
 cannot outlive the request, which the guards already ensure.
 
-What remains is not per-request but session- and host-scoped: the `STDIO_*` handshake
-flags and `PROGRESS_*`. Those are single-stdio-client assumptions and move in P1.2
-(`SessionState`) and P1.3 (`HostState`), so the isolation work lands with the types that own
-it instead of as a mechanical rewrite of the request path. The PII and HITL tables already
+What remains is not per-request but session- and host-scoped: `PROGRESS_*` and the host
+policy. Those move in P1.2 (`SessionState`) and P1.3 (`HostState`), so the isolation work
+lands with the types that own it instead of as a mechanical rewrite of the request path. The PII and HITL tables already
 moved onto a `SessionStore` owner, the two transport types are unified, and the stdio
 client's protocol era, its progress hand-off queue, and the search and confirm guards are
 session state; the handshake flags and deferral queue moved onto the session in the same
@@ -216,7 +215,8 @@ routing that P1.3 takes.
   confirm guard, connection-local notification eligibility. Today it owns the transport
   face, owner, upstream request correlation, outbound queue, subscriptions, root, the
   stdio client's declared capabilities, its 2026-07-28 era flag, its progress hand-off
-  queue, its guard pair, and its handshake flags and deferral queue; discovery/code mode plus
+  queue, its guard pair, its handshake flags and deferral queue, its broken-stdout latch, and its
+  cancellation registry and in-flight cap; discovery/code mode plus
   the progress routes are host-scoped by decision.
 - `McpSession` becomes the HTTP transport face of `SessionState`; the stdio path gets the
   same type with a stdio transport face, deleting `StdioUpstream` as a separate concept.
