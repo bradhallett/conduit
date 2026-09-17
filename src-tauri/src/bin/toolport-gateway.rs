@@ -3634,8 +3634,10 @@ fn tools_per_server(tools: &[Value]) -> HashMap<String, usize> {
 /// Consecutive guarded rebuilds per server, so the rebuild path can confirm-then-accept
 /// exactly as [`conduit_lib::downstream::apply_catalog_refresh`] does on the refresh path.
 ///
-/// Process-global because the three rebuild call sites do not share a struct, and a
-/// gateway process serves one client. Tests drive the pure function with their own map.
+/// Process-global because the three rebuild call sites do not share a struct. It belongs to
+/// the host, not to a session: one router per host means one streak per host, so it stays
+/// single-instance rather than moving onto `SessionState`. Tests drive the pure function
+/// with their own map.
 static REBUILD_SHRINK_STREAKS: std::sync::LazyLock<Mutex<HashMap<String, u8>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -11437,6 +11439,24 @@ fn register_modern_subscription(
     // Reuse the legacy subscription router so modern listeners inherit the same
     // ownership, HTTP scope, single-flight, and global/per-client limits. The
     // acknowledgement reports the subset that was actually granted.
+    // Resolve the stdio face before any downstream subscription is opened. The
+    // error path below must not run after the loop joined holders, or those
+    // holders would be stranded for a session that is never published.
+    let stdio_face = if transport == ModernSubscriptionTransport::Stdio {
+        match state.stdio_upstream.stdio_stdout() {
+            Some(stdout) => Some(stdout),
+            None => {
+                return Err(error(
+                    id,
+                    -32603,
+                    "Toolport: no stdio connection for this subscription",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
     let requested = std::mem::take(&mut filter.resource_subscriptions);
     for uri in requested {
         let subscribe = json!({
@@ -11473,10 +11493,9 @@ fn register_modern_subscription(
         }
     }
 
-    // The stdio face of this transport is the gateway's stdio client, which always
-    // has one: the stdio arm is reachable only from a stdio request (the HTTP path
-    // passes Http). Failing loudly beats falling back to a process stdout that is
-    // not this connection's.
+    // The stdio face is the gateway's stdio client, which always has one: the
+    // stdio arm is reachable only from a stdio request (the HTTP path passes
+    // Http), and it was resolved above before anything was subscribed.
     let session = match transport {
         ModernSubscriptionTransport::Http => Arc::new(SessionState::new_modern(
             owner.cloned(),
@@ -11485,7 +11504,7 @@ fn register_modern_subscription(
             transport,
         )),
         ModernSubscriptionTransport::Stdio => {
-            let Some(stdout) = state.stdio_upstream.stdio_stdout() else {
+            let Some(stdout) = stdio_face else {
                 return Err(error(
                     id,
                     -32603,
