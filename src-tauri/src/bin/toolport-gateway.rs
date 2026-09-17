@@ -3627,24 +3627,10 @@ fn tools_per_server(tools: &[Value]) -> HashMap<String, usize> {
 /// server that is absent, or returned nothing at all, is indistinguishable here
 /// from one the user just disabled - and resurrecting a disabled server's tools
 /// from cache would be a far worse failure than briefly under-reporting one.
+///
 /// Consecutive guarded rebuilds per server, so the rebuild path can confirm-then-accept
 /// exactly as [`conduit_lib::downstream::apply_catalog_refresh`] does on the refresh path.
-///
-/// Process-global because the three rebuild call sites do not share a struct. It belongs to
-/// the host, not to a session: one router per host means one streak per host, so it stays
-/// single-instance rather than moving onto `SessionState`. Tests drive the pure function
-/// with their own map.
-static REBUILD_SHRINK_STREAKS: std::sync::LazyLock<Mutex<HashMap<String, u8>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// [`preserve_collapsed_servers`] against the process-global streak map.
-fn preserve_collapsed_servers_guarded(new_tools: Vec<Value>, previous: &[Value]) -> Vec<Value> {
-    let mut streaks = REBUILD_SHRINK_STREAKS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    preserve_collapsed_servers(new_tools, previous, &mut streaks)
-}
-
+/// The caller owns `streaks` (the host's map); tests drive this with their own.
 fn preserve_collapsed_servers(
     new_tools: Vec<Value>,
     previous: &[Value],
@@ -10391,6 +10377,7 @@ fn fail_closed_integrity_catalog(
 fn effective_quarantine(
     registry: &Arc<Mutex<Registry>>,
     profile: Option<&str>,
+    read_failed: &AtomicBool,
 ) -> Option<BTreeSet<String>> {
     let on = {
         let r = registry
@@ -10406,7 +10393,7 @@ fn effective_quarantine(
     match stored {
         Ok(set) => {
             // Recovered: let a future failure warn again.
-            QUARANTINE_READ_FAILED.store(false, Ordering::SeqCst);
+            read_failed.store(false, Ordering::SeqCst);
             Some(set)
         }
         // Fail CLOSED. An unreadable store is indistinguishable from an empty one, so
@@ -10416,7 +10403,7 @@ fn effective_quarantine(
         Err(e) => {
             // Warn once per failure streak: this runs on a 1s watcher tick, so logging
             // unconditionally would bury the gateway log.
-            if !QUARANTINE_READ_FAILED.swap(true, Ordering::SeqCst) {
+            if !read_failed.swap(true, Ordering::SeqCst) {
                 glog(&format!(
                     "SECURITY: {e}; keeping the current quarantine set rather than \
                      un-blocking. Re-approve tools once the store is readable."
@@ -10427,11 +10414,6 @@ fn effective_quarantine(
         }
     }
 }
-
-/// Whether the last quarantine-store read failed, so the 1s watcher tick warns on the
-/// transition into failure rather than on every tick.
-static QUARANTINE_READ_FAILED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 /// Reconcile the router's live quarantine set against what's persisted, and re-filter if
 /// they diverged. Returns whether anything changed.
@@ -10455,8 +10437,9 @@ fn reconcile_quarantine(
     stdio: &SessionState,
     profile: Option<&str>,
     mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<SessionState>>>>>,
+    read_failed: &AtomicBool,
 ) -> bool {
-    match effective_quarantine(registry, profile) {
+    match effective_quarantine(registry, profile, read_failed) {
         Some(want) => reconcile_to(router, stdio, mcp_sessions, want),
         // Store unreadable: keep enforcing the current set rather than weakening it.
         None => false,
@@ -10583,56 +10566,60 @@ fn cached_tool_is_destructive(tool: &Value, exposed: &str) -> bool {
     }
 }
 
-fn persist_and_emit_with_sessions(
-    tools: &[Value],
-    cached_tools: &SharedCatalog,
-    router: &Arc<Mutex<Arc<Router>>>,
-    previous_router: Option<&Router>,
-    stdio: &SessionState,
-    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<SessionState>>>>>,
-    profile: Option<&str>,
-) {
-    if router_is_fail_closed(router) {
-        clear_catalog_for_fail_closed(cached_tools, profile);
-        notify_tools_changed(stdio, mcp_sessions);
-        return;
-    }
-    if !tools.is_empty() {
-        let started = Instant::now();
-        let tools = {
-            let current = cached_tools
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            preserve_collapsed_servers_guarded(tools.to_vec(), &current.tools)
-        };
-        // A guarded rebuild keeps the previous catalog for a collapsed server in
-        // the cache, but the router was already published from the degraded
-        // connect, so its routes map misses every restored tool while the cache
-        // still advertises it. Re-adopt those routes from the pre-rebuild router
-        // (authoritative (server, original) mapping -- never re-derived by
-        // splitting the exposed name) so route_of resolves what tools/list
-        // advertises (issue #700).
-        if let Some(prev) = previous_router {
-            let mut guard = router
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            Arc::make_mut(&mut guard).adopt_restored_routes(prev, &tools);
+impl HostState {
+    /// Persist a rebuilt catalog and fan out `notifications/tools/list_changed`.
+    fn persist_and_emit_with_sessions(
+        &self,
+        tools: &[Value],
+        cached_tools: &SharedCatalog,
+        router: &Arc<Mutex<Arc<Router>>>,
+        previous_router: Option<&Router>,
+        stdio: &SessionState,
+        mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<SessionState>>>>>,
+        profile: Option<&str>,
+    ) {
+        if router_is_fail_closed(router) {
+            clear_catalog_for_fail_closed(cached_tools, profile);
+            notify_tools_changed(stdio, mcp_sessions);
+            return;
         }
-        let next = Arc::new(CatalogSnapshot::new(tools.clone()));
-        let index_bytes = next.search.estimated_auxiliary_bytes();
-        *cached_tools
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
-        gtrace(&format!(
-            "search index rebuilt: {} tools, ~{} KiB auxiliary, {:.2} ms",
-            tools.len(),
-            index_bytes.div_ceil(1024),
-            started.elapsed().as_secs_f64() * 1000.0
-        ));
-        save_tool_cache(&tools, profile);
+        if !tools.is_empty() {
+            let started = Instant::now();
+            let tools = {
+                let current = cached_tools
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                self.preserve_collapsed_servers_guarded(tools.to_vec(), &current.tools)
+            };
+            // A guarded rebuild keeps the previous catalog for a collapsed server in
+            // the cache, but the router was already published from the degraded
+            // connect, so its routes map misses every restored tool while the cache
+            // still advertises it. Re-adopt those routes from the pre-rebuild router
+            // (authoritative (server, original) mapping -- never re-derived by
+            // splitting the exposed name) so route_of resolves what tools/list
+            // advertises (issue #700).
+            if let Some(prev) = previous_router {
+                let mut guard = router
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                Arc::make_mut(&mut guard).adopt_restored_routes(prev, &tools);
+            }
+            let next = Arc::new(CatalogSnapshot::new(tools.clone()));
+            let index_bytes = next.search.estimated_auxiliary_bytes();
+            *cached_tools
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+            gtrace(&format!(
+                "search index rebuilt: {} tools, ~{} KiB auxiliary, {:.2} ms",
+                tools.len(),
+                index_bytes.div_ceil(1024),
+                started.elapsed().as_secs_f64() * 1000.0
+            ));
+            save_tool_cache(&tools, profile);
+        }
+        notify_tools_changed(stdio, mcp_sessions);
     }
-    notify_tools_changed(stdio, mcp_sessions);
 }
 
 /// Append a line to the always-on gateway log (connection lifecycle: starts,
@@ -10818,6 +10805,7 @@ fn watch_registry(
     resource_subs: Option<Arc<Mutex<ResourceSubscriptionTable>>>,
     // Single-flight with startup self-heal and ${ROOT} rebuilds (SOU-337).
     rebuild_lock: Arc<Mutex<()>>,
+    host: Arc<HostState>,
 ) {
     eprintln!("toolport: watching registry at {}", path.display());
     let mut state = WatchLoopState {
@@ -10852,6 +10840,7 @@ fn watch_registry(
             resource_subs.as_ref(),
             &rebuild_lock,
             &mut state,
+            &host,
         );
     }
 }
@@ -10885,6 +10874,7 @@ fn watch_tick(
     // in-place list_changed refresh branch, which does not spawn.
     rebuild_lock: &Arc<Mutex<()>>,
     state: &mut WatchLoopState,
+    host: &HostState,
 ) -> TickOutcome {
     // Re-approving a tool rewrites quarantine.json, which is NOT the registry file
     // this loop watches, so it has to be reconciled on its own. Deliberately ahead of
@@ -10895,7 +10885,14 @@ fn watch_tick(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        reconcile_quarantine(registry, router, stdio, p.as_deref(), mcp_sessions)
+        reconcile_quarantine(
+            registry,
+            router,
+            stdio,
+            p.as_deref(),
+            mcp_sessions,
+            &host.quarantine_read_failed,
+        )
     };
     // A live downstream server that changed its own tool set (sent
     // tools/list_changed) sets this. Swap before acting so a notification
@@ -11074,7 +11071,7 @@ fn watch_tick(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(new_router);
         let tools = requarantine_if_needed(registry, router, tools, resolved.as_deref());
-        persist_and_emit_with_sessions(
+        host.persist_and_emit_with_sessions(
             &tools,
             cached_tools,
             router,
@@ -11135,7 +11132,7 @@ fn watch_tick(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
             let tools = requarantine_if_needed(registry, router, tools, resolved.as_deref());
-            persist_and_emit_with_sessions(
+            host.persist_and_emit_with_sessions(
                 &tools,
                 cached_tools,
                 router,
@@ -11251,6 +11248,14 @@ struct HostState {
     /// to subscribed clients after ownership check (SOU-394 / SOU-398). Bound per
     /// server at connect/reconnect.
     resource_updated_sink: Option<ResourceUpdatedDispatch>,
+    /// Consecutive guarded rebuilds per server, for the collapse guard in
+    /// [`preserve_collapsed_servers_guarded`]. The streak belongs to the host's one
+    /// router, so one host means one map.
+    rebuild_shrink_streaks: Mutex<HashMap<String, u8>>,
+    /// Whether the last quarantine-store read failed. [`effective_quarantine`] owns it:
+    /// it stores `true` (and warns once per failing streak) when the store cannot be
+    /// read, and stores `false` again as soon as a read succeeds.
+    quarantine_read_failed: AtomicBool,
     /// Streamable-HTTP MCP sessions (`Mcp-Session-Id` → state), and in stdio mode
     /// the one session that connection owns. The table belongs to the host, not to
     /// a connection: every session on this host is a row in it, and the server
@@ -11276,6 +11281,21 @@ impl HostState {
         Duration::from_millis(
             activity_now_ms().saturating_sub(self.last_activity_ms.load(Ordering::Relaxed)),
         )
+    }
+
+    /// [`preserve_collapsed_servers`] against this host's streak map: the collapse
+    /// guard is confirm-then-accept across rebuilds, so the streak has to outlive one
+    /// rebuild and belong to the router it protects.
+    fn preserve_collapsed_servers_guarded(
+        &self,
+        new_tools: Vec<Value>,
+        previous: &[Value],
+    ) -> Vec<Value> {
+        let mut streaks = self
+            .rebuild_shrink_streaks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        preserve_collapsed_servers(new_tools, previous, &mut streaks)
     }
 }
 
@@ -12805,7 +12825,7 @@ fn rebuild_router_for_root(state: &GatewayState) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(new_router);
     let tools = requarantine_if_needed(&state.registry, &state.router, tools, profile.as_deref());
-    persist_and_emit_with_sessions(
+    state.persist_and_emit_with_sessions(
         &tools,
         &state.cached_tools,
         &state.router,
@@ -13108,7 +13128,7 @@ fn process_request(
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .clone();
-                    preserve_collapsed_servers_guarded(tools, &current.tools)
+                    state.preserve_collapsed_servers_guarded(tools, &current.tools)
                 };
                 // Re-adopt routes the guard kept from the previous catalog so the
                 // published router routes what the cache advertises (issue #700).
@@ -16279,6 +16299,39 @@ fn main() {
         Arc::clone(&mcp_sessions),
         http_mode,
     );
+
+    // The host runtime, built before the background threads so they can carry it:
+    // the build thread needs the host's rebuild-streak map, and the registry watcher
+    // needs its quarantine-read flag.
+    let host = Arc::new(HostState {
+        registry: Arc::clone(&registry),
+        registry_trusted: Arc::clone(&registry_trusted),
+        router: Arc::clone(&router),
+        cached_tools: Arc::clone(&cached_tools),
+        routine_candidates: CandidateRegistry::default(),
+        routine_advisor: AdvisorLedger::default(),
+        ready: Arc::clone(&ready),
+        downstream_dirty: Arc::clone(&downstream_dirty),
+        rebuild_lock,
+        lazy,
+        http: http_mode,
+        http_bind_host: if http_mode {
+            conduit_lib::brand::env_var("TOOLPORT_HTTP_HOST", "CONDUIT_HTTP_HOST")
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "127.0.0.1".to_string())
+        } else {
+            String::new()
+        },
+        http_allowed_origins: configured_allowed_origins(),
+        server_handler,
+        resource_subs,
+        resource_updated_sink,
+        mcp_sessions: Arc::clone(&mcp_sessions),
+        daemon_mode: AtomicBool::new(daemon_mode),
+        last_activity_ms: AtomicU64::new(0),
+        rebuild_shrink_streaks: Mutex::new(HashMap::new()),
+        quarantine_read_failed: AtomicBool::new(false),
+    });
     glog(&format!(
         "loaded tool cache: {} tools",
         cached_tools
@@ -16295,13 +16348,14 @@ fn main() {
         let ready = Arc::clone(&ready);
         let cached_tools = Arc::clone(&cached_tools);
         let downstream_dirty = Arc::clone(&downstream_dirty);
-        let server_handler = Arc::clone(&server_handler);
+        let server_handler = Arc::clone(&host.server_handler);
         let profile = Arc::clone(&profile);
         let client_root = Arc::clone(&stdio_upstream.client_root);
-        let rebuild_lock = Arc::clone(&rebuild_lock);
+        let rebuild_lock = Arc::clone(&host.rebuild_lock);
         let mcp_sessions = Arc::clone(&mcp_sessions);
-        let resource_updated = resource_updated_sink.clone();
-        let resource_subs_for_build = Arc::clone(&resource_subs);
+        let resource_updated = host.resource_updated_sink.clone();
+        let resource_subs_for_build = Arc::clone(&host.resource_subs);
+        let host_for_build = Arc::clone(&host);
         std::thread::spawn(move || {
             let reg = registry
                 .lock()
@@ -16370,7 +16424,7 @@ fn main() {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .clone();
-                    preserve_collapsed_servers_guarded(tools, &current.tools)
+                    host_for_build.preserve_collapsed_servers_guarded(tools, &current.tools)
                 };
                 // Re-adopt routes the guard kept from the previous catalog so the
                 // published router routes what the cache advertises (issue #700).
@@ -16400,15 +16454,16 @@ fn main() {
         let stdio = Arc::clone(&stdio_upstream);
         let cached_tools = Arc::clone(&cached_tools);
         let downstream_dirty = Arc::clone(&downstream_dirty);
-        let server_handler = Arc::clone(&server_handler);
+        let server_handler = Arc::clone(&host.server_handler);
         let profile = Arc::clone(&profile);
         let client_id = client_id.clone();
         let env_profile = env_profile.clone();
         let client_root = Arc::clone(&stdio_upstream.client_root);
         let mcp_sessions = Arc::clone(&mcp_sessions);
-        let resource_updated = resource_updated_sink.clone();
-        let resource_subs_watch = Arc::clone(&resource_subs);
-        let rebuild_lock = Arc::clone(&rebuild_lock);
+        let resource_updated = host.resource_updated_sink.clone();
+        let resource_subs_watch = Arc::clone(&host.resource_subs);
+        let rebuild_lock = Arc::clone(&host.rebuild_lock);
+        let host_for_watch = Arc::clone(&host);
         std::thread::spawn(move || {
             watch_registry(
                 path,
@@ -16428,38 +16483,13 @@ fn main() {
                 resource_updated,
                 Some(resource_subs_watch),
                 rebuild_lock,
+                host_for_watch,
             )
         });
     }
 
     let state = GatewayState {
-        host: Arc::new(HostState {
-            registry: Arc::clone(&registry),
-            registry_trusted: Arc::clone(&registry_trusted),
-            router: Arc::clone(&router),
-            cached_tools: Arc::clone(&cached_tools),
-            routine_candidates: CandidateRegistry::default(),
-            routine_advisor: AdvisorLedger::default(),
-            ready: Arc::clone(&ready),
-            downstream_dirty: Arc::clone(&downstream_dirty),
-            rebuild_lock,
-            lazy,
-            http: http_mode,
-            http_bind_host: if http_mode {
-                conduit_lib::brand::env_var("TOOLPORT_HTTP_HOST", "CONDUIT_HTTP_HOST")
-                    .filter(|v| !v.trim().is_empty())
-                    .unwrap_or_else(|| "127.0.0.1".to_string())
-            } else {
-                String::new()
-            },
-            http_allowed_origins: configured_allowed_origins(),
-            server_handler,
-            resource_subs,
-            resource_updated_sink,
-            mcp_sessions: Arc::clone(&mcp_sessions),
-            daemon_mode: AtomicBool::new(daemon_mode),
-            last_activity_ms: AtomicU64::new(0),
-        }),
+        host,
         profile: Arc::clone(&profile),
         stdio_upstream,
         client_id: client_id.clone(),
@@ -21827,6 +21857,8 @@ mod tests {
                 mcp_sessions: Arc::clone(&mcp_sessions),
                 daemon_mode: AtomicBool::new(false),
                 last_activity_ms: AtomicU64::new(0),
+                rebuild_shrink_streaks: Mutex::new(HashMap::new()),
+                quarantine_read_failed: AtomicBool::new(false),
             }),
             profile: Arc::new(Mutex::new(None)),
             stdio_upstream,
@@ -28129,7 +28161,15 @@ mod tests {
                 json!({ "name": "srv__wipe", "description": "", "inputSchema": {} }),
             ]))));
 
-        persist_and_emit_with_sessions(&[], &cached_tools, &router, None, &stdio, None, None);
+        http_state(false).persist_and_emit_with_sessions(
+            &[],
+            &cached_tools,
+            &router,
+            None,
+            &stdio,
+            None,
+            None,
+        );
 
         assert!(
             cached_tools.lock().unwrap().tools.is_empty(),
@@ -28207,7 +28247,7 @@ mod tests {
         );
         let registry = Arc::new(Mutex::new(reg));
         assert_eq!(
-            effective_quarantine(&registry, Some("unused-profile")),
+            effective_quarantine(&registry, Some("unused-profile"), &AtomicBool::new(false)),
             Some(BTreeSet::new()),
             "feature off is a known-empty set, not an unknown one"
         );
@@ -28244,9 +28284,17 @@ mod tests {
             Arc::make_mut(&mut guard).requarantine(set_of(&["srv__wipe"]));
         }
 
-        assert_eq!(effective_quarantine(&registry, profile), None);
+        assert_eq!(
+            effective_quarantine(&registry, profile, &AtomicBool::new(false)),
+            None
+        );
         assert!(!reconcile_quarantine(
-            &registry, &router, &stdio, profile, None
+            &registry,
+            &router,
+            &stdio,
+            profile,
+            None,
+            &AtomicBool::new(false)
         ));
         assert_eq!(
             router.lock().unwrap().quarantined(),
@@ -28295,7 +28343,7 @@ mod tests {
             "the baseline-tamper quarantine is durable and mandatory"
         );
         assert_eq!(
-            effective_quarantine(&registry, profile),
+            effective_quarantine(&registry, profile, &AtomicBool::new(false)),
             None,
             "while the trust root remains corrupt, watcher reconciliation must retain the live set"
         );
@@ -28325,7 +28373,12 @@ mod tests {
         let stdio = test_stdio_session();
 
         assert!(reconcile_quarantine(
-            &registry, &router, &stdio, profile, None
+            &registry,
+            &router,
+            &stdio,
+            profile,
+            None,
+            &AtomicBool::new(false)
         ));
         assert!(router.lock().unwrap().quarantined().contains("srv__wipe"));
 
@@ -28338,12 +28391,19 @@ mod tests {
         std::fs::write(&path, "{ not json at all").unwrap();
 
         assert_eq!(
-            effective_quarantine(&registry, profile),
+            effective_quarantine(&registry, profile, &AtomicBool::new(false)),
             None,
             "an unreadable store must be reported as unknown, not as empty"
         );
         assert!(
-            !reconcile_quarantine(&registry, &router, &stdio, profile, None),
+            !reconcile_quarantine(
+                &registry,
+                &router,
+                &stdio,
+                profile,
+                None,
+                &AtomicBool::new(false)
+            ),
             "a corrupt store must not trigger a re-filter"
         );
         assert!(
@@ -28354,7 +28414,12 @@ mod tests {
         // And it must recover once the store is readable again.
         std::fs::write(&path, "{}").unwrap();
         assert!(reconcile_quarantine(
-            &registry, &router, &stdio, profile, None
+            &registry,
+            &router,
+            &stdio,
+            profile,
+            None,
+            &AtomicBool::new(false)
         ));
         assert!(router.lock().unwrap().quarantined().is_empty());
 
@@ -28407,6 +28472,7 @@ mod tests {
             None,
             &rebuild_lock,
             &mut state,
+            &http_state(false),
         );
         assert!(
             profile_slot.lock().unwrap().is_none(),
@@ -28482,6 +28548,7 @@ mod tests {
             None,
             &rebuild_lock,
             &mut state,
+            &http_state(false),
         );
 
         let live = registry.lock().unwrap_or_else(|e| e.into_inner());
@@ -28565,6 +28632,7 @@ mod tests {
             None,
             &rebuild_lock,
             &mut state,
+            &http_state(false),
         );
         assert!(
             load.idle_after_quarantine,
@@ -28596,6 +28664,7 @@ mod tests {
             None,
             &rebuild_lock,
             &mut state,
+            &http_state(false),
         );
         assert!(steady.idle_after_quarantine);
         assert!(!steady.quarantine_changed);
@@ -28621,6 +28690,7 @@ mod tests {
             None,
             &rebuild_lock,
             &mut state,
+            &http_state(false),
         );
         assert!(
             after.idle_after_quarantine,
@@ -28697,6 +28767,7 @@ mod tests {
             None,
             &rebuild_lock,
             &mut state,
+            &http_state(false),
         );
 
         assert!(!outcome.idle_after_quarantine);
@@ -28742,6 +28813,7 @@ mod tests {
             None,
             &rebuild_lock,
             &mut state,
+            &http_state(false),
         );
         assert!(!catalog_change.idle_after_quarantine);
         assert!(
@@ -28793,19 +28865,34 @@ mod tests {
 
         // Picks the persisted set up off disk (effective_quarantine's ON branch).
         assert!(reconcile_quarantine(
-            &registry, &router, &stdio, profile, None
+            &registry,
+            &router,
+            &stdio,
+            profile,
+            None,
+            &AtomicBool::new(false)
         ));
         assert!(router.lock().unwrap().quarantined().contains("srv__wipe"));
 
         // Steady state: no churn while nothing changes.
         assert!(!reconcile_quarantine(
-            &registry, &router, &stdio, profile, None
+            &registry,
+            &router,
+            &stdio,
+            profile,
+            None,
+            &AtomicBool::new(false)
         ));
 
         // The user re-approves. This is the SOU-292 regression, end to end.
         assert!(conduit_lib::integrity::release(profile, "srv__wipe").unwrap());
         assert!(reconcile_quarantine(
-            &registry, &router, &stdio, profile, None
+            &registry,
+            &router,
+            &stdio,
+            profile,
+            None,
+            &AtomicBool::new(false)
         ));
         assert!(
             router.lock().unwrap().quarantined().is_empty(),
@@ -30941,5 +31028,82 @@ mod tests {
             "body={}",
             authenticated.body
         );
+    }
+
+    /// P1.3: the rebuild streak map and the quarantine read flag belong to the host.
+    /// While they were process statics, a second host shared the first one's streak
+    /// (so it could accept a collapse it never saw) and its store-failure warning
+    /// state. Both are per-host now.
+    #[test]
+    fn rebuild_streaks_and_quarantine_read_state_belong_to_the_host() {
+        let first = http_state(false);
+        let second = http_state(false);
+
+        // A catalog that collapsed from five tools to one: the guard confirms before it
+        // accepts, so each guarded rebuild bumps the streak for that server.
+        let before: Vec<Value> = "abcde"
+            .chars()
+            .map(|c| json!({ "name": format!("srv__{c}"), "description": "", "inputSchema": {} }))
+            .collect();
+        let after = vec![json!({ "name": "srv__a", "description": "", "inputSchema": {} })];
+
+        let guarded = first.preserve_collapsed_servers_guarded(after.clone(), &before);
+        assert_eq!(
+            guarded.len(),
+            before.len(),
+            "the first guarded rebuild keeps the previous catalog"
+        );
+        let first_streak = first
+            .rebuild_shrink_streaks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get("srv")
+            .copied();
+        assert_eq!(
+            first_streak,
+            Some(1),
+            "the host that ran the guard must accumulate the streak"
+        );
+        assert!(
+            second
+                .rebuild_shrink_streaks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "a second host must not see another host's rebuild streak"
+        );
+
+        // The quarantine half drives the flag's only reader rather than poking the two
+        // fields: poking the atomics directly would pass for any two independent flags,
+        // which is exactly what a re-globalized flag would not be. The failure is forced
+        // with a directory where the store's JSON file must be (SOU-320: an unreadable
+        // store is reported as unknown, never as empty).
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("toolport-host-qflag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+        let profile = Some("host-qflag");
+        std::fs::create_dir_all(dir.join(format!(
+            "quarantine-v2-{}.json",
+            conduit_lib::registry::profile_store_key("host-qflag")
+        )))
+        .unwrap();
+
+        assert_eq!(
+            effective_quarantine(&first.registry, profile, &first.quarantine_read_failed),
+            None,
+            "an unreadable store is reported as unknown, not as empty"
+        );
+        assert!(
+            first.quarantine_read_failed.load(Ordering::SeqCst),
+            "the host whose store read failed must record the failure"
+        );
+        assert!(
+            !second.quarantine_read_failed.load(Ordering::SeqCst),
+            "a store failure on one host must not mark another host's read as failed"
+        );
+        drop(_data_dir);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
