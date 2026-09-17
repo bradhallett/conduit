@@ -4,7 +4,8 @@ Status: Phase 0 landed (SBS-838), and the daemon groundwork is in: the rendezvou
 `--daemon` host runtime, and the opt-in `--stdio-adapter` (P2.1 through P2.3), all behind
 explicit flags. **The current gateway topology is unchanged** — every stdio client session
 still runs its own gateway and its own copy of every enabled downstream server until the
-P4.2 default flip. P1.2/P1.3 and the P3 downstream pooling remain. See
+P4.2 default flip. P1.2 is nearly landed (the stdio handshake statics are the remainder);
+P1.3 and the P3 downstream pooling remain. See
 [the plan](one-gateway-per-host-plan.md) for the slice-by-slice status and what is next.
 
 SBS-551 delivered this design plus a slice of Phase 1 (`ActiveRequestContext` and the
@@ -53,10 +54,12 @@ owned at the wrong boundaries:
   exit (`desktop.rs`, `start_http_bridge_at`). It fails when the port is occupied rather
   than discovering an existing compatible process, so it is not a host daemon.
 - `GatewayState` mixes host state (registry, router, catalog, rebuild lock) with
-  connection state (stdout, profile, root, upstream capabilities and server-request
-  routing). Process globals also encode single-client assumptions: discovery/code mode,
-  stdio presence and era, progress dispatch, PII maps, result stash, and pending modern
-  HITL approvals.
+  connection state (profile, root, upstream capabilities and server-request routing).
+  Process globals also encode single-client assumptions: discovery/code mode, stdio
+  presence (the `STDIO_*` handshake statics), and the progress token table. The stdio era,
+  the per-connection progress hand-off, the PII maps, the result stash, and the pending
+  modern HITL approvals have since moved onto session state, and `GatewayState` no longer
+  holds a stdout; see [the plan](one-gateway-per-host-plan.md) for what landed when.
 - Streamable HTTP already has useful session primitives: authenticated owner and scope,
   client capabilities, outbound queues, upstream request correlation, subscriptions,
   expiry, and cleanup.
