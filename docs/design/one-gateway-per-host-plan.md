@@ -64,8 +64,8 @@ Still open:
   its trust flag, router, catalog snapshot, routine candidates and advisor, ready/dirty
   flags, rebuild lock, listener config, server handler, resource subscriptions and the
   `resources/updated` sink), together with its session table, its daemon runtime (daemon
-  flag and activity lease), and the progress token counter. What remains outside is
-  `DISCOVERY_MODE`, `CODE_MODE`, `QUARANTINE_READ_FAILED`, `REBUILD_SHRINK_STREAKS`, the
+  flag and activity lease), its rebuild streak map, its quarantine read flag, and the
+  progress token counter. What remains outside is `DISCOVERY_MODE`, `CODE_MODE`, the
   principal-keyed `session_tables()` store, and the `PROGRESS_*` dispatch and routes, which
   are read inside the dispatch core (see the P1.3 section for why those need the core's
   signatures changed rather than a field move).
@@ -179,7 +179,7 @@ that P1.3 takes.
 
 ### P1.3 HostState
 
-Status: two increments landed. `HostState` owns the host runtime the gateway already
+Status: three increments landed. `HostState` owns the host runtime the gateway already
 resolved once per process, and `GatewayState` is now a facade over it: a `Deref` impl keeps
 the host-scoped call sites reading `state.registry`, `state.router`, and friends, so moving
 ownership did not rewrite several hundred lines.
@@ -244,6 +244,32 @@ ownership did not rewrite several hundred lines.
   existing 300 call sites keep compiling while P2 moves ownership.
 - Tests: the topology assertions in `topology.rs` stay green; a host with one router and
   two sessions reports `router_owners == 1`.
+
+#### Next slice: the dispatch core
+
+Where the fourth increment starts, and the decision it has to make before writing code.
+
+- Remaining holders, with the readers that keep them off `HostState`: `DISCOVERY_MODE`
+  (`discovery_mode()` is read by `grouped_discovery`, `enabled_summary`, `watch_tick`,
+  `handle_stdio_request`, and `main`); `CODE_MODE` (`code_mode_enabled()` is read by
+  `gateway_capabilities`, `append_routine_tool_defs`, `grouped_tool_defs`,
+  `advise_after_direct_call`, both `save_routine_*_dispatch` helpers,
+  `handle_request_with_cancel`, and `http_tool_defs`); and the `session_tables()` store
+  (`clear_pii_session`, the `modern_hitl_*` family, and the HTTP/SSE reader's drop path).
+- The decision: `handle_request` is a wrapper whose 62 call sites are all tests, and
+  `execute_call` is reached through `run_routine_dispatch`, `execute_script_dispatch`, and
+  `execute_script_dispatch_with_candidate`. Threading `host: &HostState` through that chain
+  is mechanical except for how the tests receive their host. Tests that assert PII or HITL
+  continuity across calls (for example
+  `clearing_a_pii_session_drops_the_previous_conversations_map`) need one host for the
+  whole test, so the fixture-shaped answer is a host built once in the test body and passed
+  to every call; a per-call `&http_state(false)` would silently reset the store between
+  calls and quietly weaken exactly those tests.
+- Also worth folding into that slice: `watch_tick` and `watch_registry` now take the host
+  _and_ clones of its own fields (rebuild lock, server handler, resource subscriptions,
+  `mcp_sessions`), so a caller could pair one host with another host's router or cache. The
+  seven throwaway hosts in the watcher tests do exactly that on purpose. Production is
+  consistent, and collapsing those parameters into the host removes the hazard.
 
 ## Phase 2: rendezvous and the stdio adapter
 
