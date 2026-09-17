@@ -16765,6 +16765,49 @@ mod tests {
         }
     }
 
+    /// A serialized environment with its own data directory, for any test that can write
+    /// an audit row.
+    ///
+    /// The dispatch path resolves [`conduit_lib::registry::conduit_dir`] on every call to
+    /// find `audit.jsonl`, so a test that routes a real `tools/call` writes one row per
+    /// call. Without an override those rows land in the developer's REAL data directory
+    /// (SOU-301's failure mode, on a path `DataDirOverride` was never guarding), and
+    /// without the lock two tests can interleave: one test's unattributed fixture row is
+    /// then the first one another test's audit reader finds, which is how
+    /// `mcp_http_audit_entry_records_client_and_client_name` failed on CI with
+    /// `left: Null, right: "client:c1"` while passing alone.
+    ///
+    /// Hold one whenever a test can reach [`audit`]. Declaration order is drop order, so
+    /// the override is released before the lock and the next test never inherits it.
+    struct DataDirTestEnv {
+        dir: std::path::PathBuf,
+        _data_dir: conduit_lib::registry::DataDirOverride,
+        _env: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl DataDirTestEnv {
+        fn new(name: &str) -> Self {
+            let env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let dir = std::env::temp_dir().join(format!(
+                "toolport-{name}-{}",
+                routines::generate_id().unwrap()
+            ));
+            std::fs::create_dir_all(&dir).expect("a writable scratch dir");
+            let data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+            Self {
+                dir,
+                _data_dir: data_dir,
+                _env: env,
+            }
+        }
+    }
+
+    impl Drop for DataDirTestEnv {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
     /// Serve the gateway's handshake on a stub broker: answer the opening challenge with
     /// the proof for `token`, then return the line that follows (the request). `None` if
     /// the gateway hung up first - which is what a gateway does to a peer that fails the
@@ -17298,6 +17341,8 @@ mod tests {
 
     #[test]
     fn a_bad_tools_call_is_a_tool_error_not_a_protocol_error() {
+        let _data_env =
+            DataDirTestEnv::new("a_bad_tools_call_is_a_tool_error_not_a_protocol_error");
         // SEP-1303 (SBS-452): input/routing failures on tools/call must come back as
         // tool execution errors so the model can read them and self-correct. A
         // JSON-RPC error is invisible to the model and ends the turn instead.
@@ -18780,6 +18825,7 @@ mod tests {
     /// call count is reported for savings accounting.
     #[test]
     fn run_script_aggregates_downstream_calls() {
+        let _data_env = DataDirTestEnv::new("run_script_aggregates_downstream_calls");
         let reg = Registry::default();
         let router = Arc::new(paging_router("hello".to_string()));
         let args = json!({
@@ -18987,6 +19033,9 @@ mod tests {
 
     #[test]
     fn routine_preserves_failed_progress_and_cannot_confirm_destructive_calls() {
+        let _data_env = DataDirTestEnv::new(
+            "routine_preserves_failed_progress_and_cannot_confirm_destructive_calls",
+        );
         let (router, calls, catalog) = counting_router(false);
         let reg = Registry::default();
         let failed = routines::new_definition(
@@ -19056,7 +19105,10 @@ mod tests {
 
     #[test]
     fn an_oversized_routine_failure_keeps_its_call_ledger_in_the_text() {
-        let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        // The oversized run dispatches a real call, so it audits: serialize and take a
+        // scratch data dir (DataDirTestEnv acquires ENV_LOCK itself).
+        let _data_env =
+            DataDirTestEnv::new("an_oversized_routine_failure_keeps_its_call_ledger_in_the_text");
         let previous = std::env::var("TOOLPORT_RESULT_BUDGET").ok();
         std::env::set_var("TOOLPORT_RESULT_BUDGET", "2048");
 
@@ -19207,6 +19259,7 @@ mod tests {
     /// aggregate is shaped for the model. Scripts can filter/project huge bodies in JS.
     #[test]
     fn run_script_shapes_oversized_final_aggregate() {
+        let _data_env = DataDirTestEnv::new("run_script_shapes_oversized_final_aggregate");
         let reg = Registry::default();
         let body = "x".repeat(shaping::DEFAULT_BUDGET_BYTES * 2);
         let router = Arc::new(paging_router(body.clone()));
@@ -19273,6 +19326,7 @@ mod tests {
     /// payload, which is what a split across two servers looks like to the gateway.
     #[test]
     fn run_script_final_aggregate_is_screened_for_injection() {
+        let _data_env = DataDirTestEnv::new("run_script_final_aggregate_is_screened_for_injection");
         let mut reg = Registry::default();
         reg.content_defense = true;
         reg.block_on_injection = false;
@@ -19335,6 +19389,7 @@ mod tests {
     /// checkpoint are the script's, so each of those is judged on its own.
     #[test]
     fn run_script_blocked_failure_keeps_the_recovery_ledger() {
+        let _data_env = DataDirTestEnv::new("run_script_blocked_failure_keeps_the_recovery_ledger");
         let mut reg = Registry::default();
         reg.content_defense = true;
         reg.block_on_injection = true;
@@ -19384,6 +19439,8 @@ mod tests {
     /// Script sees the full oversized intermediate and can return a small projection.
     #[test]
     fn run_script_can_project_large_intermediate_without_cursor() {
+        let _data_env =
+            DataDirTestEnv::new("run_script_can_project_large_intermediate_without_cursor");
         let reg = Registry::default();
         let big = "y".repeat(shaping::DEFAULT_BUDGET_BYTES * 2);
         let router = Arc::new(paging_router(big.clone()));
@@ -19616,6 +19673,7 @@ mod tests {
     /// End-to-end: a typed stub routes through execute_call like toolport.call.
     #[test]
     fn run_script_servers_stub_aggregates_downstream() {
+        let _data_env = DataDirTestEnv::new("run_script_servers_stub_aggregates_downstream");
         let reg = Registry::default();
         let router = Arc::new(paging_router("hello".to_string()));
         let cached = vec![json!({ "name": "s__big" })];
@@ -19645,6 +19703,8 @@ mod tests {
     /// call, the call is refused - nothing destructive executes.
     #[test]
     fn run_script_destructive_call_fails_closed_without_confirmation() {
+        let _data_env =
+            DataDirTestEnv::new("run_script_destructive_call_fails_closed_without_confirmation");
         let mut reg = Registry::default();
         reg.confirm_destructive = true;
         let router = Arc::new(paging_router("x".to_string()));
@@ -20206,7 +20266,10 @@ mod tests {
     /// shaping truncates the body head-first.
     #[test]
     fn an_oversized_code_mode_failure_keeps_its_call_ledger_in_the_text() {
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Same as the routine variant above: the run audits, so it needs the lock and
+        // its own data dir rather than the developer's real one.
+        let _data_env =
+            DataDirTestEnv::new("an_oversized_code_mode_failure_keeps_its_call_ledger_in_the_text");
         let previous = std::env::var("TOOLPORT_RESULT_BUDGET").ok();
         std::env::set_var("TOOLPORT_RESULT_BUDGET", "2048");
 
@@ -20395,6 +20458,7 @@ mod tests {
     /// always passes `router_arc: None`, so it cannot assert a successful run.
     #[test]
     fn run_script_respects_live_code_mode_flag() {
+        let _data_env = DataDirTestEnv::new("run_script_respects_live_code_mode_flag");
         let _guard = CodeModeGuard::acquire();
         let reg = Registry::default();
         let router = Arc::new(routed_router("s", "tool"));
@@ -21125,6 +21189,8 @@ mod tests {
 
     #[test]
     fn routine_prefix_does_not_intercept_a_namespaced_downstream_tool() {
+        let _data_env =
+            DataDirTestEnv::new("routine_prefix_does_not_intercept_a_namespaced_downstream_tool");
         let _code_mode = CodeModeGuard::acquire();
         set_code_mode_flag(true);
         let calls = Arc::new(AtomicUsize::new(0));
@@ -22137,6 +22203,7 @@ mod tests {
     /// an unrelated request. A single-threaded accept loop would serialize them.
     #[test]
     fn http_slow_call_does_not_block_other_requests() {
+        let _data_env = DataDirTestEnv::new("http_slow_call_does_not_block_other_requests");
         // A downstream whose tools/call blocks ~800ms; initialize/tools/list stay fast
         // so the connect handshake and routing (`s__wait`) work normally.
         struct SlowRoute {
@@ -22762,6 +22829,7 @@ mod tests {
 
     #[test]
     fn scope_tools_filters_by_server_keeps_meta() {
+        let _data_env = DataDirTestEnv::new("scope_tools_filters_by_server_keeps_meta");
         let tools = vec![
             json!({ "name": "vercel__deploy" }),
             json!({ "name": "resend__send" }),
@@ -23256,6 +23324,7 @@ mod tests {
 
     #[test]
     fn scoped_call_to_out_of_scope_server_is_refused() {
+        let _data_env = DataDirTestEnv::new("scoped_call_to_out_of_scope_server_is_refused");
         let reg = Registry::default();
         let allowed: std::collections::HashSet<String> =
             ["vercel".to_string()].into_iter().collect();
@@ -23410,6 +23479,8 @@ mod tests {
 
     #[test]
     fn openapi_post_reports_failed_and_unknown_tools_by_status() {
+        let _data_env =
+            DataDirTestEnv::new("openapi_post_reports_failed_and_unknown_tools_by_status");
         // SBS-937: Open WebUI, n8n and generated OpenAPI clients branch on the
         // status code. A 200 carrying error text runs their success path.
         let (router, calls, _catalog) = counting_router(false);
@@ -24843,6 +24914,7 @@ mod tests {
 
     #[test]
     fn execute_call_refuses_team_twin_for_personal_scope() {
+        let _data_env = DataDirTestEnv::new("execute_call_refuses_team_twin_for_personal_scope");
         let reg = Registry::default();
         let router = twin_router();
         let cached = router.aggregated_tools();
@@ -25217,6 +25289,7 @@ mod tests {
 
     #[test]
     fn agent_control_gates_then_persists() {
+        let _data_env = DataDirTestEnv::new("agent_control_gates_then_persists");
         // Two servers, only Alpha enabled, agent control OFF.
         let path =
             std::env::temp_dir().join(format!("conduit-ac-test-{}.json", std::process::id()));
@@ -25256,6 +25329,7 @@ mod tests {
 
     #[test]
     fn agent_control_respects_the_client_scope() {
+        let _data_env = DataDirTestEnv::new("agent_control_respects_the_client_scope");
         let path =
             std::env::temp_dir().join(format!("conduit-ac-scope-{}.json", std::process::id()));
         let json = r#"{"version":1,
@@ -26352,6 +26426,8 @@ mod tests {
 
     #[test]
     fn app_only_tools_stay_out_of_model_facing_gateway_paths() {
+        let _data_env =
+            DataDirTestEnv::new("app_only_tools_stay_out_of_model_facing_gateway_paths");
         let reg = Registry::default();
         let mut router = Router::new();
         router.add(
@@ -30232,6 +30308,8 @@ mod tests {
     /// `rehydrate_for_downstream` ever moves back above the intercept.
     #[test]
     fn destructive_confirm_preview_shows_the_token_not_the_real_value() {
+        let _data_env =
+            DataDirTestEnv::new("destructive_confirm_preview_shows_the_token_not_the_real_value");
         let client = None;
         let token = with_pii_session(client, |map| {
             *map = pii::SessionMap::new();
@@ -30281,6 +30359,7 @@ mod tests {
 
     #[test]
     fn confirm_destructive_intercepts_destructive_call() {
+        let _data_env = DataDirTestEnv::new("confirm_destructive_intercepts_destructive_call");
         let reg = registry_with_confirm();
         let req = json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -30312,6 +30391,7 @@ mod tests {
 
     #[test]
     fn confirm_destructive_does_not_intercept_safe_call() {
+        let _data_env = DataDirTestEnv::new("confirm_destructive_does_not_intercept_safe_call");
         let reg = registry_with_confirm();
         let req = json!({
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
@@ -30341,6 +30421,7 @@ mod tests {
 
     #[test]
     fn confirm_destructive_off_does_not_intercept() {
+        let _data_env = DataDirTestEnv::new("confirm_destructive_off_does_not_intercept");
         let reg = Registry::default(); // confirm_destructive = false
         let req = json!({
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
@@ -30368,6 +30449,8 @@ mod tests {
 
     #[test]
     fn confirm_destructive_cannot_be_bypassed_via_toolport_call_tool() {
+        let _data_env =
+            DataDirTestEnv::new("confirm_destructive_cannot_be_bypassed_via_toolport_call_tool");
         let reg = registry_with_confirm();
         // Agent tries to call the destructive tool via toolport_call_tool instead
         // of directly — the interceptor should still catch it because
@@ -30552,6 +30635,8 @@ mod tests {
 
     #[test]
     fn confirm_destructive_token_is_client_scoped_and_does_not_loop() {
+        let _data_env =
+            DataDirTestEnv::new("confirm_destructive_token_is_client_scoped_and_does_not_loop");
         // The critical test: a destructive call is intercepted, then confirmed
         // via toolport_confirm. A different client cannot redeem or consume it,
         // and the rightful owner's confirmed call must NOT be re-intercepted.
@@ -30636,6 +30721,7 @@ mod tests {
 
     #[test]
     fn oversized_tool_call_can_be_fetched() {
+        let _data_env = DataDirTestEnv::new("oversized_tool_call_can_be_fetched");
         let body = format!("{}THE_END", "A".repeat(50_000));
 
         let reg = Registry::default();
@@ -30731,6 +30817,8 @@ mod tests {
 
     #[test]
     fn fetch_result_projection_dispatch_returns_requested_field() {
+        let _data_env =
+            DataDirTestEnv::new("fetch_result_projection_dispatch_returns_requested_field");
         let body = "A".repeat(50_000);
 
         let reg = Registry::default();

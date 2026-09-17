@@ -89,7 +89,14 @@ Still open:
   `resources/updated` check on the peer's declared era. Pre-existing, unchanged by the
   threading work, and on the list so it is not read as an oversight.
 - No topology feature flag in the registry.
-- The adapter has not been dogfooded against a real client (P4.1).
+- The adapter has not been dogfooded against a real client (P4.1), but it has an early
+  synthetic signal: with one stdio downstream (9 tools) and three client sessions, the
+  legacy arm ran 3 gateways and 3 downstream copies while the `--daemon` + `--stdio-adapter`
+  arm ran 1 daemon, 3 thin adapters, and 1 downstream copy, with all three sessions
+  answering a real `tools/call` on both arms. That is the pooling factor moving from 3.0 to
+  1.0. It is a small local fixture, not the acceptance run, and it says nothing about
+  cold-start or first-call latency, so the Phase 0 baseline numbers still stand as the
+  real-machine measurement.
 - Reusable primitives that already exist: the approval broker's `EndpointDescriptor`
   (`approval.rs`), `registry::atomic_write`, and the registry cross-process `FileLock`.
 - Client launch: `clients.rs::gateway_entry` builds the stdio entry and sets
