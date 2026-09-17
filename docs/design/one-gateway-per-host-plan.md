@@ -298,21 +298,26 @@ Where the fourth increment starts, and the decision it has to make before writin
   `handle_stdio_request`, and `main` (which passes the mode into `process_request`),
   plus `set_discovery_mode`'s guard; `grouped_discovery()` is itself read by
   `gateway_capabilities`, `handle_request`, and `handle_http_with_headers`); `CODE_MODE`
-  (`code_mode_enabled()` is read by `gateway_capabilities`, `append_routine_tool_defs`,
-  `grouped_tool_defs`, `advise_after_direct_call`, both `save_routine_*_dispatch` helpers,
-  `handle_request_with_cancel` (twice), the routine and script dispatch helpers (three
-  sites), and `http_tool_defs` (twice)); and the
+  (`code_mode_enabled()` has 13 production reads, none in tests: `gateway_capabilities`,
+  `append_routine_tool_defs`, `grouped_tool_defs`, `advise_after_direct_call`, both
+  `save_routine_*_dispatch` helpers, `http_tool_defs` (twice), and `handle_request_with_cancel`
+  five times. The routine and script dispatch helpers read it zero times, which is worth
+  knowing because it means threading this holder does not reach them); and the
   `session_tables()` store, whose nine production sites are inside `clear_pii_session`,
   `with_pii_session`, and the `modern_hitl_*` family. The HTTP session-close and
   re-handshake paths reach those helpers as callers rather than reading `session_tables()`
-  themselves, so threading the store means threading those four helpers.
+  themselves, so threading the store means threading those eight helpers.
 - Measured size of this increment, so the next attempt starts from it rather than
   rediscovering it. The holders are not a small mechanical move: `session_tables` has 22
-  production and 41 test call sites across its eight helpers; `CODE_MODE` has 12 production
-  and 12 test; `DISCOVERY_MODE` has 9 production and 18 test. On top of the call sites, each
-  reader currently takes its inputs as separate parameters (`reg`, `router`, `cached`) rather
-  than a host, so moving a holder means changing those signatures as well, and the eight
-  `HostState` literals (one production, seven in tests) need the new fields initialized.
+  production and 41 test call sites across its eight helpers. The two policy flags are smaller
+  than they look, because their readers are mostly free functions with no test call sites:
+  `code_mode_enabled()` is 13 production and 0 test, and the identifiers that flip or hold the
+  flag (`CodeModeGuard`, `set_code_mode_flag`) account for 21 test uses. `discovery_mode()` is
+  6 production and 0 test, `grouped_discovery()` 3 production and 0 test, and
+  `DiscoveryModeGuard` 3 production / 3 test. On top of the call sites, each reader currently
+  takes its inputs as separate parameters (`reg`, `router`, `cached`) rather than a host, so
+  moving a holder means changing those signatures as well, and every `HostState` construction
+  site (three: one production, two in tests) needs the new fields initialized.
   Adding the field first and migrating the readers afterwards is the tempting half-step and
   it must not be committed that way: while both the static and the host field exist, there
   are two sources of truth and whichever the readers still call wins silently. Land the
@@ -338,8 +343,9 @@ Where the fourth increment starts, and the decision it has to make before writin
   (`CodeModeGuard`, `set_code_mode_flag`, or `seed_code_mode_after_registry_load`) move from
   the process-wide guard to a host they build. That is a slice, not an edit to fold into
   another change.
-- The decision: `handle_request` is a wrapper whose 61 call sites are all tests (it was 62
-  before the third increment shifted one), and
+- The decision: `handle_request` is a wrapper whose 61 call sites are all tests (61 is also
+  its count on the revisions before the third increment, so treat 61 as stable rather than
+  drifting), and
   `execute_call` is reached through `run_routine_dispatch`, `execute_script_dispatch`, and
   `execute_script_dispatch_with_candidate`. Threading `host: &HostState` through that chain
   is mechanical except for how the tests receive their host. Tests that assert PII or HITL
@@ -354,9 +360,9 @@ Where the fourth increment starts, and the decision it has to make before writin
   caller could pair one host with another host's router or cache. Those parameters are gone;
   every host-scoped value is read off the single `host` argument. `watch_tick` went 19 → 10
   parameters and `watch_registry` 18 → 9. The four watcher tests that passed a throwaway
-  `http_state(false)` beside their own locals now build one host from their own handles (a
-  `host_from_parts` test helper), which is what makes the collapse assert the same thing it
-  used to. The only parameter kept is `resource_updated_override`, because the watcher tests
+  `http_state(false)` as the host (7 call sites across those four) beside their own locals now
+  build one host from their own handles (a `host_from_parts` test helper), which is what makes
+  the collapse assert the same thing it used to. The only parameter kept is `resource_updated_override`, because the watcher tests
   need to drive a rebuild with no sink wired, which a host field cannot express.
 - Sequencing question, for the maintainer rather than for the code: this increment and the
   stdio handshake statics are all that Phase 1 has left, and neither is a prerequisite for
