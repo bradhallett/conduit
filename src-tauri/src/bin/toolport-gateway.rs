@@ -1056,10 +1056,6 @@ static PROGRESS_DISPATCH: std::sync::OnceLock<ProgressDispatch> = std::sync::Onc
 static PROGRESS_ROUTES: std::sync::OnceLock<Arc<Mutex<ProgressRoutes>>> =
     std::sync::OnceLock::new();
 
-/// True when this process is the host daemon (`--daemon`). Gates the internal
-/// `/host/identity` route so the user-facing HTTP bridge never exposes it.
-static DAEMON_MODE: AtomicBool = AtomicBool::new(false);
-
 /// Whether the raw-stdio peer has finished the MCP handshake, so the server may
 /// put its own traffic on stdout.
 ///
@@ -9728,10 +9724,6 @@ struct ProgressRoute {
 /// reading costs dropped notifications rather than a stalled drain thread.
 const PROGRESS_STDIO_QUEUE: usize = 256;
 
-/// Source of gateway-minted progress tokens. Process-wide and monotonic, so a
-/// token is never reused while an earlier call is still in flight.
-static PROGRESS_TOKEN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
 /// Live `progressToken` -> originating client map (SOU-444).
 ///
 /// Progress is request-scoped, so an entry lives exactly as long as the
@@ -9742,6 +9734,13 @@ static PROGRESS_TOKEN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 #[derive(Default)]
 struct ProgressRoutes {
     active: HashMap<String, ProgressRoute>,
+    /// Minting counter for our own progress tokens: monotonic, so a token is never
+    /// reused while an earlier call is still in flight. It lives on the table
+    /// rather than in a process global because a token is only ever resolved
+    /// against the table that minted it, so uniqueness is needed within a table and
+    /// nowhere else. Two hosts minting the same token is fine; one table minting
+    /// the same token twice is not.
+    next_seq: u64,
 }
 
 /// RAII registration: the entry is removed when the call finishes, however it
@@ -9775,23 +9774,21 @@ fn register_progress(
 ) -> Option<(ProgressRegistration, String)> {
     let client_token = client_meta?.get("progressToken")?.clone();
     // Mint our own token rather than reusing the client's. Two clients picking
-    // the same value (integers are common) would otherwise share a table entry.
-    let key = format!(
-        "tp-{}",
-        PROGRESS_TOKEN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    );
-    table
+    // the same value (integers are common) would otherwise share a table entry,
+    // so the counter lives on the table itself rather than in a global.
+    let mut routes = table
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .active
-        .insert(
-            key.clone(),
-            ProgressRoute {
-                session: session.to_string(),
-                producer: producer.to_string(),
-                client_token,
-            },
-        );
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    routes.next_seq += 1;
+    let key = format!("tp-{}", routes.next_seq);
+    routes.active.insert(
+        key.clone(),
+        ProgressRoute {
+            session: session.to_string(),
+            producer: producer.to_string(),
+            client_token,
+        },
+    );
     Some((
         ProgressRegistration {
             table: Arc::clone(table),
@@ -11254,16 +11251,42 @@ struct HostState {
     /// to subscribed clients after ownership check (SOU-394 / SOU-398). Bound per
     /// server at connect/reconnect.
     resource_updated_sink: Option<ResourceUpdatedDispatch>,
+    /// Streamable-HTTP MCP sessions (`Mcp-Session-Id` → state), and in stdio mode
+    /// the one session that connection owns. The table belongs to the host, not to
+    /// a connection: every session on this host is a row in it, and the server
+    /// request handler and the list_changed fanout look sessions up here.
+    mcp_sessions: Arc<Mutex<HashMap<String, Arc<SessionState>>>>,
+    /// True once this process is serving as the host daemon (`--daemon`). Set
+    /// before the first request, read by the daemon identity route.
+    daemon_mode: AtomicBool,
+    /// Millis of the last request a listener accepted. The daemon's idle watchdog
+    /// compares it against its grace period to decide the host is unused.
+    last_activity_ms: AtomicU64,
+}
+
+impl HostState {
+    /// Record that this host just served something, for the daemon idle lease.
+    fn touch_activity(&self) {
+        self.last_activity_ms
+            .store(activity_now_ms(), Ordering::Relaxed);
+    }
+
+    /// How long this host has been idle, for the daemon idle watchdog.
+    fn idle_for(&self) -> Duration {
+        Duration::from_millis(
+            activity_now_ms().saturating_sub(self.last_activity_ms.load(Ordering::Relaxed)),
+        )
+    }
 }
 
 /// Thread-safe gateway state shared by both transports (cheap Arc clones).
 ///
 /// A facade over [`HostState`] plus what belongs to this connection: the resolved
-/// profile, the MCP session table, and the stdio client's own session. The
-/// `Deref` impl below is deliberate. It lets the host-scoped call sites keep
-/// reading `state.registry`, `state.router`, and friends while ownership moves
-/// into `HostState`, so this slice does not have to rewrite several hundred lines
-/// just to spell `state.host.registry`.
+/// profile, the stdio client's own session, and its client id and boot profile.
+/// The `Deref` impl below is deliberate. It lets the host-scoped call sites keep
+/// reading `state.registry`, `state.mcp_sessions`, and friends while ownership
+/// moves into `HostState`, so this slice does not have to rewrite several hundred
+/// lines just to spell `state.host.registry`.
 ///
 /// One consequence to know about: a `move` closure that names a host field captures
 /// the whole host (Rust truncates capture paths at an overloaded deref). Clone the
@@ -11271,15 +11294,12 @@ struct HostState {
 #[derive(Clone)]
 struct GatewayState {
     /// The host runtime. Cloning the facade shares it, as it must: one host, one
-    /// registry, one router.
+    /// registry, one router, one session table.
     host: Arc<HostState>,
     /// Live-updated: the registry watcher keeps this in sync with
     /// `registry.client_scopes` for a scoped client, so a profile switch reaches
     /// every reader here without a gateway restart.
     profile: Arc<Mutex<Option<String>>>,
-    /// Streamable-HTTP MCP sessions (`Mcp-Session-Id` → state). Only used when
-    /// `http` is true; empty for stdio gateways.
-    mcp_sessions: Arc<Mutex<HashMap<String, Arc<SessionState>>>>,
     /// Forward server-initiated JSON-RPC to the stdio upstream client, and carry its
     /// declared capabilities and `${ROOT}` project root. The stdio client has exactly
     /// one session, so its fields are this gateway's upstream-client state.
@@ -14341,7 +14361,7 @@ fn handle_http_with_headers(
 
     // Internal rendezvous identity. Daemon mode only, so the user-facing bridge
     // never exposes the compat fingerprint or build; gated by the same bearer.
-    if DAEMON_MODE.load(Ordering::SeqCst) && path == conduit_lib::daemon::IDENTITY_PATH {
+    if state.daemon_mode.load(Ordering::SeqCst) && path == conduit_lib::daemon::IDENTITY_PATH {
         return match caller {
             Some(_) => HttpOut::new(200, "application/json", daemon_identity_json()),
             None => HttpOut::json_err(401, "unauthorized"),
@@ -15103,10 +15123,6 @@ fn daemon_identity_json() -> String {
     .to_string()
 }
 
-/// Epoch milliseconds of the last accepted or finished HTTP request. Only the host
-/// daemon's idle watchdog reads it; no other role consults it.
-static LAST_ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
-
 fn activity_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -15134,6 +15150,7 @@ fn daemon_idle_grace() -> Duration {
 /// does not pin the process. Discovery is withdrawn before the decision is final,
 /// and put back if work arrived in that window.
 fn spawn_daemon_idle_watchdog(
+    host: Arc<HostState>,
     inflight: Arc<AtomicUsize>,
     descriptor_path: std::path::PathBuf,
     descriptor: conduit_lib::daemon::DaemonDescriptor,
@@ -15145,8 +15162,7 @@ fn spawn_daemon_idle_watchdog(
         if inflight.load(Ordering::Relaxed) > 0 {
             continue;
         }
-        let idle_ms = activity_now_ms().saturating_sub(LAST_ACTIVITY_MS.load(Ordering::Relaxed));
-        if idle_ms < grace.as_millis() as u64 {
+        if host.idle_for() < grace {
             continue;
         }
         // Commit: stop advertising this daemon, then confirm nothing connected in the
@@ -15204,7 +15220,7 @@ fn serve_daemon(state: GatewayState) -> ! {
     );
     // Set the mode before publishing, so the first adapter to probe the
     // descriptor already sees the identity route.
-    DAEMON_MODE.store(true, Ordering::SeqCst);
+    state.daemon_mode.store(true, Ordering::SeqCst);
     if let Err(error) = conduit_lib::daemon::write_descriptor(&descriptor_path, &descriptor) {
         eprintln!("toolport-gateway --daemon: could not publish the descriptor: {error}");
         std::process::exit(1);
@@ -15215,9 +15231,10 @@ fn serve_daemon(state: GatewayState) -> ! {
     ));
     let search = Arc::new(SearchGuard::default());
     let confirm = Arc::new(ConfirmGuard::new());
-    LAST_ACTIVITY_MS.store(activity_now_ms(), Ordering::Relaxed);
+    state.touch_activity();
     let inflight = Arc::new(AtomicUsize::new(0));
     spawn_daemon_idle_watchdog(
+        Arc::clone(&state.host),
         Arc::clone(&inflight),
         descriptor_path.clone(),
         descriptor.clone(),
@@ -15529,7 +15546,7 @@ fn serve_http_loop_with_inflight(
     inflight: Arc<AtomicUsize>,
 ) {
     for request in server.incoming_requests() {
-        LAST_ACTIVITY_MS.store(activity_now_ms(), Ordering::Relaxed);
+        state.touch_activity();
         let Some(guard) = try_acquire_inflight(&inflight, MAX_HTTP_INFLIGHT) else {
             respond_http_overloaded(request);
             continue;
@@ -15552,7 +15569,7 @@ fn serve_http_loop_with_inflight(
             );
             // Stamp on completion too, so a request that ran longer than the grace
             // still gives the daemon a full grace after it finished.
-            LAST_ACTIVITY_MS.store(activity_now_ms(), Ordering::Relaxed);
+            state.touch_activity();
         });
     }
 }
@@ -16439,9 +16456,11 @@ fn main() {
             server_handler,
             resource_subs,
             resource_updated_sink,
+            mcp_sessions: Arc::clone(&mcp_sessions),
+            daemon_mode: AtomicBool::new(daemon_mode),
+            last_activity_ms: AtomicU64::new(0),
         }),
         profile: Arc::clone(&profile),
-        mcp_sessions,
         stdio_upstream,
         client_id: client_id.clone(),
         env_profile: env_profile.clone(),
@@ -21805,9 +21824,11 @@ mod tests {
                 server_handler,
                 resource_subs,
                 resource_updated_sink,
+                mcp_sessions: Arc::clone(&mcp_sessions),
+                daemon_mode: AtomicBool::new(false),
+                last_activity_ms: AtomicU64::new(0),
             }),
             profile: Arc::new(Mutex::new(None)),
-            mcp_sessions,
             stdio_upstream,
             client_id: None,
             env_profile: None,
@@ -30825,6 +30846,100 @@ mod tests {
         assert!(
             state.session_guards(Some("no-such-session")).is_none(),
             "an unknown session id falls back to the listener-level pair"
+        );
+    }
+
+    /// P1.3: the host owns its daemon runtime. A second host must not see the first
+    /// one's daemon flag or activity clock; while those were process statics it did.
+    #[test]
+    fn daemon_runtime_state_belongs_to_the_host() {
+        let first = http_state(true);
+        let second = http_state(true);
+
+        assert!(!first.daemon_mode.load(Ordering::SeqCst));
+        first.daemon_mode.store(true, Ordering::SeqCst);
+        assert!(first.daemon_mode.load(Ordering::SeqCst));
+        assert!(
+            !second.daemon_mode.load(Ordering::SeqCst),
+            "daemon mode must not leak between hosts"
+        );
+
+        // A host that has never served anything is idle since the epoch; a touch
+        // resets its own lease and nothing else's.
+        assert!(second.idle_for() > Duration::from_secs(60));
+        first.touch_activity();
+        assert!(first.idle_for() < Duration::from_secs(5));
+        assert!(
+            second.idle_for() > Duration::from_secs(60),
+            "the activity lease must not leak between hosts"
+        );
+    }
+
+    /// P1.3: the token counter lives on the table, so tokens stay unique within a
+    /// table while a fresh table starts its own sequence over. Two hosts may mint
+    /// the same token because a token is resolved against its own table only.
+    #[test]
+    fn progress_tokens_are_unique_per_table_and_restart_with_a_fresh_table() {
+        let first = Arc::new(Mutex::new(ProgressRoutes::default()));
+        let second = Arc::new(Mutex::new(ProgressRoutes::default()));
+        let meta = json!({ "progressToken": 7 });
+
+        let (first_a, token_a) = register_progress(&first, Some(&meta), "alpha", "s1").unwrap();
+        let (first_b, token_b) = register_progress(&first, Some(&meta), "alpha", "s2").unwrap();
+        let (_second_a, token_c) = register_progress(&second, Some(&meta), "alpha", "s3").unwrap();
+
+        assert_ne!(token_a, token_b, "one table must never mint a token twice");
+        assert_eq!(token_a, "tp-1");
+        assert_eq!(
+            token_a, token_c,
+            "a fresh table starts its own counter instead of continuing another's"
+        );
+        drop(first_a);
+        drop(first_b);
+    }
+
+    /// P1.3: the identity route follows the host's own daemon flag, which is what
+    /// makes the flag worth owning per host: a plain HTTP bridge (or a test host)
+    /// must never serve it, with or without a bearer.
+    #[test]
+    fn the_daemon_identity_route_follows_the_hosts_daemon_flag() {
+        let state = http_state(true);
+        let caller = test_caller("daemon-probe", None);
+        let probe = |state: &GatewayState, caller: Option<&HttpCaller>| {
+            handle_http_with_headers(
+                state,
+                &SearchGuard::default(),
+                &ConfirmGuard::new(),
+                "GET",
+                conduit_lib::daemon::IDENTITY_PATH,
+                "",
+                McpHttpRequestHeaders::default(),
+                None,
+                caller,
+            )
+        };
+
+        assert!(
+            !state.daemon_mode.load(Ordering::SeqCst),
+            "the fixture is not a daemon"
+        );
+        let bridge = probe(&state, Some(&caller));
+        assert!(
+            bridge.status != 200 && bridge.status != 401,
+            "a non-daemon host must neither serve nor advertise the identity route: {}",
+            bridge.body
+        );
+
+        state.daemon_mode.store(true, Ordering::SeqCst);
+        let anonymous = probe(&state, None);
+        assert_eq!(anonymous.status, 401, "body={}", anonymous.body);
+        let authenticated = probe(&state, Some(&caller));
+        assert_eq!(authenticated.status, 200, "body={}", authenticated.body);
+        let identity: Value = serde_json::from_str(&authenticated.body).unwrap();
+        assert!(
+            identity.get("compat").is_some(),
+            "body={}",
+            authenticated.body
         );
     }
 }
