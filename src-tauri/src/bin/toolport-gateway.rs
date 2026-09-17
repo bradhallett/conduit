@@ -28003,6 +28003,39 @@ mod tests {
         ))))
     }
 
+    /// The broken-stdout latch is per session, and a reply to a peer with no stdio
+    /// face sets only that peer's latch.
+    ///
+    /// The no-face branch of [`write_stdio_response`] is the reachable unit seam for
+    /// this flag: a session with no stdio face cannot be answered, so the reply path
+    /// reports the pipe broken. Driving that branch is what makes this a test of the
+    /// behavior rather than of the field: asserting `mark_stdio_broken` then
+    /// `stdio_broken` would only prove the accessor round-trips.
+    ///
+    /// The third assertion is the discriminating one. A re-globalized flag would still
+    /// report `false` from the first reply and `true` from the second, so only
+    /// "an unrelated session is untouched" fails when the flag stops being per-session.
+    #[test]
+    fn a_broken_stdout_latch_belongs_to_one_session() {
+        let httpless = SessionState::new_http(None);
+        let other = test_stdio_session();
+
+        let answered = write_stdio_response(&httpless, &json!({ "jsonrpc": "2.0", "id": 1 }));
+
+        assert!(
+            !answered,
+            "a peer with no stdio face cannot be answered, so the write reports failure"
+        );
+        assert!(
+            httpless.stdio_broken(),
+            "the failed write marks the peer it was addressed to"
+        );
+        assert!(
+            !other.stdio_broken(),
+            "one connection's write failure must not mark another session broken"
+        );
+    }
+
     fn set_of(names: &[&str]) -> BTreeSet<String> {
         names.iter().map(|s| (*s).to_string()).collect()
     }
