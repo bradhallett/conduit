@@ -89,7 +89,28 @@ Still open:
   `resources/updated` check on the peer's declared era. Pre-existing, unchanged by the
   threading work, and on the list so it is not read as an oversight.
 - No topology feature flag in the registry.
-- The adapter has not been dogfooded against a real client (P4.1).
+- Two tests resolved the data directory per call on paths `DataDirOverride` was not
+  guarding, so the gateway suite wrote into the developer's real data dir: the audit writer
+  (`audit::audit_path`) and the search-trace writer (`searchtrace::path`). A full run
+  appended 41 audit rows and 25 search-trace rows; the audit half also let one test's
+  fixture row land inside another test's scratch log, which is what failed
+  `mcp_http_audit_entry_records_client_and_client_name` intermittently on CI. Fixed by a
+  test-only `DataDirTestEnv` guard (ENV_LOCK plus a scratch override) on every test that
+  can reach either writer. Any future per-call `conduit_dir()` resolution needs the same
+  treatment, or the leak returns under a third name.
+- Unrelated and still open: several tests leak their own scratch directories under the temp
+  dir, because a panicking test skips its cleanup and a failing run leaves the directory
+  behind. A long local session accumulated about 1,900 of them (`toolport-pii-release-*` was
+  the largest group). Worth one small cleanup pass with a Drop guard on those specific
+  tests; it does not affect correctness, but it makes the temp dir useless as a signal.
+- The adapter has not been dogfooded against a real client (P4.1), but it has an early
+  synthetic signal: with one stdio downstream (9 tools) and three client sessions, the
+  legacy arm ran 3 gateways and 3 downstream copies while the `--daemon` + `--stdio-adapter`
+  arm ran 1 daemon, 3 thin adapters, and 1 downstream copy, with all three sessions
+  answering a real `tools/call` on both arms. That is the pooling factor moving from 3.0 to
+  1.0. It is a small local fixture, not the acceptance run, and it says nothing about
+  cold-start or first-call latency, so the Phase 0 baseline numbers still stand as the
+  real-machine measurement.
 - Reusable primitives that already exist: the approval broker's `EndpointDescriptor`
   (`approval.rs`), `registry::atomic_write`, and the registry cross-process `FileLock`.
 - Client launch: `clients.rs::gateway_entry` builds the stdio entry and sets
