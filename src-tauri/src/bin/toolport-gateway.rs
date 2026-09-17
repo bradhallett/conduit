@@ -1030,24 +1030,26 @@ type ResourceUpdatedDispatch = Arc<dyn Fn(String, String) + Send + Sync>;
 /// bound per downstream server so delivery can verify who emitted it (SOU-444).
 type ProgressDispatch = Arc<dyn Fn(String, Value) + Send + Sync>;
 
-/// Process-wide progress dispatch, installed once at startup.
+/// Progress dispatch, installed once at startup.
 ///
 /// The resource-updated dispatch is threaded through `build_router` because
 /// subscriptions are rebuilt alongside the router. Progress needs none of that:
-/// it depends only on singletons that live for the whole process (stdout, the
-/// HTTP session table, and the in-flight token map), and every downstream
-/// connection wants the same one. A set-once global keeps it out of four
-/// intermediate signatures that have nothing else to do with it.
+/// the in-flight token table is host state, every downstream connection wants the
+/// same dispatch, and a set-once global keeps it out of four intermediate
+/// signatures that have nothing else to do with it.
+///
+/// Host-scoped by decision (one-gateway-per-host P1.2), not session-scoped: the
+/// table is one per host, and every entry names the session that minted its
+/// token, so P1.3 moves this alongside [`PROGRESS_ROUTES`] onto `HostState`.
+/// Delivery is session-owned: a stdio client's notifications go through that
+/// session's hand-off queue ([`SessionState::stdio_progress_sender`]) rather
+/// than a process stdout captured at startup.
 static PROGRESS_DISPATCH: std::sync::OnceLock<ProgressDispatch> = std::sync::OnceLock::new();
 
 /// In-flight `progressToken` routes, shared by every downstream connection.
+/// Host-scoped for the same reason as [`PROGRESS_DISPATCH`].
 static PROGRESS_ROUTES: std::sync::OnceLock<Arc<Mutex<ProgressRoutes>>> =
     std::sync::OnceLock::new();
-
-/// Once this stdio peer sends a 2026-07-28 request, unsolicited legacy
-/// notifications must stop. Modern notifications travel only through its
-/// explicit `subscriptions/listen` filter.
-static MODERN_STDIO_UPSTREAM: AtomicBool = AtomicBool::new(false);
 
 /// True when this process is the host daemon (`--daemon`). Gates the internal
 /// `/host/identity` route so the user-facing HTTP bridge never exposes it.
@@ -1724,6 +1726,14 @@ impl DiscoveryMode {
 
 /// The live discovery mode. Mutable (not a `OnceLock`) so the watcher can refresh it when
 /// the registry's per-client override changes; `discovery_mode()` reads it lock-free.
+///
+/// Host policy by decision (one-gateway-per-host P1.2), not session state: it is resolved
+/// from the registry (which the watcher refreshes live) plus a process env override, so
+/// every session on one host sees the same switch, and P1.3 moves it onto `HostState`.
+/// The per-client half of discovery already resolves per request from the caller's client
+/// id (`http_client_discovery_override`), and a daemon session will resolve it from the
+/// identity asserted at session open; a per-session copy of the host-wide value would be
+/// the thing that goes stale.
 static DISCOVERY_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 fn set_discovery_mode(mode: DiscoveryMode) {
@@ -1762,6 +1772,10 @@ impl Drop for DiscoveryModeGuard {
 /// The live "code mode" flag, synced from the registry's `code_mode` on startup and by the
 /// registry watcher (like [`DISCOVERY_MODE`]). Read lock-free by [`code_mode_enabled`], so the
 /// six advertise/dispatch sites don't need a `Registry` threaded through them.
+///
+/// Host policy for the same reason as [`DISCOVERY_MODE`]: it is the registry's switch plus a
+/// process env override, not something one session can hold a different value for. P1.3
+/// takes it onto `HostState`.
 static CODE_MODE: AtomicBool = AtomicBool::new(false);
 
 /// Serializes tests that flip [`CODE_MODE`] so parallel cargo tests cannot leave
@@ -3233,10 +3247,13 @@ fn savings_line() -> String {
 /// searches several DIFFERENT things (exploring), or narrows from broad to server
 /// to exact-name (each a different, justified result), never trips this. So it fixes
 /// the weak-model loop without ever penalizing Claude, Cursor, or any model doing
-/// real multi-step work. Any non-search action resets it. Per client connection.
-/// Interior-mutable so the HTTP workers can share ONE guard (the anti-thrash signal
-/// is cross-request, so it can't be per-worker) without any of them holding a lock
-/// across a downstream call: `lock()` is taken only for the brief bookkeeping below.
+/// real multi-step work. Any non-search action resets it. Per client connection:
+/// the streak is one conversation's, so it lives on the session ([`SessionGuards`])
+/// rather than on the process.
+/// Interior-mutable so the HTTP workers of ONE session share a single guard (the
+/// anti-thrash signal is cross-request, so it can't be per-worker) without any of
+/// them holding a lock across a downstream call: `lock()` is taken only for the
+/// brief bookkeeping below.
 #[derive(Default)]
 struct SearchGuard {
     inner: Mutex<SearchState>,
@@ -3270,10 +3287,17 @@ impl SearchGuard {
 /// Per-call confirmation state for destructive tools. When `confirm_destructive`
 /// is on, the first call to a destructive tool returns a preview with a token;
 /// `toolport_confirm { token }` replays the stored call. Entries expire after 60s.
+///
+/// Session-scoped (one-gateway-per-host P1.2): a confirmation is issued to one
+/// conversation and redeemed inside it, so the pending set belongs to that
+/// session ([`SessionGuards`]) rather than to the gateway process. The `owner`
+/// check below still refuses a token presented by a different principal, which is
+/// what makes a shared host safe when two sessions do reach the same set.
 struct ConfirmGuard {
     /// Pending confirmations: token → the exact call to replay. Behind a Mutex so the
-    /// HTTP workers share ONE confirm set: a token stored by one request must be
-    /// redeemable by a later `toolport_confirm` that may land on a different worker.
+    /// HTTP workers of one session share ONE confirm set: a token stored by one
+    /// request must be redeemable by a later `toolport_confirm` that may land on a
+    /// different worker.
     pending: Mutex<std::collections::HashMap<String, PendingCall>>,
 }
 
@@ -3352,6 +3376,34 @@ impl ConfirmGuard {
         }
         let entry = pending.remove(token)?;
         Some((entry.name, entry.arguments))
+    }
+}
+
+/// The cross-request guard state one client conversation owns
+/// (one-gateway-per-host P1.2).
+///
+/// Both halves are session state, not host state. The search-thrash streak counts
+/// one conversation's consecutive searches, so another client's searches must not
+/// push it toward escalation. A pending destructive confirmation was previewed for
+/// one conversation and must be redeemable in that same one; the `owner` check
+/// inside [`ConfirmGuard::take`] refuses a foreign principal on top of that.
+///
+/// Held behind `Arc`s because a dispatch borrows them for the whole call: a
+/// tools/call can hold its `&SearchGuard`/`&ConfirmGuard` across a downstream call
+/// or a human-approval hold while the session record they came from stays
+/// reachable from other threads.
+#[derive(Clone)]
+struct SessionGuards {
+    search: Arc<SearchGuard>,
+    confirm: Arc<ConfirmGuard>,
+}
+
+impl SessionGuards {
+    fn new() -> Self {
+        Self {
+            search: Arc::new(SearchGuard::default()),
+            confirm: Arc::new(ConfirmGuard::new()),
+        }
     }
 }
 
@@ -9388,10 +9440,10 @@ fn mtime(path: &Path) -> Option<SystemTime> {
 }
 
 fn notify_tools_changed(
-    stdout: &Arc<Mutex<std::io::Stdout>>,
+    stdio: &SessionState,
     mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<SessionState>>>>>,
 ) {
-    notify_list_changed(stdout, mcp_sessions, "notifications/tools/list_changed");
+    notify_list_changed(stdio, mcp_sessions, "notifications/tools/list_changed");
 }
 
 /// How long a server->client request waits for the stdio handshake to finish
@@ -9446,11 +9498,11 @@ fn write_stdio_list_changed(stdout: &Arc<Mutex<std::io::Stdout>>, method: &str) 
 /// [`drain_stdio_deferred`]'s call to make. The flag is raised before that call
 /// takes the queue lock, which is what stops a racing `notify_list_changed` from
 /// pushing onto a list that was just emptied.
-fn mark_stdio_client_ready(stdout: &Arc<Mutex<std::io::Stdout>>) {
+fn mark_stdio_client_ready(stdio: &SessionState) {
     if STDIO_CLIENT_READY.swap(true, Ordering::SeqCst) {
         return;
     }
-    drain_stdio_deferred(stdout);
+    drain_stdio_deferred(stdio);
 }
 
 /// Release whatever [`notify_list_changed`] withheld, if releasing it is now
@@ -9462,7 +9514,7 @@ fn mark_stdio_client_ready(stdout: &Arc<Mutex<std::io::Stdout>>) {
 /// this either lands in the queue this call is about to take or is written
 /// directly by its own caller. It cannot be pushed onto a list that was just
 /// emptied, which would strand it until the next catalog change.
-fn drain_stdio_deferred(stdout: &Arc<Mutex<std::io::Stdout>>) {
+fn drain_stdio_deferred(stdio: &SessionState) {
     if !stdio_may_speak() {
         return;
     }
@@ -9478,13 +9530,19 @@ fn drain_stdio_deferred(stdout: &Arc<Mutex<std::io::Stdout>>) {
     // `subscriptions/listen` filter it opened, carrying the subscription id.
     // These were queued before the peer declared its version, so dropping them
     // here is the same call `notify_list_changed` would have made had it known.
-    if MODERN_STDIO_UPSTREAM.load(Ordering::SeqCst) {
+    //
+    // Read off the session, not a process flag: the era belongs to this one
+    // connection, so a second session cannot mute or unmute it.
+    if stdio.is_modern_upstream() {
         return;
     }
+    let Some(stdout) = stdio.stdio_stdout() else {
+        return;
+    };
     // Outside the queue lock: writing takes the stdout mutex, and no other path
     // holds these two at once.
     for method in deferred {
-        write_stdio_list_changed(stdout, &method);
+        write_stdio_list_changed(&stdout, &method);
     }
 }
 
@@ -9499,26 +9557,31 @@ fn drain_stdio_deferred(stdout: &Arc<Mutex<std::io::Stdout>>) {
 /// [`STDIO_CLIENT_READY`] for why putting it on the wire early breaks the client
 /// that is still on its way to sending `initialize`. The HTTP fanout is not gated
 /// - an MCP session only exists after that session initialized.
+/// `stdio` is the gateway's stdio client session. Both the sink it writes to and
+/// the protocol era that decides whether it may write at all are session state,
+/// so one owner holds them instead of two process-wide flags.
 fn notify_list_changed(
-    stdout: &Arc<Mutex<std::io::Stdout>>,
+    stdio: &SessionState,
     mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<SessionState>>>>>,
     method: &str,
 ) {
-    if !MODERN_STDIO_UPSTREAM.load(Ordering::SeqCst) {
-        let ready = {
-            let mut queue = STDIO_DEFERRED_LIST_CHANGED
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let ready = stdio_may_speak();
-            // Deduped: replaying "the tool list changed" twice tells the client
-            // nothing the first replay did not.
-            if !ready && !queue.iter().any(|queued| queued == method) {
-                queue.push(method.to_string());
+    if let Some(stdout) = stdio.stdio_stdout() {
+        if !stdio.is_modern_upstream() {
+            let ready = {
+                let mut queue = STDIO_DEFERRED_LIST_CHANGED
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let ready = stdio_may_speak();
+                // Deduped: replaying "the tool list changed" twice tells the client
+                // nothing the first replay did not.
+                if !ready && !queue.iter().any(|queued| queued == method) {
+                    queue.push(method.to_string());
+                }
+                ready
+            };
+            if ready {
+                write_stdio_list_changed(&stdout, method);
             }
-            ready
-        };
-        if ready {
-            write_stdio_list_changed(stdout, method);
         }
     }
     if let Some(sessions) = mcp_sessions {
@@ -9560,7 +9623,7 @@ fn fanout_mcp_notification(
 /// only proceeds when that id matches the URI's first-writer owner (SOU-398);
 /// spoofed or colliding updates are dropped and logged.
 fn deliver_resource_updated(
-    stdout: &Arc<Mutex<std::io::Stdout>>,
+    stdio: &SessionState,
     mcp_sessions: &Arc<Mutex<HashMap<String, Arc<SessionState>>>>,
     subs: &Arc<Mutex<ResourceSubscriptionTable>>,
     producer: &str,
@@ -9600,11 +9663,11 @@ fn deliver_resource_updated(
             session_ids.push(sid);
         }
     }
-    if should_write_legacy_stdio_resource_update(
-        need_stdio,
-        MODERN_STDIO_UPSTREAM.load(Ordering::SeqCst),
-    ) {
-        let mut out = stdout
+    if should_write_legacy_stdio_resource_update(need_stdio, stdio.is_modern_upstream()) {
+        let Some(out) = stdio.stdio_stdout() else {
+            return;
+        };
+        let mut out = out
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = write_json_line(&mut *out, &msg);
@@ -9766,7 +9829,7 @@ fn prepare_progress(
 /// Deliver one `notifications/progress` to the client that minted its token,
 /// dropping anything unroutable or spoofed (SOU-444).
 fn deliver_progress(
-    stdio: &std::sync::mpsc::SyncSender<Value>,
+    stdio: &Arc<SessionState>,
     mcp_sessions: &Arc<Mutex<HashMap<String, Arc<SessionState>>>>,
     routes: &Arc<Mutex<ProgressRoutes>>,
     producer: &str,
@@ -9813,7 +9876,15 @@ fn deliver_progress(
         // so the in-flight call never completes while still holding the per-server
         // slot mutex, wedging that server for every client. Bounded and dropping
         // when full, exactly as the HTTP session queue already behaves (SOU-474).
-        if stdio.try_send(note.clone()).is_err() {
+        //
+        // The queue belongs to the stdio session, not to the process: a second
+        // stdio client would be a second session with its own hand-off rather
+        // than a second writer on one shared stdout.
+        let Some(sender) = stdio.stdio_progress_sender() else {
+            eprintln!("toolport: stdio progress for a session with no stdio face; dropped");
+            return;
+        };
+        if sender.try_send(note.clone()).is_err() {
             eprintln!("toolport: stdio progress queue full or closed; progress dropped");
         }
         return;
@@ -9837,28 +9908,18 @@ fn deliver_progress(
 
 /// Build the shared dispatch that routes progress notifications to the client
 /// that minted the token. Bound per downstream via [`bind_progress_sink`].
+///
+/// `stdio` is this gateway's stdio client session, which owns the hand-off queue
+/// a `RESOURCE_SUB_STDIO` route delivers to. It is resolved per route rather than
+/// captured here, so the dispatch closes over the session and not over a stdout
+/// that belonged to whichever connection started the process.
 fn make_progress_sink(
-    stdout: Arc<Mutex<std::io::Stdout>>,
+    stdio: Arc<SessionState>,
     mcp_sessions: Arc<Mutex<HashMap<String, Arc<SessionState>>>>,
     routes: Arc<Mutex<ProgressRoutes>>,
 ) -> ProgressDispatch {
-    // One writer thread owns the blocking write to the stdio client, fed by a
-    // bounded queue. Delivery runs on the downstream drain thread, which must
-    // never block (see `deliver_progress`).
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Value>(PROGRESS_STDIO_QUEUE);
-    std::thread::spawn(move || {
-        for note in rx {
-            let mut out = stdout
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if write_json_line(&mut *out, &note).is_err() {
-                // The stdio client is gone; nothing further will be readable.
-                break;
-            }
-        }
-    });
     Arc::new(move |producer: String, note: Value| {
-        deliver_progress(&tx, &mcp_sessions, &routes, &producer, &note);
+        deliver_progress(&stdio, &mcp_sessions, &routes, &producer, &note);
     })
 }
 
@@ -9875,13 +9936,17 @@ fn bind_progress_sink(dispatch: &ProgressDispatch, producer: &str) -> downstream
 /// Build the shared dispatch that fans resource-updated notifications to
 /// subscribed upstream clients only (SOU-394), after verifying the producer
 /// owns the URI (SOU-398). Bound per downstream via [`bind_resource_updated_sink`].
+///
+/// `stdio` is this gateway's stdio client session: the legacy stdio copy of the
+/// notification goes to that session's stdout, and whether it may be written at
+/// all is that session's protocol era.
 fn make_resource_updated_sink(
-    stdout: Arc<Mutex<std::io::Stdout>>,
+    stdio: Arc<SessionState>,
     mcp_sessions: Arc<Mutex<HashMap<String, Arc<SessionState>>>>,
     subs: Arc<Mutex<ResourceSubscriptionTable>>,
 ) -> ResourceUpdatedDispatch {
     Arc::new(move |producer: String, uri: String| {
-        deliver_resource_updated(&stdout, &mcp_sessions, &subs, &producer, &uri);
+        deliver_resource_updated(&stdio, &mcp_sessions, &subs, &producer, &uri);
     })
 }
 
@@ -10379,12 +10444,12 @@ static QUARANTINE_READ_FAILED: std::sync::atomic::AtomicBool =
 fn reconcile_quarantine(
     registry: &Arc<Mutex<Registry>>,
     router: &Arc<Mutex<Arc<Router>>>,
-    stdout: &Arc<Mutex<std::io::Stdout>>,
+    stdio: &SessionState,
     profile: Option<&str>,
     mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<SessionState>>>>>,
 ) -> bool {
     match effective_quarantine(registry, profile) {
-        Some(want) => reconcile_to(router, stdout, mcp_sessions, want),
+        Some(want) => reconcile_to(router, stdio, mcp_sessions, want),
         // Store unreadable: keep enforcing the current set rather than weakening it.
         None => false,
     }
@@ -10400,7 +10465,7 @@ fn reconcile_quarantine(
 /// `requarantine` call sits on an error path and leaves the hide up.
 fn reconcile_to(
     router: &Arc<Mutex<Arc<Router>>>,
-    stdout: &Arc<Mutex<std::io::Stdout>>,
+    stdio: &SessionState,
     mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<SessionState>>>>>,
     want: BTreeSet<String>,
 ) -> bool {
@@ -10432,7 +10497,7 @@ fn reconcile_to(
         eprintln!("toolport: quarantine set changed on disk; re-filtering exposed tools");
         // Fan to HTTP MCP sessions too (SOU-328): quarantine/re-approval must not
         // leave streamable-HTTP clients on a stale tools/list.
-        notify_tools_changed(stdout, mcp_sessions);
+        notify_tools_changed(stdio, mcp_sessions);
     }
     changed
 }
@@ -10515,13 +10580,13 @@ fn persist_and_emit_with_sessions(
     cached_tools: &SharedCatalog,
     router: &Arc<Mutex<Arc<Router>>>,
     previous_router: Option<&Router>,
-    stdout: &Arc<Mutex<std::io::Stdout>>,
+    stdio: &SessionState,
     mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<SessionState>>>>>,
     profile: Option<&str>,
 ) {
     if router_is_fail_closed(router) {
         clear_catalog_for_fail_closed(cached_tools, profile);
-        notify_tools_changed(stdout, mcp_sessions);
+        notify_tools_changed(stdio, mcp_sessions);
         return;
     }
     if !tools.is_empty() {
@@ -10559,7 +10624,7 @@ fn persist_and_emit_with_sessions(
         ));
         save_tool_cache(&tools, profile);
     }
-    notify_tools_changed(stdout, mcp_sessions);
+    notify_tools_changed(stdio, mcp_sessions);
 }
 
 /// Append a line to the always-on gateway log (connection lifecycle: starts,
@@ -10722,7 +10787,9 @@ fn watch_registry(
     // recovered or defaulted registry as "no clients configured" (SBS-900).
     registry_trusted: Arc<AtomicBool>,
     router: Arc<Mutex<Arc<Router>>>,
-    stdout: Arc<Mutex<std::io::Stdout>>,
+    // The gateway's stdio client session: the refresh paths tell that connection
+    // its catalog changed, and its declared era decides which frame may be sent.
+    stdio: Arc<SessionState>,
     cached_tools: SharedCatalog,
     profile: Arc<Mutex<Option<String>>>,
     client_id: Option<String>,
@@ -10763,7 +10830,7 @@ fn watch_registry(
             &registry,
             &registry_trusted,
             &router,
-            &stdout,
+            &stdio,
             &cached_tools,
             &profile,
             client_id.as_deref(),
@@ -10794,7 +10861,7 @@ fn watch_tick(
     // Published together with every swap of `registry` (SBS-900).
     registry_trusted: &Arc<AtomicBool>,
     router: &Arc<Mutex<Arc<Router>>>,
-    stdout: &Arc<Mutex<std::io::Stdout>>,
+    stdio: &SessionState,
     cached_tools: &SharedCatalog,
     profile: &Arc<Mutex<Option<String>>>,
     client_id: Option<&str>,
@@ -10820,7 +10887,7 @@ fn watch_tick(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        reconcile_quarantine(registry, router, stdout, p.as_deref(), mcp_sessions)
+        reconcile_quarantine(registry, router, stdio, p.as_deref(), mcp_sessions)
     };
     // A live downstream server that changed its own tool set (sent
     // tools/list_changed) sets this. Swap before acting so a notification
@@ -10843,7 +10910,7 @@ fn watch_tick(
     let file_changed = current != state.last_mtime;
     if !file_changed && downstream_changed == 0 {
         if routine_catalog_changed {
-            notify_tools_changed(stdout, mcp_sessions);
+            notify_tools_changed(stdio, mcp_sessions);
             eprintln!(
                 "toolport: routine catalog changed; notified clients without rebuilding downstream servers"
             );
@@ -10915,7 +10982,7 @@ fn watch_tick(
         if downstream_changed == 0 && new_relevant == state.last_relevant {
             publish_registry(new_reg);
             if routine_surface_changed || routine_catalog_changed {
-                notify_tools_changed(stdout, mcp_sessions);
+                notify_tools_changed(stdio, mcp_sessions);
                 eprintln!(
                     "toolport: routine tool surface changed; notified clients without rebuilding downstream servers"
                 );
@@ -11004,7 +11071,7 @@ fn watch_tick(
             cached_tools,
             router,
             Some(&previous_router),
-            stdout,
+            stdio,
             mcp_sessions,
             resolved.as_deref(),
         );
@@ -11068,7 +11135,7 @@ fn watch_tick(
                 // list implausibly shrinks, so the refreshed router routes what
                 // the cache advertises -- nothing to re-adopt.
                 None,
-                stdout,
+                stdio,
                 mcp_sessions,
                 resolved.as_deref(),
             );
@@ -11091,7 +11158,7 @@ fn watch_tick(
             *router
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
-            notify_list_changed(stdout, mcp_sessions, "notifications/resources/list_changed");
+            notify_list_changed(stdio, mcp_sessions, "notifications/resources/list_changed");
             eprintln!("toolport: downstream resources/list_changed, refreshed + sent");
         }
         if downstream_changed & downstream::change::PROMPTS != 0 {
@@ -11109,7 +11176,7 @@ fn watch_tick(
             *router
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
-            notify_list_changed(stdout, mcp_sessions, "notifications/prompts/list_changed");
+            notify_list_changed(stdio, mcp_sessions, "notifications/prompts/list_changed");
             eprintln!("toolport: downstream prompts/list_changed, refreshed + sent");
         }
     }
@@ -11200,6 +11267,26 @@ struct ClientUpstreamCaps {
     sampling: bool,
     elicitation_form: bool,
     elicitation_url: bool,
+}
+
+impl GatewayState {
+    /// The guard pair for a request carrying this MCP session id, or `None` when
+    /// there is no session record (a modern request, which is self-contained, or an
+    /// OpenAPI tool call, which carries no MCP session at all).
+    ///
+    /// Guards are session state (P1.2): the search-thrash streak and the pending
+    /// destructive confirmations belong to the conversation that created them, so a
+    /// host serving several clients must not fold two of them into one pair. The
+    /// caller falls back to the listener-level pair only when no session record
+    /// exists, which is the behavior those requests already had.
+    fn session_guards(&self, session: Option<&str>) -> Option<SessionGuards> {
+        let session = session?;
+        self.mcp_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session)
+            .map(|session| session.guards())
+    }
 }
 
 /// Roots the upstream MCP client exposed at `initialize`.
@@ -11382,9 +11469,14 @@ fn register_modern_subscription(
         ModernSubscriptionTransport::Http => {
             SessionState::new_modern(owner.cloned(), id, filter, transport)
         }
-        ModernSubscriptionTransport::Stdio => {
-            SessionState::new_modern_stdio(id, filter, Arc::clone(&state.stdout))
-        }
+        ModernSubscriptionTransport::Stdio => SessionState::new_modern_stdio(
+            id,
+            filter,
+            state
+                .stdio_upstream
+                .stdio_stdout()
+                .unwrap_or_else(|| Arc::clone(&state.stdout)),
+        ),
     });
     if transport == ModernSubscriptionTransport::Http {
         let _ = session.try_begin_listen();
@@ -11553,6 +11645,17 @@ struct SessionState {
     /// session. `None` is used only by direct unit-test callers and the local
     /// stdio client, which has no bearer identity.
     owner: Option<McpSessionOwner>,
+    /// Cross-request guard state this conversation owns: the search-thrash streak
+    /// and the pending destructive confirmations (P1.2).
+    guards: SessionGuards,
+    /// Once this stdio peer sends a 2026-07-28 request, unsolicited legacy
+    /// notifications must stop; modern notifications travel only through its
+    /// explicit `subscriptions/listen` filter.
+    ///
+    /// Session state rather than a process flag: the era is declared by ONE
+    /// connection, so in a shared host a second client must not be able to mute or
+    /// unmute this one. Always `false` for an HTTP face.
+    modern_upstream: AtomicBool,
     last_seen: Mutex<Instant>,
     outbound: Mutex<VecDeque<McpOutboundMessage>>,
     closed: AtomicBool,
@@ -11569,6 +11672,15 @@ struct SessionState {
     /// (it predates the session and only needs this field) instead of the whole
     /// session. stdio-only; always `None` for HTTP sessions.
     client_root: Arc<Mutex<Option<String>>>,
+    /// The stdio client's progress hand-off, created on first use: one writer
+    /// thread owns the blocking write to this session's stdout, fed by a bounded
+    /// queue. Delivery runs on the downstream drain thread, which must never block.
+    ///
+    /// On the session rather than in the shared progress dispatch so the sink
+    /// closes over a connection instead of over whichever stdout started the
+    /// process. Unused (and never created) for an HTTP face or a client that never
+    /// asks for progress.
+    stdio_progress: OnceLock<std::sync::mpsc::SyncSender<Value>>,
     /// Present only for a 2026-07-28 `subscriptions/listen` request. Legacy
     /// Streamable-HTTP sessions keep this `None` and retain their existing fanout.
     modern_subscription: Option<ModernSubscription>,
@@ -11594,6 +11706,8 @@ impl SessionState {
         Self {
             transport,
             owner,
+            guards: SessionGuards::new(),
+            modern_upstream: AtomicBool::new(false),
             last_seen: Mutex::new(Instant::now()),
             outbound: Mutex::new(VecDeque::new()),
             closed: AtomicBool::new(false),
@@ -11603,8 +11717,70 @@ impl SessionState {
             upstream_pending: Mutex::new(HashMap::new()),
             next_upstream_id: AtomicI64::new(1),
             client_root: Arc::new(Mutex::new(None)),
+            stdio_progress: OnceLock::new(),
             modern_subscription: None,
         }
+    }
+
+    /// This session's cross-request guard state, as a shared handle the dispatch
+    /// can borrow for the whole call.
+    fn guards(&self) -> SessionGuards {
+        self.guards.clone()
+    }
+
+    /// Record that this stdio peer declared 2026-07-28 (see [`Self::modern_upstream`]).
+    fn mark_modern_upstream(&self) {
+        self.modern_upstream.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether this stdio peer is on the modern era. `false` for an HTTP face.
+    fn is_modern_upstream(&self) -> bool {
+        self.modern_upstream.load(Ordering::SeqCst)
+    }
+
+    /// The stdout sink of a stdio client, or `None` for every other face.
+    ///
+    /// Callers use it for the connection-local protocol writes that must reach
+    /// THIS client (bare `list_changed`, `resources/updated`), never as a stand-in
+    /// for process stdout.
+    fn stdio_stdout(&self) -> Option<Arc<Mutex<std::io::Stdout>>> {
+        match &self.transport {
+            SessionTransportFace::Stdio(stdout) => Some(Arc::clone(stdout)),
+            SessionTransportFace::Http => None,
+        }
+    }
+
+    /// This session's progress hand-off, or `None` when it has no stdio face.
+    /// Created on first use, so a client that never asks for progress pays for
+    /// neither the queue nor the writer thread.
+    fn stdio_progress_sender(&self) -> Option<&std::sync::mpsc::SyncSender<Value>> {
+        let stdout = match &self.transport {
+            SessionTransportFace::Stdio(stdout) => Arc::clone(stdout),
+            SessionTransportFace::Http => return None,
+        };
+        Some(self.stdio_progress.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Value>(PROGRESS_STDIO_QUEUE);
+            std::thread::spawn(move || {
+                for note in rx {
+                    let mut out = stdout
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if write_json_line(&mut *out, &note).is_err() {
+                        // The stdio client is gone; nothing further will be readable.
+                        break;
+                    }
+                }
+            });
+            tx
+        }))
+    }
+
+    /// Test seam: hand this session a progress queue the test owns, so it can read
+    /// what the writer thread would have written. Real sessions create the queue
+    /// lazily, on first use.
+    #[cfg(test)]
+    fn set_stdio_progress(&self, sender: std::sync::mpsc::SyncSender<Value>) {
+        let _ = self.stdio_progress.set(sender);
     }
 
     fn new_modern(
@@ -12548,7 +12724,7 @@ fn rebuild_router_for_root(state: &GatewayState) {
         &state.cached_tools,
         &state.router,
         Some(&previous_router),
-        &state.stdout,
+        &state.stdio_upstream,
         Some(&state.mcp_sessions),
         profile.as_deref(),
     );
@@ -12720,14 +12896,14 @@ fn process_request(
     });
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     if !state.http && upstream_declared_version(req) == Some(MODERN_PROTOCOL_VERSION) {
-        MODERN_STDIO_UPSTREAM.store(true, Ordering::SeqCst);
+        state.stdio_upstream.mark_modern_upstream();
     }
     // Anything on stdio that is not `initialize` itself means the handshake is
     // behind us: the required `notifications/initialized`, or a first real request
     // from a client that skipped it. Either way the server may speak now (SBS-1019).
     // An empty method is a client->server response, which carries no such signal.
     if !state.http && !method.is_empty() && method != "initialize" {
-        mark_stdio_client_ready(&state.stdout);
+        mark_stdio_client_ready(&state.stdio_upstream);
     }
     let is_notification = !req.get("id").is_some_and(|id| !id.is_null());
     if is_notification {
@@ -12878,7 +13054,7 @@ fn process_request(
                         .server_count(),
                     tools.len()
                 ));
-                notify_tools_changed(&state.stdout, Some(&state.mcp_sessions));
+                notify_tools_changed(&state.stdio_upstream, Some(&state.mcp_sessions));
             }
         }
     }
@@ -12978,10 +13154,17 @@ fn process_request(
 }
 
 fn write_stdio_response(
-    stdout: &Arc<Mutex<std::io::Stdout>>,
+    stdio: &SessionState,
     response: &Value,
     stdout_broken: &Arc<AtomicBool>,
 ) -> bool {
+    let Some(stdout) = stdio.stdio_stdout() else {
+        // No stdio face means there is nobody to answer. Treat it as a broken pipe
+        // so the reader loop stops instead of grinding through requests it can
+        // never reply to.
+        stdout_broken.store(true, Ordering::SeqCst);
+        return false;
+    };
     let result = {
         let mut out = stdout
             .lock()
@@ -13002,12 +13185,13 @@ fn handle_stdio_request(
     state: GatewayState,
     req: Value,
     request_key: String,
-    search_guard: Arc<SearchGuard>,
-    confirm_guard: Arc<ConfirmGuard>,
     cancel_registry: downstream::CancelRegistry,
     stdout_broken: Arc<AtomicBool>,
 ) {
     let cancel_context = cancel_registry.context(request_key.clone());
+    // The guards are the stdio session's own: one connection, one search streak,
+    // one set of pending confirmations (P1.2).
+    let guards = state.stdio_upstream.guards();
     // A panic in a handler must not kill the gateway: catch it, log it, and
     // return a JSON-RPC internal error for this request unless the client
     // cancelled it while it was in flight.
@@ -13015,8 +13199,8 @@ fn handle_stdio_request(
         process_request(
             &state,
             &req,
-            &search_guard,
-            &confirm_guard,
+            &guards.search,
+            &guards.confirm,
             None,
             Some(cancel_context),
             None,
@@ -13046,9 +13230,9 @@ fn handle_stdio_request(
         // the first thing it reads. This is the second of the two conditions in
         // `stdio_may_speak`; the peer's post-handshake message is the other, and
         // either one may land last.
-        if write_stdio_response(&state.stdout, &resp, &stdout_broken) {
+        if write_stdio_response(&state.stdio_upstream, &resp, &stdout_broken) {
             STDIO_RESPONDED.store(true, Ordering::SeqCst);
-            drain_stdio_deferred(&state.stdout);
+            drain_stdio_deferred(&state.stdio_upstream);
         }
     }
 }
@@ -13975,6 +14159,17 @@ fn handle_mcp_http(
                     }
                 }
             }
+
+            // A legacy MCP session owns its own guard pair (P1.2): one search
+            // streak and one set of pending confirmations per conversation. A
+            // request with no session record keeps the listener-level pair passed
+            // in, which is what a modern (self-contained) request and every
+            // pre-session request already used.
+            let session_guards = state.session_guards(session_id.as_deref());
+            let (guard, confirm) = match &session_guards {
+                Some(guards) => (guards.search.as_ref(), guards.confirm.as_ref()),
+                None => (guard, confirm),
+            };
 
             // Notifications / JSON-RPC responses: 202 with empty body.
             if !has_id {
@@ -15970,10 +16165,15 @@ fn main() {
     // tool set mid-session propagates to the client instead of being dropped.
     let downstream_dirty = Arc::new(AtomicU8::new(0));
     let mcp_sessions = Arc::new(Mutex::new(HashMap::new()));
+    // The gateway's stdio client session. Created here, ahead of the dispatches
+    // below, because both of them deliver to that one connection: its stdout is
+    // the sink, and its declared protocol era decides whether the legacy frames
+    // may be written at all.
+    let stdio_upstream = Arc::new(SessionState::new_stdio(Arc::clone(&stdout)));
     // Resource subscription tracking + drain-thread sink (SOU-394).
     let resource_subs = Arc::new(Mutex::new(ResourceSubscriptionTable::default()));
     let resource_updated_sink = Some(make_resource_updated_sink(
-        Arc::clone(&stdout),
+        Arc::clone(&stdio_upstream),
         Arc::clone(&mcp_sessions),
         Arc::clone(&resource_subs),
     ));
@@ -15981,14 +16181,13 @@ fn main() {
     // every transport binds a sink; `connect_one` reads it from here rather than
     // taking it as a parameter.
     let _ = PROGRESS_DISPATCH.set(make_progress_sink(
-        Arc::clone(&stdout),
+        Arc::clone(&stdio_upstream),
         Arc::clone(&mcp_sessions),
         Arc::clone(progress_routes()),
     ));
     // Single-flight for every router build/swap (startup, watcher self-heal, and
     // ${ROOT} rebuilds). Created up front so the startup build can share it.
     let rebuild_lock = Arc::new(Mutex::new(()));
-    let stdio_upstream = Arc::new(SessionState::new_stdio(Arc::clone(&stdout)));
     let server_handler = make_server_request_handler(
         Arc::clone(&stdio_upstream),
         Arc::clone(&mcp_sessions),
@@ -16006,7 +16205,7 @@ fn main() {
     {
         let registry = Arc::clone(&registry);
         let router = Arc::clone(&router);
-        let stdout = Arc::clone(&stdout);
+        let stdio = Arc::clone(&stdio_upstream);
         let ready = Arc::clone(&ready);
         let cached_tools = Arc::clone(&cached_tools);
         let downstream_dirty = Arc::clone(&downstream_dirty);
@@ -16104,7 +16303,7 @@ fn main() {
                 glog("background build was empty; keeping previous tool cache");
             }
             ready.store(true, Ordering::SeqCst);
-            notify_tools_changed(&stdout, Some(&mcp_sessions));
+            notify_tools_changed(&stdio, Some(&mcp_sessions));
         });
     }
 
@@ -16112,7 +16311,7 @@ fn main() {
         let registry = Arc::clone(&registry);
         let registry_trusted = Arc::clone(&registry_trusted);
         let router = Arc::clone(&router);
-        let stdout = Arc::clone(&stdout);
+        let stdio = Arc::clone(&stdio_upstream);
         let cached_tools = Arc::clone(&cached_tools);
         let downstream_dirty = Arc::clone(&downstream_dirty);
         let server_handler = Arc::clone(&server_handler);
@@ -16130,7 +16329,7 @@ fn main() {
                 registry,
                 registry_trusted,
                 router,
-                stdout,
+                stdio,
                 cached_tools,
                 profile,
                 client_id,
@@ -16194,10 +16393,8 @@ fn main() {
     }
 
     let stdin = std::io::stdin();
-    // stdio serves one client on one thread, so no sharing is needed, but the guards
-    // are now interior-mutable (&self methods) to match the shared HTTP path.
-    let search_guard = Arc::new(SearchGuard::default());
-    let confirm_guard = Arc::new(ConfirmGuard::new());
+    // Every stdio client's cross-request state (search streak, pending
+    // confirmations) lives on its session, so the loop holds no guards of its own.
     let cancel_registry = downstream::CancelRegistry::new();
     let stdio_inflight = Arc::new(AtomicUsize::new(0));
     let stdout_broken = Arc::new(AtomicBool::new(false));
@@ -16247,11 +16444,12 @@ fn main() {
         }
 
         let Some(request_key) = request_id_key(&req) else {
+            let guards = state.stdio_upstream.guards();
             let _ = process_request(
                 &state,
                 &req,
-                &search_guard,
-                &confirm_guard,
+                &guards.search,
+                &guards.confirm,
                 None,
                 None,
                 None,
@@ -16266,15 +16464,13 @@ fn main() {
             ));
             let id = req.get("id").cloned().unwrap_or(Value::Null);
             let resp = error(id, -32600, "duplicate in-flight request id");
-            if !write_stdio_response(&state.stdout, &resp, &stdout_broken) {
+            if !write_stdio_response(&state.stdio_upstream, &resp, &stdout_broken) {
                 break;
             }
             continue;
         }
 
         let state = state.clone();
-        let search_guard = Arc::clone(&search_guard);
-        let confirm_guard = Arc::clone(&confirm_guard);
         let cancel_registry = cancel_registry.clone();
         let stdout_broken_for_worker = Arc::clone(&stdout_broken);
         let job = move || {
@@ -16282,8 +16478,6 @@ fn main() {
                 state,
                 req,
                 request_key,
-                search_guard,
-                confirm_guard,
                 cancel_registry,
                 stdout_broken_for_worker,
             );
@@ -21518,7 +21712,7 @@ mod tests {
         );
         let resource_subs = Arc::new(Mutex::new(ResourceSubscriptionTable::default()));
         let resource_updated_sink = Some(make_resource_updated_sink(
-            Arc::clone(&stdout),
+            Arc::clone(&stdio_upstream),
             Arc::clone(&mcp_sessions),
             Arc::clone(&resource_subs),
         ));
@@ -25338,7 +25532,7 @@ mod tests {
             table.add(&s1, "fixture://only-s1", "srv").unwrap();
         }
         deliver_resource_updated(
-            &state.stdout,
+            &state.stdio_upstream,
             &state.mcp_sessions,
             &state.resource_subs,
             "srv",
@@ -25365,13 +25559,17 @@ mod tests {
         );
     }
 
-    /// A stdio progress channel plus its receiver, so a test can assert what the
-    /// writer thread would have written.
-    fn stdio_progress_channel() -> (
-        std::sync::mpsc::SyncSender<Value>,
-        std::sync::mpsc::Receiver<Value>,
-    ) {
-        std::sync::mpsc::sync_channel(PROGRESS_STDIO_QUEUE)
+    /// A stdio session whose progress hand-off is a channel the test owns, so a
+    /// test can assert what the session's writer thread would have written to
+    /// stdout. The session normally creates that queue lazily on first use; the
+    /// test seam injects one up front.
+    fn stdio_session_with_progress() -> (Arc<SessionState>, std::sync::mpsc::Receiver<Value>) {
+        let session = Arc::new(SessionState::new_stdio(Arc::new(Mutex::new(
+            std::io::stdout(),
+        ))));
+        let (tx, rx) = std::sync::mpsc::sync_channel(PROGRESS_STDIO_QUEUE);
+        session.set_stdio_progress(tx);
+        (session, rx)
     }
 
     fn progress_note(token: &str) -> Value {
@@ -26597,7 +26795,7 @@ mod tests {
         let s1 = mint_mcp_session(&state, None).ok().expect("mint s1");
         let s2 = mint_mcp_session(&state, None).ok().expect("mint s2");
         let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
-        let (stdio_tx, _stdio_rx) = stdio_progress_channel();
+        let (stdio, _stdio_rx) = stdio_session_with_progress();
 
         let (_registration, wire_token) = register_progress(
             &routes,
@@ -26612,7 +26810,7 @@ mod tests {
         );
 
         deliver_progress(
-            &stdio_tx,
+            &stdio,
             &state.mcp_sessions,
             &routes,
             "alpha",
@@ -26645,7 +26843,7 @@ mod tests {
         let s1 = mint_mcp_session(&state, None).ok().expect("mint s1");
         let s2 = mint_mcp_session(&state, None).ok().expect("mint s2");
         let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
-        let (stdio_tx, _stdio_rx) = stdio_progress_channel();
+        let (stdio, _stdio_rx) = stdio_session_with_progress();
 
         // Same client token, same downstream server, two different clients.
         let (_r1, wire1) =
@@ -26660,7 +26858,7 @@ mod tests {
         );
 
         let note = progress_note(&wire1);
-        deliver_progress(&stdio_tx, &state.mcp_sessions, &routes, "alpha", &note);
+        deliver_progress(&stdio, &state.mcp_sessions, &routes, "alpha", &note);
 
         let first = drain_session(&state, &s1);
         assert_eq!(first.len(), 1, "progress goes to the client that asked");
@@ -26679,7 +26877,7 @@ mod tests {
         let state = http_state(false);
         let s1 = mint_mcp_session(&state, None).ok().expect("mint s1");
         let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
-        let (stdio_tx, _stdio_rx) = stdio_progress_channel();
+        let (stdio, _stdio_rx) = stdio_session_with_progress();
 
         let (registration, wire_token) = register_progress(
             &routes,
@@ -26691,7 +26889,7 @@ mod tests {
 
         // beta was never given this token.
         deliver_progress(
-            &stdio_tx,
+            &stdio,
             &state.mcp_sessions,
             &routes,
             "beta",
@@ -26704,7 +26902,7 @@ mod tests {
 
         // A token nobody registered is dropped rather than broadcast.
         deliver_progress(
-            &stdio_tx,
+            &stdio,
             &state.mcp_sessions,
             &routes,
             "alpha",
@@ -26717,7 +26915,7 @@ mod tests {
 
         // The rightful owner still gets through...
         deliver_progress(
-            &stdio_tx,
+            &stdio,
             &state.mcp_sessions,
             &routes,
             "alpha",
@@ -26733,7 +26931,7 @@ mod tests {
             "the route must not outlive the call"
         );
         deliver_progress(
-            &stdio_tx,
+            &stdio,
             &state.mcp_sessions,
             &routes,
             "alpha",
@@ -26754,7 +26952,7 @@ mod tests {
         // for every client (SOU-474).
         let state = http_state(false);
         let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
-        let (stdio_tx, stdio_rx) = stdio_progress_channel();
+        let (stdio, stdio_rx) = stdio_session_with_progress();
 
         let (_reg, wire) = register_progress(
             &routes,
@@ -26765,7 +26963,7 @@ mod tests {
         .expect("registers");
 
         deliver_progress(
-            &stdio_tx,
+            &stdio,
             &state.mcp_sessions,
             &routes,
             "alpha",
@@ -26783,7 +26981,7 @@ mod tests {
         // never given would have been caught for HTTP clients and forwarded to the
         // stdio one - the primary deployment (SOU-474).
         deliver_progress(
-            &stdio_tx,
+            &stdio,
             &state.mcp_sessions,
             &routes,
             "beta",
@@ -26796,11 +26994,14 @@ mod tests {
 
         // Fill the queue, then confirm a further send is DROPPED rather than
         // blocking. Without the bound this call would hang forever.
+        let sender = stdio
+            .stdio_progress_sender()
+            .expect("a stdio session owns a progress hand-off");
         for _ in 0..PROGRESS_STDIO_QUEUE {
-            let _ = stdio_tx.try_send(json!({}));
+            let _ = sender.try_send(json!({}));
         }
         deliver_progress(
-            &stdio_tx,
+            &stdio,
             &state.mcp_sessions,
             &routes,
             "alpha",
@@ -26857,7 +27058,7 @@ mod tests {
         // The common case: clients that never ask for progress cost nothing and
         // leave no state behind.
         let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
-        let (_stdio_tx, _stdio_rx) = stdio_progress_channel();
+        let (_stdio, _stdio_rx) = stdio_session_with_progress();
         assert!(register_progress(&routes, None, "alpha", "stdio").is_none());
         assert!(register_progress(
             &routes,
@@ -26883,7 +27084,7 @@ mod tests {
         }
         // Spoof: beta claims an update for alpha's URI.
         deliver_resource_updated(
-            &state.stdout,
+            &state.stdio_upstream,
             &state.mcp_sessions,
             &state.resource_subs,
             "beta",
@@ -26901,7 +27102,7 @@ mod tests {
         }
         // Legitimate owner still fans out.
         deliver_resource_updated(
-            &state.stdout,
+            &state.stdio_upstream,
             &state.mcp_sessions,
             &state.resource_subs,
             "alpha",
@@ -26928,7 +27129,7 @@ mod tests {
             Err(_) => panic!("mint s1 failed"),
         };
         deliver_resource_updated(
-            &state.stdout,
+            &state.stdio_upstream,
             &state.mcp_sessions,
             &state.resource_subs,
             "alpha",
@@ -27328,6 +27529,9 @@ mod tests {
     /// reconcile tests reach the same queue through `notify_tools_changed` - and
     /// `cargo test` runs those in parallel threads of one process. A flag left
     /// flipped by a failing test would change what an unrelated one observes.
+    ///
+    /// The protocol era is deliberately NOT here. It lives on the session under
+    /// test (P1.2), so one test's peer cannot mute another test's.
     struct StdioHandshakeGuard;
 
     /// Every method these tests emit starts with this, so cleanup can find its
@@ -27337,7 +27541,6 @@ mod tests {
     impl StdioHandshakeGuard {
         fn clear() {
             STDIO_CLIENT_READY.store(false, Ordering::SeqCst);
-            MODERN_STDIO_UPSTREAM.store(false, Ordering::SeqCst);
             STDIO_RESPONDED.store(false, Ordering::SeqCst);
             // Drop this test's own queued methods. Deliberately not a whole
             // `mem::take`: the queue is shared with reconcile tests running on
@@ -27389,25 +27592,26 @@ mod tests {
     /// has handshaked, or the notification is withheld and then never delivered.
     ///
     /// Note the limit of this and its siblings: there is no writer seam in this
-    /// binary - every path takes a concrete `Arc<Mutex<Stdout>>` - so these
-    /// assert on the deferral queue, which is the state that decides whether a
-    /// write happens, and not on the bytes. Proving the wire order needs a
-    /// spawned gateway; that belongs in an integration test, not here.
+    /// binary - every path takes the session whose stdout a frame would go to, and
+    /// the session's face is a concrete `Arc<Mutex<Stdout>>` - so these assert on
+    /// the deferral queue, which is the state that decides whether a write
+    /// happens, and not on the bytes. Proving the wire order needs a spawned
+    /// gateway; that belongs in an integration test, not here.
     #[test]
     fn stdio_list_changed_waits_for_the_client_handshake() {
         let _serial = STDIO_HANDSHAKE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _restore = reset_stdio_handshake();
-        let stdout = Arc::new(Mutex::new(std::io::stdout()));
+        let stdio = test_stdio_session();
         // A name no other test emits, so a concurrent `reconcile_to` cannot add
         // to or subtract from what is asserted below.
         let method = "notifications/toolport-test-handshake/list_changed";
 
         // The background build lands while the client is still starting up. Twice,
         // because a ${ROOT} rebuild follows the cold build in a real session.
-        notify_list_changed(&stdout, None, method);
-        notify_list_changed(&stdout, None, method);
+        notify_list_changed(&stdio, None, method);
+        notify_list_changed(&stdio, None, method);
         assert_eq!(
             deferred_count(method),
             1,
@@ -27416,7 +27620,7 @@ mod tests {
 
         // The peer speaks again, but nothing has been answered yet, so the
         // gateway still has no business putting a frame on the wire.
-        mark_stdio_client_ready(&stdout);
+        mark_stdio_client_ready(&stdio);
         assert!(STDIO_CLIENT_READY.load(Ordering::SeqCst));
         assert_eq!(
             deferred_count(method),
@@ -27427,7 +27631,7 @@ mod tests {
         // Its reply lands. The held notification is released, not dropped - the
         // catalog really did change while the client could not be told.
         STDIO_RESPONDED.store(true, Ordering::SeqCst);
-        drain_stdio_deferred(&stdout);
+        drain_stdio_deferred(&stdio);
         assert_eq!(
             deferred_count(method),
             0,
@@ -27436,11 +27640,11 @@ mod tests {
 
         // From here it goes straight out with nothing queued.
         let after = "notifications/toolport-test-handshake/after";
-        notify_list_changed(&stdout, None, after);
+        notify_list_changed(&stdio, None, after);
         assert_eq!(deferred_count(after), 0);
 
         // A second release must not re-drain or re-announce.
-        mark_stdio_client_ready(&stdout);
+        mark_stdio_client_ready(&stdio);
         assert_eq!(deferred_count(method), 0);
     }
 
@@ -27459,15 +27663,15 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _restore = reset_stdio_handshake();
-        let stdout = Arc::new(Mutex::new(std::io::stdout()));
+        let stdio = test_stdio_session();
         let method = "notifications/toolport-test-initorder/list_changed";
 
         // The opening request has been read, but no reply has been written.
-        notify_list_changed(&stdout, None, method);
+        notify_list_changed(&stdio, None, method);
         assert_eq!(deferred_count(method), 1);
 
         // The pipelined follow-up marks the peer ready on the reader thread.
-        mark_stdio_client_ready(&stdout);
+        mark_stdio_client_ready(&stdio);
         assert!(STDIO_CLIENT_READY.load(Ordering::SeqCst));
         assert_eq!(
             deferred_count(method),
@@ -27476,12 +27680,12 @@ mod tests {
         );
         // And a notification arriving in this window must not slip out either.
         let during = "notifications/toolport-test-initorder/during";
-        notify_list_changed(&stdout, None, during);
+        notify_list_changed(&stdio, None, during);
         assert_eq!(deferred_count(during), 1);
 
         // The worker writes the reply; now the queue may go.
         STDIO_RESPONDED.store(true, Ordering::SeqCst);
-        drain_stdio_deferred(&stdout);
+        drain_stdio_deferred(&stdio);
         assert_eq!(deferred_count(method), 0);
         assert_eq!(deferred_count(during), 0);
     }
@@ -27499,18 +27703,18 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _restore = reset_stdio_handshake();
-        let stdout = Arc::new(Mutex::new(std::io::stdout()));
+        let stdio = test_stdio_session();
         let method = "notifications/toolport-test-modern/list_changed";
 
         // Queued while the peer's version was still unknown.
-        notify_list_changed(&stdout, None, method);
+        notify_list_changed(&stdio, None, method);
         assert_eq!(deferred_count(method), 1);
 
         // Its first post-`initialize` message declares the modern version, which
         // `process_request` records before it marks the peer ready.
-        MODERN_STDIO_UPSTREAM.store(true, Ordering::SeqCst);
+        stdio.mark_modern_upstream();
         STDIO_RESPONDED.store(true, Ordering::SeqCst);
-        mark_stdio_client_ready(&stdout);
+        mark_stdio_client_ready(&stdio);
         assert_eq!(
             deferred_count(method),
             0,
@@ -27519,16 +27723,26 @@ mod tests {
 
         // And nothing new is banked for it either.
         let later = "notifications/toolport-test-modern/later";
-        notify_list_changed(&stdout, None, later);
+        notify_list_changed(&stdio, None, later);
         assert_eq!(deferred_count(later), 0);
     }
 
-    /// The router wrapped the way the gateway holds it, plus a stdout sink.
-    fn reconcile_harness() -> (Arc<Mutex<Arc<Router>>>, Arc<Mutex<std::io::Stdout>>) {
+    /// The router wrapped the way the gateway holds it, plus the stdio session
+    /// whose connection a notification would be written to.
+    fn reconcile_harness() -> (Arc<Mutex<Arc<Router>>>, Arc<SessionState>) {
         (
             Arc::new(Mutex::new(Arc::new(Router::new()))),
-            Arc::new(Mutex::new(std::io::stdout())),
+            test_stdio_session(),
         )
+    }
+
+    /// A stdio session over the test process's own stdout. The session is the
+    /// owner of everything a stdio client's notifications depend on (P1.2), so a
+    /// test that drives the notify path needs one.
+    fn test_stdio_session() -> Arc<SessionState> {
+        Arc::new(SessionState::new_stdio(Arc::new(Mutex::new(
+            std::io::stdout(),
+        ))))
     }
 
     fn set_of(names: &[&str]) -> BTreeSet<String> {
@@ -27543,10 +27757,10 @@ mod tests {
         // watcher doesn't look at that file either, so the router kept the stale entry and
         // `route_call` (which reads the materialized `blocked` map) failed with
         // "quarantined ... re-approve to restore" while the app showed nothing quarantined.
-        let (router, stdout) = reconcile_harness();
+        let (router, stdio) = reconcile_harness();
 
         // A drift quarantines a tool.
-        assert!(reconcile_to(&router, &stdout, None, set_of(&["srv__wipe"])));
+        assert!(reconcile_to(&router, &stdio, None, set_of(&["srv__wipe"])));
         assert_eq!(
             router.lock().unwrap().quarantined(),
             &set_of(&["srv__wipe"])
@@ -27554,17 +27768,12 @@ mod tests {
 
         // The same set again is a no-op, so the gateway's own quarantine writes can't
         // churn the catalog or spam the client with list_changed.
-        assert!(!reconcile_to(
-            &router,
-            &stdout,
-            None,
-            set_of(&["srv__wipe"])
-        ));
+        assert!(!reconcile_to(&router, &stdio, None, set_of(&["srv__wipe"])));
 
         // The user re-approves and the set SHRINKS. This is the assertion that fails
         // without the fix.
         assert!(
-            reconcile_to(&router, &stdout, None, BTreeSet::new()),
+            reconcile_to(&router, &stdio, None, BTreeSet::new()),
             "a release must be reconciled into the live router"
         );
         assert!(
@@ -27573,24 +27782,24 @@ mod tests {
         );
 
         // Idempotent: the next watcher tick does nothing.
-        assert!(!reconcile_to(&router, &stdout, None, BTreeSet::new()));
+        assert!(!reconcile_to(&router, &stdio, None, BTreeSet::new()));
     }
 
     #[test]
     fn reconcile_to_detects_a_partial_release() {
         // Releasing one of several must still re-filter. A cheaper "is it empty vs
         // non-empty" check would miss this and leave the released tool blocked.
-        let (router, stdout) = reconcile_harness();
+        let (router, stdio) = reconcile_harness();
         assert!(reconcile_to(
             &router,
-            &stdout,
+            &stdio,
             None,
             set_of(&["a__x", "b__y"])
         ));
 
-        assert!(reconcile_to(&router, &stdout, None, set_of(&["a__x"])));
+        assert!(reconcile_to(&router, &stdio, None, set_of(&["a__x"])));
         assert_eq!(router.lock().unwrap().quarantined(), &set_of(&["a__x"]));
-        assert!(!reconcile_to(&router, &stdout, None, set_of(&["a__x"])));
+        assert!(!reconcile_to(&router, &stdio, None, set_of(&["a__x"])));
     }
 
     /// SBS-871: build_router must not Default::default() an empty set on store Err.
@@ -27680,14 +27889,14 @@ mod tests {
 
     /// The gateway's router wrapper holding a router that fail-closed because the
     /// quarantine store could not be read (SBS-871).
-    fn fail_closed_harness() -> (Arc<Mutex<Arc<Router>>>, Arc<Mutex<std::io::Stdout>>) {
+    fn fail_closed_harness() -> (Arc<Mutex<Arc<Router>>>, Arc<SessionState>) {
         let policy = ToolPolicy {
             fail_closed_catalog: true,
             ..ToolPolicy::default()
         };
         (
             Arc::new(Mutex::new(Arc::new(Router::with_policy(policy)))),
-            Arc::new(Mutex::new(std::io::stdout())),
+            test_stdio_session(),
         )
     }
 
@@ -27696,11 +27905,11 @@ mod tests {
     /// empty), so a running gateway stayed dark until it restarted.
     #[test]
     fn sbs871_reconcile_to_lifts_fail_closed_on_a_successful_empty_read() {
-        let (router, stdout) = fail_closed_harness();
+        let (router, stdio) = fail_closed_harness();
         assert!(router.lock().unwrap().catalog_fail_closed());
 
         assert!(
-            reconcile_to(&router, &stdout, None, BTreeSet::new()),
+            reconcile_to(&router, &stdio, None, BTreeSet::new()),
             "a successful read of an empty store must reconcile, not no-op"
         );
         assert!(
@@ -27708,7 +27917,7 @@ mod tests {
             "a successful store read is exactly what lifts the hide"
         );
         // And it settles: the next watcher tick does nothing.
-        assert!(!reconcile_to(&router, &stdout, None, BTreeSet::new()));
+        assert!(!reconcile_to(&router, &stdio, None, BTreeSet::new()));
     }
 
     /// SBS-871: everything that is NOT a successful store read must leave the hide up.
@@ -27717,7 +27926,7 @@ mod tests {
     /// the store was still unreadable.
     #[test]
     fn sbs871_integrity_change_with_an_unreadable_store_keeps_fail_closed() {
-        let (router, _stdout) = fail_closed_harness();
+        let (router, _stdio) = fail_closed_harness();
 
         requarantine_after_integrity_change(
             &router,
@@ -27743,7 +27952,7 @@ mod tests {
     /// known and the catalog comes back.
     #[test]
     fn sbs871_integrity_change_with_a_readable_store_lifts_fail_closed() {
-        let (router, _stdout) = fail_closed_harness();
+        let (router, _stdio) = fail_closed_harness();
 
         requarantine_after_integrity_change(&router, BTreeSet::new(), Ok(set_of(&["srv__wipe"])));
 
@@ -27768,13 +27977,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
 
-        let (router, stdout) = fail_closed_harness();
+        let (router, stdio) = fail_closed_harness();
         let cached_tools: SharedCatalog =
             Arc::new(Mutex::new(Arc::new(CatalogSnapshot::new(vec![
                 json!({ "name": "srv__wipe", "description": "", "inputSchema": {} }),
             ]))));
 
-        persist_and_emit_with_sessions(&[], &cached_tools, &router, None, &stdout, None, None);
+        persist_and_emit_with_sessions(&[], &cached_tools, &router, None, &stdio, None, None);
 
         assert!(
             cached_tools.lock().unwrap().tools.is_empty(),
@@ -27797,7 +28006,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
-        let (router, _stdout) = reconcile_harness();
+        let (router, _stdio) = reconcile_harness();
         {
             let mut guard = router.lock().unwrap();
             Arc::make_mut(&mut guard).requarantine(set_of(&["srv__already_blocked"]));
@@ -27815,7 +28024,7 @@ mod tests {
 
     #[test]
     fn post_write_quarantine_read_failure_still_blocks_the_new_candidate() {
-        let (router, _stdout) = reconcile_harness();
+        let (router, _stdio) = reconcile_harness();
         {
             let mut guard = router.lock().unwrap();
             Arc::make_mut(&mut guard).requarantine(set_of(&["srv__already_blocked"]));
@@ -27881,7 +28090,7 @@ mod tests {
         let mut reg = Registry::default();
         reg.quarantine_on_drift = false;
         let registry = Arc::new(Mutex::new(reg));
-        let (router, stdout) = reconcile_harness();
+        let (router, stdio) = reconcile_harness();
         {
             let mut guard = router.lock().unwrap();
             // Simulate fail_closed_integrity_catalog after the mandatory tamper quarantine write
@@ -27891,7 +28100,7 @@ mod tests {
 
         assert_eq!(effective_quarantine(&registry, profile), None);
         assert!(!reconcile_quarantine(
-            &registry, &router, &stdout, profile, None
+            &registry, &router, &stdio, profile, None
         ));
         assert_eq!(
             router.lock().unwrap().quarantined(),
@@ -27967,10 +28176,10 @@ mod tests {
         reg.quarantine_on_drift = true;
         let registry = Arc::new(Mutex::new(reg));
         let router = Arc::new(Mutex::new(Arc::new(Router::new())));
-        let stdout = Arc::new(Mutex::new(std::io::stdout()));
+        let stdio = test_stdio_session();
 
         assert!(reconcile_quarantine(
-            &registry, &router, &stdout, profile, None
+            &registry, &router, &stdio, profile, None
         ));
         assert!(router.lock().unwrap().quarantined().contains("srv__wipe"));
 
@@ -27988,7 +28197,7 @@ mod tests {
             "an unreadable store must be reported as unknown, not as empty"
         );
         assert!(
-            !reconcile_quarantine(&registry, &router, &stdout, profile, None),
+            !reconcile_quarantine(&registry, &router, &stdio, profile, None),
             "a corrupt store must not trigger a re-filter"
         );
         assert!(
@@ -27999,7 +28208,7 @@ mod tests {
         // And it must recover once the store is readable again.
         std::fs::write(&path, "{}").unwrap();
         assert!(reconcile_quarantine(
-            &registry, &router, &stdout, profile, None
+            &registry, &router, &stdio, profile, None
         ));
         assert!(router.lock().unwrap().quarantined().is_empty());
 
@@ -28018,7 +28227,7 @@ mod tests {
         let registry = Arc::new(Mutex::new(Registry::default()));
         let registry_trusted = Arc::new(AtomicBool::new(true));
         let router = Arc::new(Mutex::new(Arc::new(Router::new())));
-        let stdout = Arc::new(Mutex::new(std::io::stdout()));
+        let stdio = test_stdio_session();
         let cached_tools = Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default())));
         let profile_slot = Arc::new(Mutex::new(None));
         let downstream_dirty = Arc::new(AtomicU8::new(0));
@@ -28038,7 +28247,7 @@ mod tests {
             &registry,
             &registry_trusted,
             &router,
-            &stdout,
+            &stdio,
             &cached_tools,
             &profile_slot,
             None,
@@ -28093,7 +28302,7 @@ mod tests {
         let registry = Arc::new(Mutex::new(with_client));
         let registry_trusted = Arc::new(AtomicBool::new(true));
         let router = Arc::new(Mutex::new(Arc::new(Router::new())));
-        let stdout = Arc::new(Mutex::new(std::io::stdout()));
+        let stdio = test_stdio_session();
         let cached_tools = Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default())));
         let profile_slot = Arc::new(Mutex::new(None));
         let downstream_dirty = Arc::new(AtomicU8::new(0));
@@ -28113,7 +28322,7 @@ mod tests {
             &registry,
             &registry_trusted,
             &router,
-            &stdout,
+            &stdio,
             &cached_tools,
             &profile_slot,
             None,
@@ -28173,7 +28382,7 @@ mod tests {
         let registry = Arc::new(Mutex::new(reg));
         let registry_trusted = Arc::new(AtomicBool::new(true));
         let router = Arc::new(Mutex::new(Arc::new(Router::new())));
-        let stdout = Arc::new(Mutex::new(std::io::stdout()));
+        let stdio = test_stdio_session();
         let cached_tools = Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default())));
         let profile_slot = Arc::new(Mutex::new(Some(profile_name.to_string())));
         let downstream_dirty = Arc::new(AtomicU8::new(0));
@@ -28196,7 +28405,7 @@ mod tests {
             &registry,
             &registry_trusted,
             &router,
-            &stdout,
+            &stdio,
             &cached_tools,
             &profile_slot,
             None,
@@ -28227,7 +28436,7 @@ mod tests {
             &registry,
             &registry_trusted,
             &router,
-            &stdout,
+            &stdio,
             &cached_tools,
             &profile_slot,
             None,
@@ -28252,7 +28461,7 @@ mod tests {
             &registry,
             &registry_trusted,
             &router,
-            &stdout,
+            &stdio,
             &cached_tools,
             &profile_slot,
             None,
@@ -28299,7 +28508,7 @@ mod tests {
         let registry_trusted = Arc::new(AtomicBool::new(true));
         let original_router = Arc::new(Router::new());
         let router = Arc::new(Mutex::new(Arc::clone(&original_router)));
-        let stdout = Arc::new(Mutex::new(std::io::stdout()));
+        let stdio = test_stdio_session();
         let cached_tools = Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default())));
         let profile = Arc::new(Mutex::new(None));
         let downstream_dirty = Arc::new(AtomicU8::new(0));
@@ -28328,7 +28537,7 @@ mod tests {
             &registry,
             &registry_trusted,
             &router,
-            &stdout,
+            &stdio,
             &cached_tools,
             &profile,
             None,
@@ -28373,7 +28582,7 @@ mod tests {
             &registry,
             &registry_trusted,
             &router,
-            &stdout,
+            &stdio,
             &cached_tools,
             &profile,
             None,
@@ -28434,23 +28643,23 @@ mod tests {
         reg.quarantine_on_drift = true;
         let registry = Arc::new(Mutex::new(reg));
         let router = Arc::new(Mutex::new(Arc::new(Router::new())));
-        let stdout = Arc::new(Mutex::new(std::io::stdout()));
+        let stdio = test_stdio_session();
 
         // Picks the persisted set up off disk (effective_quarantine's ON branch).
         assert!(reconcile_quarantine(
-            &registry, &router, &stdout, profile, None
+            &registry, &router, &stdio, profile, None
         ));
         assert!(router.lock().unwrap().quarantined().contains("srv__wipe"));
 
         // Steady state: no churn while nothing changes.
         assert!(!reconcile_quarantine(
-            &registry, &router, &stdout, profile, None
+            &registry, &router, &stdio, profile, None
         ));
 
         // The user re-approves. This is the SOU-292 regression, end to end.
         assert!(conduit_lib::integrity::release(profile, "srv__wipe").unwrap());
         assert!(reconcile_quarantine(
-            &registry, &router, &stdout, profile, None
+            &registry, &router, &stdio, profile, None
         ));
         assert!(
             router.lock().unwrap().quarantined().is_empty(),
@@ -30360,6 +30569,137 @@ mod tests {
         assert_eq!(
             fetch_resp["result"]["content"][0]["text"].as_str().unwrap(),
             "30"
+        );
+    }
+
+    /// P1.2: the anti-thrash streak belongs to one conversation. A host that
+    /// serves several clients must not let one client's repeated search escalate
+    /// another client's answer, and each client's own third repeat still trips it.
+    #[test]
+    fn each_session_owns_its_own_search_streak() {
+        let reg = Registry::default();
+        let a = test_stdio_session();
+        let b = test_stdio_session();
+        let a_guard = a.guards().search;
+        let b_guard = b.guards().search;
+
+        for _ in 0..2 {
+            assert!(!search_text(&reg, &a_guard, "charges").contains(ESCALATION_MARK));
+        }
+        // b's first search is already its own first search, not a's third.
+        let b_first = search_text(&reg, &b_guard, "charges");
+        assert!(b_first.contains("Top match:"));
+        assert!(
+            !b_first.contains(ESCALATION_MARK),
+            "another session must not inherit this streak: {b_first}"
+        );
+
+        // a's third consecutive same-result search still escalates.
+        assert!(
+            search_text(&reg, &a_guard, "charges").contains(ESCALATION_MARK),
+            "the owning session keeps the escalation"
+        );
+        assert!(
+            !search_text(&reg, &b_guard, "charges").contains(ESCALATION_MARK),
+            "b is on its own second search, still polite"
+        );
+    }
+
+    /// P1.2: a pending destructive confirmation is issued to one conversation and
+    /// is redeemable only there. Cross-session redemption is what the guard's
+    /// `owner` check would already refuse for a foreign principal; this asserts the
+    /// stronger session boundary underneath it.
+    #[test]
+    fn a_confirmation_belongs_to_the_session_that_stored_it() {
+        let a = test_stdio_session();
+        let b = test_stdio_session();
+        let owner = Some("client:a");
+        let token = a.guards().confirm.store(
+            "stripe__delete_customer".to_string(),
+            json!({ "id": "cus_1" }),
+            owner,
+        );
+
+        assert!(
+            b.guards().confirm.take(&token, owner).is_none(),
+            "another session must not redeem a token it never minted, even for the same principal"
+        );
+        let redeemed = a.guards().confirm.take(&token, owner);
+        assert_eq!(
+            redeemed.map(|(name, _)| name).as_deref(),
+            Some("stripe__delete_customer"),
+            "the owning session still redeems its own token"
+        );
+    }
+
+    /// P1.2: the 2026-07-28 era is declared by ONE connection. A second session
+    /// must keep the legacy behavior: nothing is withheld for a modern peer, and a
+    /// modern peer does not mute anyone else's notifications.
+    #[test]
+    fn a_modern_peer_does_not_mute_another_session() {
+        let _serial = STDIO_HANDSHAKE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = reset_stdio_handshake();
+        let modern = test_stdio_session();
+        let legacy = test_stdio_session();
+        modern.mark_modern_upstream();
+        assert!(modern.is_modern_upstream());
+        assert!(
+            !legacy.is_modern_upstream(),
+            "one connection's era must not reach another session"
+        );
+
+        let method = "notifications/toolport-test-era/list_changed";
+        // No subscription filter was opened, so a modern peer gets no bare frame
+        // and nothing is banked for it either.
+        notify_list_changed(&modern, None, method);
+        assert_eq!(
+            deferred_count(method),
+            0,
+            "nothing withheld for a modern peer"
+        );
+        notify_list_changed(&legacy, None, method);
+        assert_eq!(
+            deferred_count(method),
+            1,
+            "the legacy peer still queues the notification for its handshake"
+        );
+    }
+
+    /// P1.2: an HTTP request that carries a session id uses that session's guards,
+    /// so a confirmation minted in one session is invisible to another. A request
+    /// with no session record (a modern request, or an OpenAPI call) falls back to
+    /// the listener-level pair.
+    #[test]
+    fn http_requests_use_the_guards_of_their_session() {
+        let state = http_state(false);
+        let s1 = mint_mcp_session(&state, None).ok().expect("mint s1");
+        let s2 = mint_mcp_session(&state, None).ok().expect("mint s2");
+        let first = state
+            .session_guards(Some(&s1))
+            .expect("a minted session has guards");
+        let second = state
+            .session_guards(Some(&s2))
+            .expect("a minted session has guards");
+        let owner = Some("client:c1");
+        let token = second.confirm.store(
+            "stripe__delete_customer".to_string(),
+            json!({ "id": "cus_1" }),
+            owner,
+        );
+
+        assert!(
+            first.confirm.take(&token, owner).is_none(),
+            "s1 must not redeem a token minted by s2"
+        );
+        assert!(
+            second.confirm.take(&token, owner).is_some(),
+            "the minting session redeems it"
+        );
+        assert!(
+            state.session_guards(Some("no-such-session")).is_none(),
+            "an unknown session id falls back to the listener-level pair"
         );
     }
 }
