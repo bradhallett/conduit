@@ -27699,6 +27699,7 @@ mod tests {
 
     #[test]
     fn legacy_conduit_alias_dispatches_like_toolport() {
+        let _data_env = DataDirTestEnv::new("legacy_conduit_alias_dispatches_like_toolport");
         // A tools/call under the OLD conduit_* name must route identically to the
         // renamed toolport_* name, so nothing that still uses the old names breaks.
         let reg = Registry::default();
@@ -29410,6 +29411,7 @@ mod tests {
 
     #[test]
     fn search_tool_call_returns_matches() {
+        let _data_env = DataDirTestEnv::new("search_tool_call_returns_matches");
         let reg = Registry::default();
         let req = json!({
             "jsonrpc": "2.0", "id": 5, "method": "tools/call",
@@ -29463,6 +29465,7 @@ mod tests {
     /// taught marker unless it gets the same pass.
     #[test]
     fn search_neutralizes_pinned_prerequisite_definitions() {
+        let _data_env = DataDirTestEnv::new("search_neutralizes_pinned_prerequisite_definitions");
         let mut reg = Registry::default();
         reg.set_tool_pinned("evil", "prereq", true);
         let router = routed_router("evil", "prereq");
@@ -29513,6 +29516,8 @@ mod tests {
 
     #[test]
     fn search_no_matches_explains_the_exhaustive_escape_hatch() {
+        let _data_env =
+            DataDirTestEnv::new("search_no_matches_explains_the_exhaustive_escape_hatch");
         let reg = Registry::default();
         let req = json!({
             "jsonrpc": "2.0", "id": 7, "method": "tools/call",
@@ -29542,6 +29547,8 @@ mod tests {
 
     #[test]
     fn search_empty_scope_does_not_claim_fallback_candidates_exist() {
+        let _data_env =
+            DataDirTestEnv::new("search_empty_scope_does_not_claim_fallback_candidates_exist");
         let reg = Registry::default();
         let req = json!({
             "jsonrpc": "2.0", "id": 8, "method": "tools/call",
@@ -29600,6 +29607,7 @@ mod tests {
 
     #[test]
     fn repeated_same_need_escalates_then_resets() {
+        let _data_env = DataDirTestEnv::new("repeated_same_need_escalates_then_resets");
         let reg = Registry::default();
         let guard = SearchGuard::default();
 
@@ -29644,6 +29652,8 @@ mod tests {
 
     #[test]
     fn repeated_low_confidence_search_never_forces_a_weak_top_result() {
+        let _data_env =
+            DataDirTestEnv::new("repeated_low_confidence_search_never_forces_a_weak_top_result");
         let reg = Registry::default();
         let guard = SearchGuard::default();
 
@@ -29657,6 +29667,7 @@ mod tests {
 
     #[test]
     fn searching_different_needs_never_escalates() {
+        let _data_env = DataDirTestEnv::new("searching_different_needs_never_escalates");
         // The capable-model guarantee: a model that searches several DIFFERENT things
         // in a row (different top tool each time) is never cut off, no matter how many
         // searches. This is what keeps Claude/Cursor's exploration unaffected.
@@ -30898,6 +30909,7 @@ mod tests {
     /// another client's answer, and each client's own third repeat still trips it.
     #[test]
     fn each_session_owns_its_own_search_streak() {
+        let _data_env = DataDirTestEnv::new("each_session_owns_its_own_search_streak");
         let reg = Registry::default();
         let a = test_stdio_session();
         let b = test_stdio_session();

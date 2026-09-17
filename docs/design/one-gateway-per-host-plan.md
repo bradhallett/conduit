@@ -89,6 +89,15 @@ Still open:
   `resources/updated` check on the peer's declared era. Pre-existing, unchanged by the
   threading work, and on the list so it is not read as an oversight.
 - No topology feature flag in the registry.
+- Two tests resolved the data directory per call on paths `DataDirOverride` was not
+  guarding, so the gateway suite wrote into the developer's real data dir: the audit writer
+  (`audit::audit_path`) and the search-trace writer (`searchtrace::path`). A full run
+  appended 41 audit rows and 25 search-trace rows; the audit half also let one test's
+  fixture row land inside another test's scratch log, which is what failed
+  `mcp_http_audit_entry_records_client_and_client_name` intermittently on CI. Fixed by a
+  test-only `DataDirTestEnv` guard (ENV_LOCK plus a scratch override) on every test that
+  can reach either writer. Any future per-call `conduit_dir()` resolution needs the same
+  treatment, or the leak returns under a third name.
 - The adapter has not been dogfooded against a real client (P4.1), but it has an early
   synthetic signal: with one stdio downstream (9 tools) and three client sessions, the
   legacy arm ran 3 gateways and 3 downstream copies while the `--daemon` + `--stdio-adapter`
