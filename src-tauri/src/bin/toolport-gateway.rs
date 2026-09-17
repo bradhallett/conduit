@@ -30997,8 +30997,13 @@ mod tests {
 
         // The handshake flags are per-session too, which is the stronger half of this
         // claim: one peer completing its handshake must not make the gateway think the
-        // other one has. Drive the legacy peer all the way through and assert the
-        // modern peer's own readiness is untouched.
+        // other one has. Drive the legacy peer through BOTH halves of the handshake and
+        // assert the modern peer's own state is untouched.
+        //
+        // Both halves are checked deliberately. Readiness and respondedness are separate
+        // conditions in [`SessionState::stdio_may_speak`], so a per-session `ready` with a
+        // process-wide `responded` would still let one peer's answer unlock another peer's
+        // traffic. Re-globalizing either flag alone must fail this test.
         mark_stdio_client_ready(&legacy);
         legacy.mark_stdio_responded();
         assert!(
@@ -31008,6 +31013,10 @@ mod tests {
         assert!(
             !modern.stdio_client_ready(),
             "one connection's handshake must not mark another session ready"
+        );
+        assert!(
+            !modern.stdio_responded(),
+            "one connection's answer must not mark another session responded"
         );
         assert!(
             !modern.stdio_may_speak(),
