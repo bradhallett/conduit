@@ -317,6 +317,27 @@ Where the fourth increment starts, and the decision it has to make before writin
   it must not be committed that way: while both the static and the host field exist, there
   are two sources of truth and whichever the readers still call wins silently. Land the
   field and its readers in one pass, or leave the static alone.
+- The decision, and the answer this session settled on for `CODE_MODE` (the next attempt
+  should reuse it rather than re-derive it): keep `handle_request` as the test wrapper and
+  give it a `host: &HostState` parameter. Retiring it in favour of `handle_request_with_cancel`
+  is the tidier end state but it is a 61-site change to a 17-argument call, and nothing is
+  blocked on it. The wrapper keeps its other parameters, which is deliberate: tests pass
+  `lazy`, their own `reg` and `router`, and a profile, and the wrapper builds the
+  `CatalogSearchIndex` those need. Evidence for "one host built once per test body" rather
+  than a fresh host per call: 5 tests dispatch twice or more under one code-mode state
+  (`routine_write_opt_in_defaults_off_and_controls_advertisement` 2 calls,
+  `code_mode_flag_fails_closed_when_registry_load_fails` 2,
+  `toolport_extension_reports_active_features_without_gating_core_tools` 3,
+  `a_corrupt_quarantine_store_keeps_the_current_set_instead_of_un_blocking` 23,
+  `watch_tick_marks_a_recovered_registry_untrusted` 21), and a per-call host would reset the
+  store between them and quietly weaken exactly those tests.
+- Cost of the `CODE_MODE` half alone, measured: 6 functions gain a host parameter
+  (`gateway_capabilities`, `grouped_tool_defs`, `append_routine_tool_defs`,
+  `save_routine_dispatch`, `save_routine_promotion_dispatch`, `advise_after_direct_call`) at
+  11 production and 11 test call sites, and the 20 tests that touch the code-mode switch
+  (`CodeModeGuard`, `set_code_mode_flag`, or `seed_code_mode_after_registry_load`) move from
+  the process-wide guard to a host they build. That is a slice, not an edit to fold into
+  another change.
 - The decision: `handle_request` is a wrapper whose 61 call sites are all tests (it was 62
   before the third increment shifted one), and
   `execute_call` is reached through `run_routine_dispatch`, `execute_script_dispatch`, and
