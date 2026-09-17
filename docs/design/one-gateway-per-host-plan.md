@@ -43,10 +43,11 @@ Landed:
   the stdio `SessionState`, and the notification and resource-updated paths now carry that
   session instead of a bare stdout, so the sink a frame is written to and the era that
   decides whether it may be written come from one owner. The stdio client's progress
-  hand-off queue became session state (the shared progress dispatch no longer captures a
-  process stdout), and the search and confirm guards moved onto `SessionState`, with the
-  listener-level pair kept only for requests that carry no session record (a modern
-  request, or an OpenAPI call). Progress routes stay host-scoped by decision, see below.
+  hand-off queue became session state (the shared progress dispatch now closes over the
+  stdio session instead of capturing a process stdout), and the search and confirm guards
+  moved onto `SessionState`, with the listener-level pair kept only for requests that carry
+  no session record (a modern request, or an OpenAPI call). The `GatewayState.stdout` field
+  is gone with them. Progress routes stay host-scoped by decision, see below.
 
 Still open:
 
@@ -63,8 +64,16 @@ Still open:
   will resolve it from the identity asserted at session open. Moving them onto
   `SessionState` would give each session a private copy of a host-wide setting.
 - Progress routing is host state by decision: one token table per host, with every entry
-  naming the session that minted its token. What was session-shaped about it (the stdio
-  hand-off queue and the stdout it writes to) is now owned by the stdio session.
+  recording the session key that minted its token (a real session id for an HTTP client,
+  the `RESOURCE_SUB_STDIO` sentinel for the stdio client). The stdio half of it is still
+  single-client: the dispatch closes over the gateway's stdio session and that sentinel is
+  a constant, so a second stdio client needs its own route identity. What was
+  session-shaped about it (the hand-off queue and the stdout it writes to) is now owned by
+  the stdio session.
+- Progress is not era-gated, and never was: `deliver_progress` writes a bare
+  `notifications/progress` frame through the hand-off, without the `list_changed` /
+  `resources/updated` check on the peer's declared era. Pre-existing, unchanged by the
+  threading work, and on the list so it is not read as an oversight.
 - No `HostState` type and no topology feature flag in the registry.
 - The adapter has not been dogfooded against a real client (P4.1).
 - Reusable primitives that already exist: the approval broker's `EndpointDescriptor`
@@ -75,19 +84,19 @@ Still open:
 
 ## Delivery shape
 
-| PR  | Slice                                                                       | Behavior change           | Status                           |
-| --- | --------------------------------------------------------------------------- | ------------------------- | -------------------------------- |
-| 1   | P2.1 rendezvous primitives (library module, tested)                         | none (new module only)    | landed (#880)                    |
-| 2   | P2.2a identity role; P2.2b host runtime on the internal endpoint            | none (explicit flag only) | landed (#881)                    |
-| 3   | P1.2 session tables on `SessionStore`; transports unified on `SessionState` | none                      | landed; handshake statics remain |
-| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade            | none                      | not started                      |
-| 5   | P2.2c stdio adapter speaks the daemon session protocol, behind flag         | opt-in only               | landed (#888, #891, #893)        |
-| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback                   | opt-in only               | landed (#892, #893)              |
-| 7   | P3.1 union catalog built once, allowed-set enforced per session             | opt-in only               | not started                      |
-| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding               | opt-in only, the big win  | not started                      |
-| 9   | P4.1 dogfood flag, telemetry, acceptance run                                | opt-in only               | not started                      |
-| 10  | P4.2 adapter topology becomes default; legacy kill switch remains           | default flip              | not started                      |
-| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease              | separate, later           | not started                      |
+| PR  | Slice                                                                                                              | Behavior change           | Status                           |
+| --- | ------------------------------------------------------------------------------------------------------------------ | ------------------------- | -------------------------------- |
+| 1   | P2.1 rendezvous primitives (library module, tested)                                                                | none (new module only)    | landed (#880)                    |
+| 2   | P2.2a identity role; P2.2b host runtime on the internal endpoint                                                   | none (explicit flag only) | landed (#881)                    |
+| 3   | P1.2 session tables on `SessionStore`; transports unified on `SessionState`; era, progress, and guards per session | none                      | landed; handshake statics remain |
+| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade                                                   | none                      | not started                      |
+| 5   | P2.2c stdio adapter speaks the daemon session protocol, behind flag                                                | opt-in only               | landed (#888, #891, #893)        |
+| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback                                                          | opt-in only               | landed (#892, #893)              |
+| 7   | P3.1 union catalog built once, allowed-set enforced per session                                                    | opt-in only               | not started                      |
+| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding                                                      | opt-in only, the big win  | not started                      |
+| 9   | P4.1 dogfood flag, telemetry, acceptance run                                                                       | opt-in only               | not started                      |
+| 10  | P4.2 adapter topology becomes default; legacy kill switch remains                                                  | default flip              | not started                      |
+| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease                                                     | separate, later           | not started                      |
 
 Each of 1 through 8 must leave the default topology untouched and all existing suites
 green. The only PRs that change what a user gets are 10 and 11.
@@ -109,13 +118,13 @@ read goes through the context (`serving_modern_client`, `active_mcp_session`,
 thread-local as a scoped adapter as long as it is populated from the explicit value and
 cannot outlive the request, which the guards already ensure.
 
-What remains is not per-request but session- and host-scoped: `MODERN_STDIO_UPSTREAM`,
-the `STDIO_*` handshake flags, and `PROGRESS_*`. Those are single-stdio-client
-assumptions and move in P1.2 (`SessionState`) and P1.3 (`HostState`), so the isolation
-work lands with the types that own it instead of as a mechanical rewrite of the request
-path. The PII and HITL tables already moved onto a `SessionStore` owner, and the two
-transport types are unified; the rest of the session-scoped state follows in the threading
-slice.
+What remains is not per-request but session- and host-scoped: the `STDIO_*` handshake
+flags and `PROGRESS_*`. Those are single-stdio-client assumptions and move in P1.2
+(`SessionState`) and P1.3 (`HostState`), so the isolation work lands with the types that own
+it instead of as a mechanical rewrite of the request path. The PII and HITL tables already
+moved onto a `SessionStore` owner, the two transport types are unified, and the stdio
+client's protocol era, its progress hand-off queue, and the search and confirm guards are
+session state; the handshake statics are the last of the session-scoped state.
 
 ### P1.2 SessionState
 
@@ -146,7 +155,13 @@ that P1.3 takes.
   state. Landed: `SessionState` owns them for both faces, a request with an MCP session id
   on the HTTP bridge uses that session's pair, and only a request with no session record
   keeps the listener-level pair. Tests cover a second session neither inheriting the streak
-  nor redeeming the token.
+  nor redeeming the token. Consequence worth knowing: a confirmation is now redeemable only
+  from the session that minted it (a session closed or re-initialized inside the
+  confirmation window loses its pending token) and only on the surface that minted it
+  (`/mcp` with a session id vs. the OpenAPI path, which mints against the listener pair).
+- Known duplication: `watch_registry`/`watch_tick` still take the stdio session and its
+  `${ROOT}` separately, although the root is a field of that session since #898. Harmless
+  (both come from the same startup resolution) and it collapses with the `HostState` move.
 
 ### P1.3 HostState
 

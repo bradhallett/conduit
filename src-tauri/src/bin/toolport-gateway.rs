@@ -1039,11 +1039,16 @@ type ProgressDispatch = Arc<dyn Fn(String, Value) + Send + Sync>;
 /// signatures that have nothing else to do with it.
 ///
 /// Host-scoped by decision (one-gateway-per-host P1.2), not session-scoped: the
-/// table is one per host, and every entry names the session that minted its
-/// token, so P1.3 moves this alongside [`PROGRESS_ROUTES`] onto `HostState`.
-/// Delivery is session-owned: a stdio client's notifications go through that
-/// session's hand-off queue ([`SessionState::stdio_progress_sender`]) rather
-/// than a process stdout captured at startup.
+/// token table is one per host, and every entry records the session key that
+/// minted its token (a real session id for HTTP, the [`RESOURCE_SUB_STDIO`]
+/// sentinel for the stdio client), so P1.3 moves this alongside
+/// [`PROGRESS_ROUTES`] onto `HostState`.
+///
+/// The stdio half is still welded to one connection: this dispatch closes over
+/// the gateway's stdio session, which is also where a stdio route's hand-off
+/// queue lives ([`SessionState::stdio_progress_sender`]). Giving a second stdio
+/// client its own identity here is part of the `RESOURCE_SUB_STDIO` work that
+/// remains.
 static PROGRESS_DISPATCH: std::sync::OnceLock<ProgressDispatch> = std::sync::OnceLock::new();
 
 /// In-flight `progressToken` routes, shared by every downstream connection.
@@ -9557,6 +9562,7 @@ fn drain_stdio_deferred(stdio: &SessionState) {
 /// [`STDIO_CLIENT_READY`] for why putting it on the wire early breaks the client
 /// that is still on its way to sending `initialize`. The HTTP fanout is not gated
 /// - an MCP session only exists after that session initialized.
+///
 /// `stdio` is the gateway's stdio client session. Both the sink it writes to and
 /// the protocol era that decides whether it may write at all are session state,
 /// so one owner holds them instead of two process-wide flags.
@@ -9664,13 +9670,14 @@ fn deliver_resource_updated(
         }
     }
     if should_write_legacy_stdio_resource_update(need_stdio, stdio.is_modern_upstream()) {
-        let Some(out) = stdio.stdio_stdout() else {
-            return;
-        };
-        let mut out = out
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = write_json_line(&mut *out, &msg);
+        // A write, not a return: the HTTP/SSE fanout below is not conditional on
+        // this session having a stdio face.
+        if let Some(out) = stdio.stdio_stdout() {
+            let mut out = out
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = write_json_line(&mut *out, &msg);
+        }
     }
     if !session_ids.is_empty() {
         let targets: Vec<Arc<SessionState>> = {
@@ -9909,10 +9916,12 @@ fn deliver_progress(
 /// Build the shared dispatch that routes progress notifications to the client
 /// that minted the token. Bound per downstream via [`bind_progress_sink`].
 ///
-/// `stdio` is this gateway's stdio client session, which owns the hand-off queue
-/// a `RESOURCE_SUB_STDIO` route delivers to. It is resolved per route rather than
-/// captured here, so the dispatch closes over the session and not over a stdout
-/// that belonged to whichever connection started the process.
+/// `stdio` is this gateway's stdio client session, and the delivery target for a
+/// `RESOURCE_SUB_STDIO` route. The dispatch closes over that session rather than
+/// over a stdout captured at startup, so the queue a notification lands in
+/// belongs to the connection. What is still single-client is the route table's
+/// stdio sentinel ([`RESOURCE_SUB_STDIO`]), and that moves with the stdio
+/// connection object.
 fn make_progress_sink(
     stdio: Arc<SessionState>,
     mcp_sessions: Arc<Mutex<HashMap<String, Arc<SessionState>>>>,
@@ -11216,7 +11225,6 @@ struct GatewayState {
     cached_tools: SharedCatalog,
     routine_candidates: CandidateRegistry,
     routine_advisor: AdvisorLedger,
-    stdout: Arc<Mutex<std::io::Stdout>>,
     ready: Arc<AtomicBool>,
     downstream_dirty: Arc<AtomicU8>,
     /// Serializes every full `build_router` + router swap: startup background build,
@@ -11465,19 +11473,28 @@ fn register_modern_subscription(
         }
     }
 
-    let session = Arc::new(match transport {
-        ModernSubscriptionTransport::Http => {
-            SessionState::new_modern(owner.cloned(), id, filter, transport)
-        }
-        ModernSubscriptionTransport::Stdio => SessionState::new_modern_stdio(
+    // The stdio face of this transport is the gateway's stdio client, which always
+    // has one: the stdio arm is reachable only from a stdio request (the HTTP path
+    // passes Http). Failing loudly beats falling back to a process stdout that is
+    // not this connection's.
+    let session = match transport {
+        ModernSubscriptionTransport::Http => Arc::new(SessionState::new_modern(
+            owner.cloned(),
             id,
             filter,
-            state
-                .stdio_upstream
-                .stdio_stdout()
-                .unwrap_or_else(|| Arc::clone(&state.stdout)),
-        ),
-    });
+            transport,
+        )),
+        ModernSubscriptionTransport::Stdio => {
+            let Some(stdout) = state.stdio_upstream.stdio_stdout() else {
+                return Err(error(
+                    id,
+                    -32603,
+                    "Toolport: no stdio connection for this subscription",
+                ));
+            };
+            Arc::new(SessionState::new_modern_stdio(id, filter, stdout))
+        }
+    };
     if transport == ModernSubscriptionTransport::Http {
         let _ = session.try_begin_listen();
     }
@@ -11626,11 +11643,12 @@ struct ModernSubscription {
 /// Both transports share the same session record, ownership, capability gate, and
 /// server-initiated request correlation. Only the delivery sink differs: an HTTP
 /// session queues messages for the `GET /mcp` listen stream, while a stdio
-/// session writes each message to the process stdout.
+/// session writes each message to its own stdout.
 enum SessionTransportFace {
     /// Streamable HTTP: server-to-client messages queue for an SSE listener.
     Http,
-    /// One stdio client: server-to-client messages go straight to stdout.
+    /// One stdio client: server-to-client messages go straight to that session's
+    /// stdout.
     Stdio(Arc<Mutex<std::io::Stdout>>),
 }
 
@@ -15227,10 +15245,13 @@ fn serve_http(state: GatewayState, port: u16) {
         );
     }
 
-    // Two guards shared by every worker thread on BOTH loopback listeners: the
-    // anti-thrash SearchGuard and the destructive-confirm ConfirmGuard each hold
-    // cross-request state (a confirm token stored by one request is redeemed by a
-    // later one), so they must be a single shared instance, not per-thread.
+    // The listener-level guard pair. A request that carries an MCP session id
+    // uses that session's own pair (see GatewayState::session_guards); this one
+    // is the fallback for requests that have no session record: a modern
+    // (self-contained) request, an OpenAPI tool call, and the pre-session
+    // `initialize`. It is per listener rather than per worker because a confirm
+    // token stored by one request is redeemed by a later one, which may land on a
+    // different worker.
     let search = Arc::new(SearchGuard::default());
     let confirm = Arc::new(ConfirmGuard::new());
 
@@ -16353,7 +16374,6 @@ fn main() {
         cached_tools: Arc::clone(&cached_tools),
         routine_candidates: CandidateRegistry::default(),
         routine_advisor: AdvisorLedger::default(),
-        stdout: Arc::clone(&stdout),
         ready: Arc::clone(&ready),
         downstream_dirty: Arc::clone(&downstream_dirty),
         rebuild_lock,
@@ -21724,7 +21744,6 @@ mod tests {
             cached_tools: Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default()))),
             routine_candidates: CandidateRegistry::default(),
             routine_advisor: AdvisorLedger::default(),
-            stdout,
             ready: Arc::new(AtomicBool::new(true)),
             downstream_dirty: Arc::new(AtomicU8::new(0)),
             rebuild_lock: Arc::new(Mutex::new(())),
