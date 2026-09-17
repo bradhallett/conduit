@@ -270,6 +270,13 @@ Where the fourth increment starts, and the decision it has to make before writin
   `mcp_sessions`), so a caller could pair one host with another host's router or cache. The
   seven throwaway hosts in the watcher tests do exactly that on purpose. Production is
   consistent, and collapsing those parameters into the host removes the hazard.
+- Sequencing question, for the maintainer rather than for the code: this increment and the
+  stdio handshake statics are all that Phase 1 has left, and neither is a prerequisite for
+  the pooling work. The three remaining P1.3 holders are host-scoped by decision rather than
+  isolation gaps (host policy, one table per host, one dispatch per host), and the P1.2
+  remainder only affects the stdio handshake path. P3.1 and P3.2 are therefore free to start
+  first; the plan keeps the original order by preference, so that pooling is built on state
+  that is already fully host-owned. That is a choice about risk, not a dependency.
 
 ## Phase 2: rendezvous and the stdio adapter
 
