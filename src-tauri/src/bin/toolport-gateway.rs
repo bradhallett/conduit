@@ -16777,8 +16777,11 @@ mod tests {
     /// `mcp_http_audit_entry_records_client_and_client_name` failed on CI with
     /// `left: Null, right: "client:c1"` while passing alone.
     ///
-    /// Hold one whenever a test can reach [`audit`]. Declaration order is drop order, so
-    /// the override is released before the lock and the next test never inherits it.
+    /// Hold one whenever a test can reach [`audit`] or [`searchtrace::record`]. Fields drop
+    /// in declaration order after the `Drop` impl runs, so the override is released before
+    /// the lock and the next test never inherits it. When a test also needs `CodeModeGuard`,
+    /// take this first: every such test in this module locks ENV_LOCK before CODE_MODE, and
+    /// the reverse order would invert the two.
     struct DataDirTestEnv {
         dir: std::path::PathBuf,
         _data_dir: conduit_lib::registry::DataDirOverride,
@@ -21164,6 +21167,12 @@ mod tests {
 
     #[test]
     fn advisor_stays_silent_without_a_ledger_or_with_code_mode_off() {
+        // ENV_LOCK first, then CodeModeGuard, matching every other test that holds both
+        // (see registry::DataDirOverride). The advisor path can audit via record_candidate
+        // and record_advisor_hint when a parallel test flips CODE_MODE on, so it needs a
+        // scratch data dir as well as the lock.
+        let _data_env =
+            DataDirTestEnv::new("advisor_stays_silent_without_a_ledger_or_with_code_mode_off");
         let _code_mode = CodeModeGuard::acquire();
         set_code_mode_flag(false);
         let advisor = AdvisorLedger::default();
@@ -21232,6 +21241,9 @@ mod tests {
 
     #[test]
     fn guessed_save_routine_is_refused_while_writes_are_disabled() {
+        // Same order as above: ENV_LOCK before CodeModeGuard.
+        let _data_env =
+            DataDirTestEnv::new("guessed_save_routine_is_refused_while_writes_are_disabled");
         let _guard = CodeModeGuard::acquire();
         set_code_mode_flag(true);
         let reg = Registry::default();
