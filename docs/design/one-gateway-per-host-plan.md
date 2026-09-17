@@ -60,13 +60,16 @@ Still open:
   process-wide `stdout_broken` for what is a per-session condition; and stdio PII/HITL
   lookups collapse to `PII_LOCAL_SESSION`, so two stdio clients on one host would share one
   pseudonym map and clearing one would clear the other.
-- P1.3 `HostState`. `GatewayState` still mixes host and session state, and owns the
-  host-scoped policy and routing globals: `DISCOVERY_MODE`, `CODE_MODE`,
-  `PROGRESS_DISPATCH`, `PROGRESS_ROUTES`. Six more host-scoped statics live outside it and
-  move in the same pass: `DAEMON_MODE` (process role), `LAST_ACTIVITY_MS` (daemon idle
-  lease), `QUARANTINE_READ_FAILED`, `PROGRESS_TOKEN_SEQ`, `REBUILD_SHRINK_STREAKS`, and the
-  principal-keyed `session_tables()` store. `GatewayState.stdio_upstream` is also
-  constructed unconditionally, including in HTTP/daemon mode where there is no connection.
+- P1.3 `HostState` (in progress). The host runtime now lives on `HostState` (registry and
+  its trust flag, router, catalog snapshot, routine candidates and advisor, ready/dirty
+  flags, rebuild lock, listener config, server handler, resource subscriptions and the
+  `resources/updated` sink), with `GatewayState` as a `Deref` facade over it. What remains
+  outside is the host-scoped policy and routing statics: `DISCOVERY_MODE`, `CODE_MODE`,
+  `PROGRESS_DISPATCH`, `PROGRESS_ROUTES`, plus `DAEMON_MODE` (process role),
+  `LAST_ACTIVITY_MS` (daemon idle lease), `QUARANTINE_READ_FAILED`, `PROGRESS_TOKEN_SEQ`,
+  `REBUILD_SHRINK_STREAKS`, and the principal-keyed `session_tables()` store.
+  `GatewayState.stdio_upstream` is also constructed unconditionally, including in
+  HTTP/daemon mode where there is no connection.
 - Discovery and code mode are host policy, not session state, by decision. Both are
   resolved from the registry (which the watcher refreshes live) plus a process env
   override, so every session on one host sees the same switch; the per-client part of
@@ -84,7 +87,7 @@ Still open:
   `notifications/progress` frame through the hand-off, without the `list_changed` /
   `resources/updated` check on the peer's declared era. Pre-existing, unchanged by the
   threading work, and on the list so it is not read as an oversight.
-- No `HostState` type and no topology feature flag in the registry.
+- No topology feature flag in the registry.
 - The adapter has not been dogfooded against a real client (P4.1).
 - Reusable primitives that already exist: the approval broker's `EndpointDescriptor`
   (`approval.rs`), `registry::atomic_write`, and the registry cross-process `FileLock`.
@@ -94,19 +97,19 @@ Still open:
 
 ## Delivery shape
 
-| PR  | Slice                                                                                                              | Behavior change                             | Status                           |
-| --- | ------------------------------------------------------------------------------------------------------------------ | ------------------------------------------- | -------------------------------- |
-| 1   | P2.1 rendezvous primitives (library module, tested)                                                                | none (new module only)                      | landed (#880)                    |
-| 2   | P2.2a identity role; P2.2b host runtime on the internal endpoint                                                   | none (explicit flag only)                   | landed (#881)                    |
-| 3   | P1.2 session tables on `SessionStore`; transports unified on `SessionState`; era, progress, and guards per session | none default; HTTP confirm scoping narrowed | landed; handshake statics remain |
-| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade                                                   | none                                        | not started                      |
-| 5   | P2.2c stdio adapter speaks the daemon session protocol, behind flag                                                | opt-in only                                 | landed (#888, #891, #893)        |
-| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback                                                          | opt-in only                                 | landed (#892, #893)              |
-| 7   | P3.1 union catalog built once, allowed-set enforced per session                                                    | opt-in only                                 | not started                      |
-| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding                                                      | opt-in only, the big win                    | not started                      |
-| 9   | P4.1 dogfood flag, telemetry, acceptance run                                                                       | opt-in only                                 | not started                      |
-| 10  | P4.2 adapter topology becomes default; legacy kill switch remains                                                  | default flip                                | not started                      |
-| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease                                                     | separate, later                             | not started                      |
+| PR  | Slice                                                                                                              | Behavior change                             | Status                                                 |
+| --- | ------------------------------------------------------------------------------------------------------------------ | ------------------------------------------- | ------------------------------------------------------ |
+| 1   | P2.1 rendezvous primitives (library module, tested)                                                                | none (new module only)                      | landed (#880)                                          |
+| 2   | P2.2a identity role; P2.2b host runtime on the internal endpoint                                                   | none (explicit flag only)                   | landed (#881)                                          |
+| 3   | P1.2 session tables on `SessionStore`; transports unified on `SessionState`; era, progress, and guards per session | none default; HTTP confirm scoping narrowed | landed; handshake statics remain                       |
+| 4   | P1.3 `HostState` extracted; `GatewayState` becomes a thin facade                                                   | none                                        | in progress: host runtime moved, policy statics remain |
+| 5   | P2.2c stdio adapter speaks the daemon session protocol, behind flag                                                | opt-in only                                 | landed (#888, #891, #893)                              |
+| 6   | P2.3 session lifecycle, TTL, crash/EOF handling, fallback                                                          | opt-in only                                 | landed (#892, #893)                                    |
+| 7   | P3.1 union catalog built once, allowed-set enforced per session                                                    | opt-in only                                 | not started                                            |
+| 8   | P3.2 downstream pooling by `LaunchKey` and `${ROOT}` sharding                                                      | opt-in only, the big win                    | not started                                            |
+| 9   | P4.1 dogfood flag, telemetry, acceptance run                                                                       | opt-in only                                 | not started                                            |
+| 10  | P4.2 adapter topology becomes default; legacy kill switch remains                                                  | default flip                                | not started                                            |
+| 11  | P4.3 desktop Shared HTTP converges onto a daemon service lease                                                     | separate, later                             | not started                                            |
 
 Each of 1 through 8 must leave the default topology untouched and all existing suites
 green. The only PRs that change what a user gets are 10 and 11.
@@ -175,6 +178,31 @@ that P1.3 takes.
 
 ### P1.3 HostState
 
+Status: first increment landed. `HostState` owns the host runtime the gateway already
+resolved once per process, and `GatewayState` is now a facade over it: a `Deref` impl keeps
+the host-scoped call sites reading `state.registry`, `state.router`, and friends, so moving
+ownership did not rewrite several hundred lines.
+
+- Landed: `HostState` holds the registry and its trust flag, the live router, the catalog
+  snapshot, the routine candidate registry and advisor ledger, the ready and dirty flags,
+  the rebuild lock, the listener configuration (`lazy`, `http`, bind host, allowed
+  origins), the server-request handler, the resource subscription table, and the
+  `resources/updated` dispatch sink. `GatewayState` keeps the session-side fields: the
+  profile handle, the MCP session table, the stdio client's session, and its client id and
+  boot profile. One invariant test asserts that a second facade shares the host, so one
+  host still has exactly one live router and one registry.
+- Remaining: the host-scoped statics (`DISCOVERY_MODE`, `CODE_MODE`, `PROGRESS_DISPATCH`,
+  `PROGRESS_ROUTES`, `DAEMON_MODE`, `LAST_ACTIVITY_MS`, `QUARANTINE_READ_FAILED`,
+  `PROGRESS_TOKEN_SEQ`, `REBUILD_SHRINK_STREAKS`) and the principal-keyed session store
+  still live outside `HostState`; they move in the next increment, which is also where the
+  watcher and the downstream pool join it.
+- Watch item: `mcp_sessions` is host context that still sits on the facade (every facade is
+  a clone of the one built at startup, so exactly one table exists). It has to move with the
+  session store before anything constructs a facade per session, or `session_guards`, the
+  server-request session lookup, and the list_changed fanout would each see an empty table.
+- Naming note: `codemode.rs` has its own private `HostState` for the QuickJS sandbox host.
+  Unrelated to this one; the plan's name wins here because this is the type the design's
+  ownership split is about.
 - Introduce `HostState` owning registry and watcher, router and rebuild lock, catalog
   snapshot and cache writes, downstream pool and circuit-breaker state, quarantine and
   rate-limit bindings, audit/metrics/savings, `server_handler`, and
