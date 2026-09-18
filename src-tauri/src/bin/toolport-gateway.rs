@@ -556,7 +556,7 @@ fn gateway_capabilities(
         }
         let discovery_mode = if lazy {
             DiscoveryMode::Lazy
-        } else if grouped_discovery() {
+        } else if host.grouped_discovery() {
             DiscoveryMode::Grouped
         } else {
             DiscoveryMode::Full
@@ -1688,51 +1688,6 @@ impl DiscoveryMode {
     }
 }
 
-/// The live discovery mode. Mutable (not a `OnceLock`) so the watcher can refresh it when
-/// the registry's per-client override changes; `discovery_mode()` reads it lock-free.
-///
-/// Host policy by decision (one-gateway-per-host P1.2), not session state: it is resolved
-/// from the registry (which the watcher refreshes live) plus a process env override, so
-/// every session on one host sees the same switch, and P1.3 moves it onto `HostState`.
-/// The per-client half of discovery already resolves per request from the caller's client
-/// id (`http_client_discovery_override`), and a daemon session will resolve it from the
-/// identity asserted at session open; a per-session copy of the host-wide value would be
-/// the thing that goes stale.
-static DISCOVERY_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-fn set_discovery_mode(mode: DiscoveryMode) {
-    DISCOVERY_MODE.store(mode.as_u8(), std::sync::atomic::Ordering::Relaxed);
-}
-
-#[cfg(test)]
-static DISCOVERY_MODE_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-#[cfg(test)]
-struct DiscoveryModeGuard {
-    prev: DiscoveryMode,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-#[cfg(test)]
-impl DiscoveryModeGuard {
-    fn acquire() -> Self {
-        let lock = DISCOVERY_MODE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Self {
-            prev: discovery_mode(),
-            _lock: lock,
-        }
-    }
-}
-
-#[cfg(test)]
-impl Drop for DiscoveryModeGuard {
-    fn drop(&mut self) {
-        set_discovery_mode(self.prev);
-    }
-}
-
 /// The code-mode flag a registry load seeds (WS2-5).
 ///
 /// A successful load copies `registry.code_mode`, which is the value a host's flag starts
@@ -1760,8 +1715,8 @@ fn parse_mode(s: &str) -> Option<DiscoveryMode> {
 
 /// Per-HTTP-client discovery override from `clientDiscovery[<client id>]`. Only
 /// `full` and `lazy` are honored per client: grouped still depends on
-/// process-global publisher state, so a `grouped` value (or any unrecognized one)
-/// yields `None` and the request uses the process mode.
+/// host-wide publisher state, so a `grouped` value (or any unrecognized one)
+/// yields `None` and the request uses the host's mode.
 fn http_client_discovery_override(reg: &Registry, client_id: &str) -> Option<DiscoveryMode> {
     match reg.client_discovery_mode(client_id).and_then(parse_mode) {
         Some(DiscoveryMode::Lazy) => Some(DiscoveryMode::Lazy),
@@ -1846,17 +1801,6 @@ fn resolve_mode_from(
     } else {
         (DiscoveryMode::Full, None)
     }
-}
-
-/// The resolved mode. Defaults to `Lazy` before `main` sets it (only unit tests, which
-/// don't run `main` and test the grouped helpers directly, ever observe that default).
-fn discovery_mode() -> DiscoveryMode {
-    DiscoveryMode::from_u8(DISCOVERY_MODE.load(std::sync::atomic::Ordering::Relaxed))
-}
-
-/// True when this gateway runs in grouped discovery mode (see [`grouped_tool_defs`]).
-fn grouped_discovery() -> bool {
-    discovery_mode() == DiscoveryMode::Grouped
 }
 
 /// The server prefix of a *namespaced* tool (`server__tool`). `None` for a bare name
@@ -2959,6 +2903,7 @@ fn project_budgeted(tools: &[&Value]) -> Vec<Value> {
 }
 
 fn enabled_summary(
+    host: &HostState,
     reg: &Registry,
     cached: &[Value],
     profile: Option<&str>,
@@ -3078,7 +3023,7 @@ fn enabled_summary(
     // catalog?" and confirms a per-client override took effect.
     out.push_str(&format!(
         "\nDiscovery mode: {}\n",
-        discovery_mode().as_str()
+        host.discovery_mode().as_str()
     ));
     out.push_str(&savings_line());
     out
@@ -3788,7 +3733,7 @@ struct HttpCaller {
     audit_label: Option<String>,
     session_owner: McpSessionOwner,
     /// Per-client discovery override, when `clientDiscovery[<client id>]` sets one
-    /// (#868). `None` means the request uses the process mode, so one HTTP bridge
+    /// (#868). `None` means the request uses the host's mode, so one HTTP bridge
     /// can still serve a native-search client the full catalog and a local model
     /// the meta-tools at the same time.
     discovery: Option<DiscoveryMode>,
@@ -7598,11 +7543,11 @@ fn handle_request(
     client: Option<&str>,
 ) -> Option<Value> {
     let search_index = CatalogSearchIndex::build(cached);
-    // Callers of this wrapper hand in the process mode as a bool; translate it
-    // back to a mode so a global grouped mode still applies to them.
+    // Callers of this wrapper hand in the mode as a bool; translate it back to a mode so
+    // a host-wide grouped mode still applies to them.
     let mode = if lazy {
         DiscoveryMode::Lazy
-    } else if grouped_discovery() {
+    } else if host.grouped_discovery() {
         DiscoveryMode::Grouped
     } else {
         DiscoveryMode::Full
@@ -8011,7 +7956,7 @@ fn handle_request_with_cancel(
                 return Some(success(
                     id,
                     json!({
-                        "content": [{ "type": "text", "text": enabled_summary(reg, cached, profile, allowed) }],
+                        "content": [{ "type": "text", "text": enabled_summary(host, reg, cached, profile, allowed) }],
                         "isError": false
                     }),
                 ));
@@ -10859,10 +10804,10 @@ fn watch_tick(
         // override edit (`client_discovery`) may be the only change, and it isn't
         // router-relevant, so resolve it here before the rebuild fast-path can return.
         let new_mode = discovery_mode_for(&new_reg, client_id);
-        if new_mode != discovery_mode() {
+        if new_mode != host.discovery_mode() {
             eprintln!("toolport: discovery mode -> {}", new_mode.as_str());
         }
-        set_discovery_mode(new_mode);
+        host.set_discovery_mode(new_mode);
         let routine_surface_changed = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -11145,6 +11090,18 @@ struct HostState {
     /// [`preserve_collapsed_servers_guarded`]. The streak belongs to the host's one
     /// router, so one host means one map.
     rebuild_shrink_streaks: Mutex<HashMap<String, u8>>,
+    /// The live discovery mode. Mutable (not a `OnceLock`) so the watcher can refresh it
+    /// when the registry's per-client override changes; [`HostState::discovery_mode`] reads
+    /// it lock-free.
+    ///
+    /// Host policy by decision (one-gateway-per-host P1.2), not session state: it is resolved
+    /// from the registry (which the watcher refreshes live) plus a process env override, so
+    /// every session on one host sees the same switch. The per-client half of discovery
+    /// already resolves per request from the caller's client id
+    /// (`http_client_discovery_override`), and a daemon session will resolve it from the
+    /// identity asserted at session open; a per-session copy of the host-wide value would be
+    /// the thing that goes stale.
+    discovery: AtomicU8,
     /// The live "code mode" flag (SOU-397 policy), synced from the registry's `code_mode`
     /// at boot ([`seed_code_mode_after_registry_load`]) and by the registry watcher on every
     /// reload, the same live-refresh path as discovery mode.
@@ -11217,6 +11174,23 @@ impl HostState {
     /// every reload, and a test that drives the switch.
     fn set_code_mode(&self, enabled: bool) {
         self.code_mode.store(enabled, Ordering::Relaxed);
+    }
+
+    /// The resolved discovery mode for this host. Defaults to `Lazy` before the bootstrap
+    /// sets it (only unit tests, which don't run `main`, ever observe that default).
+    fn discovery_mode(&self) -> DiscoveryMode {
+        DiscoveryMode::from_u8(self.discovery.load(Ordering::Relaxed))
+    }
+
+    /// Set this host's discovery mode: the bootstrap, the registry watcher on every reload,
+    /// and a test that drives the switch.
+    fn set_discovery_mode(&self, mode: DiscoveryMode) {
+        self.discovery.store(mode.as_u8(), Ordering::Relaxed);
+    }
+
+    /// True when this host runs in grouped discovery mode (see [`grouped_tool_defs`]).
+    fn grouped_discovery(&self) -> bool {
+        self.discovery_mode() == DiscoveryMode::Grouped
     }
 }
 
@@ -13309,7 +13283,7 @@ fn handle_stdio_request(state: GatewayState, req: Value, request_key: String) {
             Some(cancel_context),
             None,
             None,
-            discovery_mode(),
+            state.discovery_mode(),
         )
     }))
     .unwrap_or_else(|_| {
@@ -14361,14 +14335,14 @@ fn handle_http_with_headers(
     let client_name = caller.and_then(|value| value.audit_label.as_deref());
     let session_owner = caller.map(|value| &value.session_owner);
     // Per-client discovery (#868): a caller whose client set clientDiscovery gets
-    // that mode; every other request keeps the process mode (including grouped,
-    // which stays process-global).
+    // that mode; every other request keeps the host's mode (including grouped, which
+    // is host-wide by decision).
     let discovery = caller
         .and_then(|value| value.discovery)
         .unwrap_or_else(|| {
             if state.lazy {
                 DiscoveryMode::Lazy
-            } else if grouped_discovery() {
+            } else if state.grouped_discovery() {
                 DiscoveryMode::Grouped
             } else {
                 DiscoveryMode::Full
@@ -16141,8 +16115,9 @@ fn main() {
     // gateway (e.g. Antigravity). Resolved once and cached; `lazy` is derived so its
     // behavior is unchanged, and grouped mode reads the same cached value.
     let mode = resolve_discovery_mode();
-    set_discovery_mode(mode);
     let lazy = matches!(mode, DiscoveryMode::Lazy);
+    // The host's discovery mode starts from this bootstrap value; the watcher refreshes it.
+    let discovery_seed = mode.as_u8();
     // Per-client scoping: this gateway exposes only the named profile's servers.
     // This is only the bootstrap value - once the registry loads below, the live
     // value (kept in sync with registry.client_scopes on every watcher tick) wins.
@@ -16332,6 +16307,7 @@ fn main() {
         rebuild_shrink_streaks: Mutex::new(HashMap::new()),
         quarantine_read_failed: AtomicBool::new(false),
         code_mode: AtomicBool::new(code_mode_seed),
+        discovery: AtomicU8::new(discovery_seed),
     });
     glog(&format!(
         "loaded tool cache: {} tools",
@@ -16561,7 +16537,7 @@ fn main() {
                 None,
                 None,
                 None,
-                discovery_mode(),
+                state.discovery_mode(),
             );
             continue;
         };
@@ -20590,7 +20566,6 @@ mod tests {
         let state = http_state(true);
         state.set_code_mode(true);
         let host = Arc::clone(&state.host);
-        let _discovery = DiscoveryModeGuard::acquire();
         let list_req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
         let router = router();
         let listed_names = |listed: &Value| {
@@ -20634,7 +20609,7 @@ mod tests {
             (DiscoveryMode::Grouped, false),
             (DiscoveryMode::Full, false),
         ] {
-            set_discovery_mode(mode);
+            host.set_discovery_mode(mode);
             let listed = handle_request(
                 &host,
                 &list_req,
@@ -20663,7 +20638,7 @@ mod tests {
             }
         }
 
-        set_discovery_mode(DiscoveryMode::Lazy);
+        host.set_discovery_mode(DiscoveryMode::Lazy);
         *state.registry.lock().unwrap() = enabled;
         let http_names: std::collections::HashSet<String> = http_tool_defs(&state, None, DiscoveryMode::Lazy)
             .iter()
@@ -20690,9 +20665,8 @@ mod tests {
     fn flattened_routine_tools_are_advertised_and_run() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let host = dispatch_host(false);
-        let _discovery = DiscoveryModeGuard::acquire();
         host.set_code_mode(true);
-        set_discovery_mode(DiscoveryMode::Lazy);
+        host.set_discovery_mode(DiscoveryMode::Lazy);
         let dir = std::env::temp_dir().join(format!(
             "toolport-routine-flatten-{}",
             routines::generate_id().unwrap()
@@ -21998,6 +21972,7 @@ mod tests {
             rebuild_shrink_streaks: Mutex::new(HashMap::new()),
             quarantine_read_failed: AtomicBool::new(false),
             code_mode: AtomicBool::new(false),
+            discovery: AtomicU8::new(0),
             mcp_sessions: mcp_sessions.unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new()))),
             daemon_mode: AtomicBool::new(false),
             last_activity_ms: AtomicU64::new(0),
@@ -22044,6 +22019,7 @@ mod tests {
                 rebuild_shrink_streaks: Mutex::new(HashMap::new()),
                 quarantine_read_failed: AtomicBool::new(false),
                 code_mode: AtomicBool::new(false),
+                discovery: AtomicU8::new(0),
             }),
             profile: Arc::new(Mutex::new(None)),
             stdio_upstream,
@@ -23322,6 +23298,7 @@ mod tests {
 
     #[test]
     fn status_summary_scopes_to_allowed_servers() {
+        let host = dispatch_host(false);
         use std::collections::HashSet;
         let mut reg = Registry::default();
         for id in ["alpha", "bravo"] {
@@ -23347,13 +23324,13 @@ mod tests {
         reg.set_server_enabled(&billing, "bravo", true).unwrap();
         let cached = vec![json!({ "name": "alpha__x" }), json!({ "name": "bravo__y" })];
         // Unscoped (legacy/stdio): the active profile -> alpha only.
-        let full = enabled_summary(&reg, &cached, None, None);
+        let full = enabled_summary(&host, &reg, &cached, None, None);
         assert!(full.contains("alpha"));
         assert!(!full.contains("bravo")); // not in the active profile
                                           // Scoped to bravo: shows bravo (its real scope) even though bravo isn't in
                                           // the active profile, and never leaks alpha's name/command/tool count.
         let allowed: HashSet<String> = ["bravo".to_string()].into_iter().collect();
-        let scoped = enabled_summary(&reg, &cached, None, Some(&allowed));
+        let scoped = enabled_summary(&host, &reg, &cached, None, Some(&allowed));
         assert!(scoped.contains("bravo"));
         assert!(!scoped.contains("alpha"));
         assert!(!scoped.contains("alpha-cmd"));
@@ -23361,6 +23338,7 @@ mod tests {
 
     #[test]
     fn status_flags_enabled_servers_that_expose_no_tools() {
+        let host = dispatch_host(false);
         let mut reg = Registry::default();
         for id in ["github", "atlassian"] {
             reg.servers.push(ServerEntry {
@@ -23386,7 +23364,7 @@ mod tests {
             json!({ "name": "github__list_repos" }),
             json!({ "name": "github__create_issue" }),
         ];
-        let out = enabled_summary(&reg, &cached, None, None);
+        let out = enabled_summary(&host, &reg, &cached, None, None);
         assert!(out.contains("github: 2 tool(s)"));
         assert!(out.contains("Enabled but exposing 0 tools"));
         // The silent server is named under the hint; the one with tools is not.
@@ -23401,6 +23379,7 @@ mod tests {
     /// dropped its counts, then reported it as exposing 0 tools.
     #[test]
     fn status_counts_tools_for_a_hyphenated_server_id() {
+        let host = dispatch_host(false);
         let mut reg = Registry::default();
         reg.servers.push(stub_server("file-system", "File System"));
         reg.set_server_enabled("default", "file-system", true)
@@ -23409,13 +23388,13 @@ mod tests {
             json!({ "name": "file_system__read" }),
             json!({ "name": "file_system__write" }),
         ];
-        let out = enabled_summary(&reg, &cached, None, None);
+        let out = enabled_summary(&host, &reg, &cached, None, None);
         assert!(out.contains("file_system: 2 tool(s)"), "{out}");
         assert!(!out.contains("Enabled but exposing 0 tools"), "{out}");
         // Same answer for a scoped HTTP caller, whose allow-set is raw ids too.
         let allowed: std::collections::HashSet<String> =
             ["file-system".to_string()].into_iter().collect();
-        let scoped = enabled_summary(&reg, &cached, None, Some(&allowed));
+        let scoped = enabled_summary(&host, &reg, &cached, None, Some(&allowed));
         assert!(scoped.contains("file_system: 2 tool(s)"), "{scoped}");
 
         // A prefix two tenants share is counted for neither, rather than crediting
@@ -23427,12 +23406,19 @@ mod tests {
         twins
             .set_server_enabled("default", "team_slack", true)
             .unwrap();
-        let out = enabled_summary(&twins, &[json!({ "name": "team_slack__send" })], None, None);
+        let out = enabled_summary(
+            &host,
+            &twins,
+            &[json!({ "name": "team_slack__send" })],
+            None,
+            None,
+        );
         assert!(!out.contains("team_slack: 1 tool(s)"), "{out}");
     }
 
     #[test]
     fn status_omits_zero_tool_hint_before_catalog_populates() {
+        let host = dispatch_host(false);
         // Before any server has produced tools (empty catalog = still connecting),
         // the hint must stay silent - otherwise every server reads as "0 tools".
         let mut reg = Registry::default();
@@ -23452,7 +23438,7 @@ mod tests {
             unknown_fields: serde_json::Map::new(),
         });
         reg.set_server_enabled("default", "github", true).unwrap();
-        let out = enabled_summary(&reg, &[], None, None);
+        let out = enabled_summary(&host, &reg, &[], None, None);
         assert!(!out.contains("Enabled but exposing 0 tools"));
     }
 
@@ -24874,7 +24860,7 @@ mod tests {
         reg.set_client_discovery("c-claude-code", Some("lazy"));
         assert_eq!(resolve(&reg), Some(DiscoveryMode::Lazy));
 
-        // Grouped still depends on process-global publisher state, so it is not a
+        // Grouped still depends on host-wide publisher state, so it is not a
         // per-client override, and neither is an unset client.
         reg.set_client_discovery("c-claude-code", Some("grouped"));
         assert_eq!(resolve(&reg), None);
@@ -27787,8 +27773,7 @@ mod tests {
     #[test]
     fn full_tools_list_neutralizes_spoofs_outside_the_description() {
         let host = dispatch_host(false);
-        let _discovery = DiscoveryModeGuard::acquire();
-        set_discovery_mode(DiscoveryMode::Full);
+        host.set_discovery_mode(DiscoveryMode::Full);
         let poisoned = vec![spoofed_tool("resend__send_email")];
         let reg = Registry::default();
         let resp = handle_request(
@@ -28894,6 +28879,156 @@ mod tests {
         assert!(
             other_host.code_mode_enabled(),
             "a reload must not touch another host's code-mode flag"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// P1.3: the discovery mode belongs to the host, so one host's switch cannot decide what
+    /// another host advertises.
+    ///
+    /// Teeth: with the mode back on a process global, both hosts read one value and one of
+    /// these assertions fails. It also pins that the dispatch path reads the host it was
+    /// handed rather than a value resolved somewhere else.
+    #[test]
+    fn discovery_mode_is_per_host() {
+        let grouped = dispatch_host(false);
+        grouped.set_discovery_mode(DiscoveryMode::Grouped);
+        let full = dispatch_host(false);
+        full.set_discovery_mode(DiscoveryMode::Full);
+        let reg = Registry::default();
+        let router = routed_router("s", "tool");
+        let catalog = vec![json!({
+            "name": "s__tool",
+            "description": "a tool",
+            "inputSchema": { "type": "object" }
+        })];
+        let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+        let names = |host: &HostState| -> Vec<String> {
+            let resp = handle_request(
+                host,
+                &req,
+                &reg,
+                &router,
+                &catalog,
+                false,
+                None,
+                &SearchGuard::default(),
+                &ConfirmGuard::new(),
+                None,
+                None,
+            )
+            .unwrap();
+            resp["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+                .collect()
+        };
+
+        let full_names = names(&full);
+        assert!(
+            full_names.contains(&"s__tool".to_string()),
+            "full discovery advertises the catalog: {full_names:?}"
+        );
+        let grouped_names = names(&grouped);
+        assert!(
+            !grouped_names.contains(&"s__tool".to_string()),
+            "grouped discovery must not advertise the raw catalog: {grouped_names:?}"
+        );
+        assert!(
+            grouped_names.iter().any(|name| name.starts_with("help_")),
+            "grouped discovery advertises one help_<server> tool per server: {grouped_names:?}"
+        );
+    }
+
+    /// P1.3: the discovery mode is the host's, so the watcher's live refresh has to land on the
+    /// host it was given and on no other. This is the discovery twin of
+    /// `watch_tick_refreshes_code_mode_on_the_host_it_was_given`.
+    ///
+    /// Teeth: it drives the real writer (the reload inside `watch_tick`) rather than the setter.
+    /// A refresh that stopped publishing, or wrote a process global instead of the host, fails
+    /// one of the two assertions.
+    #[test]
+    fn watch_tick_refreshes_discovery_mode_on_the_host_it_was_given() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("toolport-discovery-tick-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let registry_trusted = Arc::new(AtomicBool::new(true));
+        let router = Arc::new(Mutex::new(Arc::new(Router::new())));
+        let stdio = test_stdio_session();
+        let cached_tools = Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default())));
+        let profile_slot = Arc::new(Mutex::new(None));
+        let downstream_dirty = Arc::new(AtomicU8::new(0));
+        let client_root = Arc::new(Mutex::new(None));
+        let server_handler: ServerRequestHandler = Arc::new(|_| None);
+        let rebuild_lock = Arc::new(Mutex::new(()));
+        // The registry on disk resolves to `full`, so the reload has something to publish.
+        let on_disk = Registry {
+            discovery_mode: Some("full".to_string()),
+            ..Registry::default()
+        };
+        let reg_path = dir.join("registry.json");
+        conduit_lib::registry::save_to(&reg_path, &on_disk).unwrap();
+        let mut state = WatchLoopState {
+            last_mtime: None,
+            last_relevant: json!({}),
+            last_routines_mtime: None,
+        };
+
+        let watch_host = host_from_parts(
+            Arc::clone(&registry),
+            Arc::clone(&registry_trusted),
+            Arc::clone(&router),
+            Arc::clone(&cached_tools),
+            Arc::clone(&downstream_dirty),
+            Arc::clone(&server_handler),
+            Arc::clone(&rebuild_lock),
+            None,
+            None,
+        );
+        let other_host = host_from_parts(
+            Arc::clone(&registry),
+            Arc::clone(&registry_trusted),
+            Arc::clone(&router),
+            Arc::clone(&cached_tools),
+            Arc::clone(&downstream_dirty),
+            Arc::clone(&server_handler),
+            Arc::clone(&rebuild_lock),
+            None,
+            None,
+        );
+        // Both start Grouped, which no registry in this fixture resolves to, so the reload
+        // moving exactly one of them is the assertion.
+        watch_host.set_discovery_mode(DiscoveryMode::Grouped);
+        other_host.set_discovery_mode(DiscoveryMode::Grouped);
+
+        let _ = watch_tick(
+            &reg_path,
+            &stdio,
+            &profile_slot,
+            None,
+            None,
+            false,
+            &client_root,
+            None,
+            &mut state,
+            &watch_host,
+        );
+
+        assert_ne!(
+            watch_host.discovery_mode(),
+            DiscoveryMode::Grouped,
+            "the reload must publish the resolved discovery mode to this host"
+        );
+        assert_eq!(
+            other_host.discovery_mode(),
+            DiscoveryMode::Grouped,
+            "a reload must not touch another host's discovery mode"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
