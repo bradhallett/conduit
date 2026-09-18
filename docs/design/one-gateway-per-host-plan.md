@@ -315,27 +315,30 @@ ownership did not rewrite several hundred lines.
   `discovery_mode()` / `set_discovery_mode()` / `grouped_discovery()`. `HostState` owns a
   `discovery: AtomicU8` read through those same three names as methods, `main` seeds it from
   the same `resolve_discovery_mode()` outcome it used to store into the static, and the
-  watcher publishes on the host it was handed. Six production reads moved with it, plus the test-only wrapper,
+  watcher publishes on the host it was handed. Seven production reads moved with it
   (`enabled_summary`'s status line, which is why that function gained the host parameter,
   `watch_tick`'s compare, the `process_request` arguments in `handle_stdio_request` and
-  `main`, and the three `grouped_discovery()` call sites), plus the watcher's set and the
-  bootstrap that initializes the field, four test setter sites (six calls, one of them a
-  three-mode loop), seven test `enabled_summary` call sites, and the three guard sites, which
-  are deleted rather than moved. Two tests pin the ownership, the discovery twin of the pair
-  the code-mode increment added: one asserts two hosts advertise differently, one drives the
-  watcher's reload and asserts a second host's mode is untouched. Sabotage-checked both ways:
-  re-globalizing the value behind the new names fails both, and dropping the watcher's publish
-  fails the second alone. This is the second of the two host-policy statics; the dispatch core
-  still has the session store and the routes.
+  `main`, and the three `grouped_discovery()` call sites), plus the test-only wrapper, plus
+  the watcher's set and the bootstrap that initializes the field, the four test setter sites
+  this moved (six calls, one of them a three-mode loop) and the five more the new tests and
+  the status assertion added, eight test `enabled_summary` call sites, and the three guard
+  sites, which are deleted rather than moved. Two tests pin the ownership, the discovery twin
+  of the pair the code-mode increment added: one asserts two hosts advertise differently, one
+  drives the watcher's reload and asserts a second host's mode is untouched. Sabotage-checked
+  both ways: re-globalizing the value behind the new names fails both, and dropping the
+  watcher's publish fails the second alone. This is the second of the two host-policy statics;
+  the dispatch core still has the session store and the routes.
   Coverage limits, stated rather than implied: `main`'s wiring of the resolved mode into the
   host field is not observable from a unit test (nothing calls `main`), the
   `process_request` mode arguments are not driven with a non-default host mode, and the watcher
   test derives its expected mode from its own fixture so an ambient `TOOLPORT_DISCOVERY`
   override cannot fail it. One hazard this increment uncovered and did not fix, because fixing
-  it changes behavior: the HTTP/OpenAPI fallback still reads the boot-frozen `HostState.lazy`
-  while the live value is `HostState::discovery`, so a mode switch after boot reaches stdio and
-  the daemon immediately and the bridge only on restart. That is main's behavior too, and the
-  comment there now says so; collapsing the two fields is its own slice.
+  it changes behavior: the HTTP/OpenAPI fallback keeps the boot-frozen `HostState.lazy` bit
+  while the live value is `HostState::discovery`, so a mode switch after boot reaches stdio
+  and the daemon immediately, a switch into or out of grouped reaches the bridge immediately
+  through the live field, and only a switch involving `lazy` waits for a restart. That is
+  main's behavior too, and the comment there now says so; collapsing the two fields is its
+  own slice.
 - Remaining: the principal-keyed session store and the
   `PROGRESS_*` dispatch and routes. The session store
   is read deep inside the dispatch core (`execute_call`,

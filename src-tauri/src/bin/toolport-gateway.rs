@@ -3733,7 +3733,8 @@ struct HttpCaller {
     audit_label: Option<String>,
     session_owner: McpSessionOwner,
     /// Per-client discovery override, when `clientDiscovery[<client id>]` sets one
-    /// (#868). `None` means the request falls back to the listener's boot `lazy` flag, so one HTTP bridge
+    /// (#868). `None` means the request falls back to the listener's boot `lazy` flag plus
+    /// the host's live grouped bit (see `handle_http_with_headers`), so one HTTP bridge
     /// can still serve a native-search client the full catalog and a local model
     /// the meta-tools at the same time.
     discovery: Option<DiscoveryMode>,
@@ -14334,10 +14335,11 @@ fn handle_http_with_headers(
     let client = caller.map(|value| value.session_owner.identity.as_str());
     let client_name = caller.and_then(|value| value.audit_label.as_deref());
     let session_owner = caller.map(|value| &value.session_owner);
-    // Per-client discovery (#868): a caller whose client set clientDiscovery gets
-    // that mode; every other request keeps the listener's boot-frozen `lazy` flag, so the
-    // bridge stays on the mode resolved at boot even after a live switch (the plan doc lists
-    // that gap; stdio and the daemon read the host's live mode instead).
+    // Per-client discovery (#868): a caller whose client set clientDiscovery gets that mode;
+    // every other request keeps the listener's boot-frozen `lazy` flag and reads the host's
+    // live grouped bit, so a switch into or out of grouped reaches this bridge at once while a
+    // switch involving `lazy` waits for a restart (the plan doc records that gap; stdio and the
+    // daemon read the host's live mode instead).
     let discovery = caller
         .and_then(|value| value.discovery)
         .unwrap_or_else(|| {
