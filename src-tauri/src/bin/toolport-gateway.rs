@@ -20404,6 +20404,10 @@ mod tests {
     /// `toolport_run_script`. Production seeds the flag from the registry at boot.
     #[test]
     fn run_script_is_refused_when_code_mode_disabled() {
+        // Scratch data dir: the refusal returns before the audit writer, so this test writes no
+        // row while the gate is off. Force the gate on, as a sabotage does, and the dispatch
+        // reaches `audit::record_timed`; the guard keeps that row out of the real dev log.
+        let _data_env = DataDirTestEnv::new("run_script_is_refused_when_code_mode_disabled");
         let host = dispatch_host(false);
         let mut reg = Registry::default();
         reg.code_mode = false;
@@ -21643,6 +21647,11 @@ mod tests {
     /// the fallback [`Registry::default`] has `code_mode: true`.
     #[test]
     fn code_mode_flag_fails_closed_when_registry_load_fails() {
+        // Scratch data dir: while the gate is off every call below is refused before the audit
+        // writer, so this test writes nothing. Force the gate on, as a sabotage does, and the
+        // run_script dispatch reaches `audit::record_timed` and would append its row to the
+        // developer's real dev log. The guard keeps that local either way.
+        let _data_env = DataDirTestEnv::new("code_mode_flag_fails_closed_when_registry_load_fails");
         // The seed rule the boot path applies to a failed load, driven directly: if it
         // returned true, the host below would advertise and dispatch run_script, which the
         // assertions reject.
