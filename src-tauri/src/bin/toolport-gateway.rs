@@ -514,6 +514,7 @@ fn unsupported_version_error(id: Value, requested: &str) -> Value {
 /// aligned across eras, while the removed legacy `resources.subscribe` flag is
 /// omitted from modern discovery in favor of `subscriptions/listen`.
 fn gateway_capabilities(
+    host: &HostState,
     router: &Router,
     allowed: Option<&std::collections::HashSet<String>>,
     reg: &Registry,
@@ -567,7 +568,7 @@ fn gateway_capabilities(
             json!({
                 "version": "1.0.0",
                 "discoveryMode": discovery_mode.as_str(),
-                "codeMode": code_mode_enabled(),
+                "codeMode": host.code_mode_enabled(),
                 "agentControl": reg.allow_agent_control,
                 "destructiveConfirmation": reg.confirm_destructive
                     && !reg.human_approval_effective(),
@@ -1296,7 +1297,7 @@ fn confirm_tool_def() -> Value {
 const ROUTINE_AGENT_INSTRUCTIONS: &str = "Saved routines are advertised directly as `toolport_routine_*` tools; prefer one whose description matches the task over re-orchestrating the same steps. If no advertised Routine is a confident match, toolport_list_routines remains a catalog fallback before authoring a new parameterizable Code Mode orchestration with multiple MCP calls or significant local transformation. Use a Routine only when its description and input schema match the goal and every required argument can be supplied confidently; otherwise fall back to Code Mode. For a new reusable pattern, run Code Mode with immutable input plus an explicit inputSchema. When a tool result carries a `[Toolport advisor: ...]` note about repeated similar calls, prefer fetching the prepared draft with toolport_fetch_result and running it as one toolport_run_script call over continuing one-by-one. Only call toolport_save_routine when the user asks to persist or reuse this work: pass the runId from the run result or advisor note, and tell the user in one short sentence that a save-approval prompt is coming - a statement, not a question. Toolport also queues strong repeated patterns in the Toolport app where the user saves them directly; you never need to campaign for saving. Do not retry a save after denial or timeout. Every Routine execution re-enters current governance and receives no future permission from promotion approval.";
 
 /// The `toolport_run_script` "code mode" meta-tool (advertised only when
-/// [`code_mode_enabled`]). One script replaces many round-trips.
+/// [`HostState::code_mode_enabled`]). One script replaces many round-trips.
 fn run_script_tool_def() -> Value {
     json!({
         "name": "toolport_run_script",
@@ -1400,8 +1401,9 @@ fn run_routine_tool_def() -> Value {
     })
 }
 
-fn append_routine_tool_defs(tools: &mut Vec<Value>, allow_writes: bool) {
-    if !code_mode_enabled() {
+/// `host` is the gate: with code mode off, routines are not advertised at all.
+fn append_routine_tool_defs(host: &HostState, tools: &mut Vec<Value>, allow_writes: bool) {
+    if !host.code_mode_enabled() {
         return;
     }
     tools.push(list_routines_tool_def());
@@ -1731,66 +1733,17 @@ impl Drop for DiscoveryModeGuard {
     }
 }
 
-/// The live "code mode" flag, synced from the registry's `code_mode` on startup and by the
-/// registry watcher (like [`DISCOVERY_MODE`]). Read lock-free by [`code_mode_enabled`], so the
-/// six advertise/dispatch sites don't need a `Registry` threaded through them.
+/// The code-mode flag a registry load seeds (WS2-5).
 ///
-/// Host policy for the same reason as [`DISCOVERY_MODE`]: it is the registry's switch plus a
-/// process env override, not something one session can hold a different value for. P1.3
-/// takes it onto `HostState`.
-static CODE_MODE: AtomicBool = AtomicBool::new(false);
-
-/// Serializes tests that flip [`CODE_MODE`] so parallel cargo tests cannot leave
-/// the process flag stuck true (WS2-6).
-#[cfg(test)]
-static CODE_MODE_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-/// Holds [`CODE_MODE_TEST_LOCK`] and restores the flag's prior value on drop.
-///
-/// Restoring with a plain call after the assertions is not enough: a failing
-/// assertion unwinds past it and leaks the flag into every later test, and since
-/// every lock site recovers from poisoning with `PoisonError::into_inner`, those
-/// tests then run against state the failure left behind. One real failure would
-/// cascade into unrelated ones.
-#[cfg(test)]
-struct CodeModeGuard {
-    prev: bool,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-#[cfg(test)]
-impl CodeModeGuard {
-    fn acquire() -> Self {
-        let lock = CODE_MODE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Self {
-            prev: CODE_MODE.load(Ordering::Relaxed),
-            _lock: lock,
-        }
-    }
-}
-
-#[cfg(test)]
-impl Drop for CodeModeGuard {
-    fn drop(&mut self) {
-        set_code_mode_flag(self.prev);
-    }
-}
-
-fn set_code_mode_flag(enabled: bool) {
-    CODE_MODE.store(enabled, Ordering::Relaxed);
-}
-
-/// Seed [`CODE_MODE`] from a registry load outcome (WS2-5).
-///
-/// Successful loads copy `registry.code_mode`. Load failures must fail closed
-/// (`false`): [`Registry::default`] has `code_mode: true`, so seeding from the
-/// error fallback would silently re-enable code mode after a corrupt registry.
-fn seed_code_mode_after_registry_load(loaded: Result<&Registry, ()>) {
+/// A successful load copies `registry.code_mode`, which is the value a host's flag starts
+/// from (see [`HostState::code_mode_enabled`]). A load failure must fail closed (`false`):
+/// [`Registry::default`] has `code_mode: true`, so seeding from the error fallback would
+/// silently re-enable code mode after a corrupt registry. The watcher already fails safe by
+/// not touching the flag when a reload fails.
+fn seed_code_mode_after_registry_load(loaded: Result<&Registry, ()>) -> bool {
     match loaded {
-        Ok(reg) => set_code_mode_flag(reg.code_mode),
-        Err(()) => set_code_mode_flag(false),
+        Ok(reg) => reg.code_mode,
+        Err(()) => false,
     }
 }
 
@@ -1906,19 +1859,6 @@ fn grouped_discovery() -> bool {
     discovery_mode() == DiscoveryMode::Grouped
 }
 
-/// Gate for server-side "code mode" (the `toolport_run_script` meta-tool).
-///
-/// Policy (SOU-397): **on by default** via the registry's `code_mode` field (Settings
-/// switch, synced into [`CODE_MODE`]). Kill switch: turn Settings off. Code mode runs
-/// agent-supplied JS and is not a security boundary; each host call still passes the same
-/// scope / human-approval gates as `toolport_call_tool`. `TOOLPORT_CODE_MODE=1` (or legacy
-/// `CONDUIT_CODE_MODE`) still force-enables for power users and tests. When off, `run_script`
-/// is neither advertised nor dispatched.
-fn code_mode_enabled() -> bool {
-    let env_forced = conduit_lib::brand::env_flag("TOOLPORT_CODE_MODE", "CONDUIT_CODE_MODE");
-    env_forced || CODE_MODE.load(Ordering::Relaxed)
-}
-
 /// The server prefix of a *namespaced* tool (`server__tool`). `None` for a bare name
 /// (a meta-tool), so those never spawn a spurious `help_<meta>` browse tool. (Guard:
 /// `tool_prefix` returns the whole name when there is no `__`.)
@@ -1972,6 +1912,7 @@ fn help_tool_def(prefix: &str, tool_count: usize) -> Value {
 /// `catalog` must already be scoped to the calling client. Takes the two registry
 /// flags directly so callers needn't hold the registry lock across the router lock.
 fn grouped_tool_defs(
+    host: &HostState,
     allow_agent_control: bool,
     allow_routine_writes: bool,
     confirm_destructive: bool,
@@ -1983,10 +1924,10 @@ fn grouped_tool_defs(
         call_tool_def(),
         fetch_result_tool_def(),
     ];
-    if code_mode_enabled() {
+    if host.code_mode_enabled() {
         tools.push(run_script_tool_def());
     }
-    append_routine_tool_defs(&mut tools, allow_routine_writes);
+    append_routine_tool_defs(host, &mut tools, allow_routine_writes);
     if allow_agent_control {
         tools.push(enable_server_tool_def());
         tools.push(disable_server_tool_def());
@@ -5797,6 +5738,7 @@ fn candidate_caller(client: Option<&str>) -> String {
 /// promotion approval.
 #[allow(clippy::too_many_arguments)]
 fn advise_after_direct_call(
+    host: &HostState,
     reg: &Registry,
     router: &Router,
     cached: &[Value],
@@ -5810,7 +5752,7 @@ fn advise_after_direct_call(
 ) -> Value {
     // The advisor's whole output is Code Mode material; with the kill switch off the
     // hint would point at a disabled door.
-    if !code_mode_enabled() {
+    if !host.code_mode_enabled() {
         return result;
     }
     let ok = !result
@@ -7006,6 +6948,7 @@ fn refused_promotion_result(decision: approval::ApprovalDecision) -> Value {
 }
 
 fn save_routine_promotion_dispatch(
+    host: &HostState,
     reg: &Registry,
     candidates: &CandidateRegistry,
     client: Option<&str>,
@@ -7152,7 +7095,7 @@ fn save_routine_promotion_dispatch(
         .map(|fresh| fresh.allow_routine_writes)
         .unwrap_or(false);
     if lease.is_expired()
-        || !code_mode_enabled()
+        || !host.code_mode_enabled()
         || !fresh_writes_enabled
         || definition.verify().is_err()
         || audit::args_hash(&approval_payload) != approval_hash
@@ -7229,6 +7172,7 @@ fn save_routine_promotion_dispatch(
 
 #[cfg(test)]
 fn save_routine_dispatch(
+    host: &HostState,
     reg: &Registry,
     cached: &[Value],
     client: Option<&str>,
@@ -7406,7 +7350,7 @@ fn save_routine_dispatch(
         Ok(registry) => registry,
         Err(error) => return routine_error(format!("could not re-read the registry ({error}).")),
     };
-    if !code_mode_enabled() || !fresh.allow_routine_writes {
+    if !host.code_mode_enabled() || !fresh.allow_routine_writes {
         audit::record_routine(
             "save",
             definition.id(),
@@ -7638,6 +7582,7 @@ fn run_routine_dispatch(
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn handle_request(
+    host: &HostState,
     req: &Value,
     reg: &Registry,
     router: &Router,
@@ -7663,6 +7608,7 @@ fn handle_request(
         DiscoveryMode::Full
     };
     handle_request_with_cancel(
+        host,
         req,
         reg,
         router,
@@ -7685,6 +7631,7 @@ fn handle_request(
 
 #[allow(clippy::too_many_arguments)]
 fn handle_request_with_cancel(
+    host: &HostState,
     req: &Value,
     reg: &Registry,
     router: &Router,
@@ -7751,7 +7698,7 @@ fn handle_request_with_cancel(
             id,
             json!({
                 "supportedVersions": SUPPORTED_UPSTREAM_VERSIONS,
-                "capabilities": gateway_capabilities(router, allowed, reg, mode == DiscoveryMode::Lazy),
+                "capabilities": gateway_capabilities(host, router, allowed, reg, mode == DiscoveryMode::Lazy),
                 "instructions": format!("Toolport aggregates every configured MCP server behind one endpoint. In lazy discovery mode the catalog is reached through toolport_search_tools / toolport_call_tool rather than a full tools/list. {ROUTINE_AGENT_INSTRUCTIONS}"),
                 // server/discover is a cacheable operation. The list results grow
                 // these fields in SOU-454.
@@ -7782,7 +7729,7 @@ fn handle_request_with_cancel(
                 id,
                 json!({
                     "protocolVersion": proto,
-                    "capabilities": gateway_capabilities(router, allowed, reg, mode == DiscoveryMode::Lazy),
+                    "capabilities": gateway_capabilities(host, router, allowed, reg, mode == DiscoveryMode::Lazy),
                     "serverInfo": { "name": "toolport-gateway", "version": env!("CARGO_PKG_VERSION") },
                     "instructions": ROUTINE_AGENT_INSTRUCTIONS
                 }),
@@ -7801,10 +7748,10 @@ fn handle_request_with_cancel(
                 ];
                 // Code mode (on by default, Settings kill switch): one script that
                 // orchestrates many calls in a single round-trip.
-                if code_mode_enabled() {
+                if host.code_mode_enabled() {
                     tools.push(run_script_tool_def());
                 }
-                append_routine_tool_defs(&mut tools, reg.allow_routine_writes);
+                append_routine_tool_defs(host, &mut tools, reg.allow_routine_writes);
                 // Opt-in: surface the agent-control tools only when the user has
                 // allowed it, so an agent can't even see them otherwise.
                 if reg.allow_agent_control {
@@ -7878,6 +7825,7 @@ fn handle_request_with_cancel(
                     owner_of_exposed_tool(Some(router), &owners, n)
                 });
                 let mut tools = grouped_tool_defs(
+                    host,
                     reg.allow_agent_control,
                     reg.allow_routine_writes,
                     reg.confirm_destructive,
@@ -7916,10 +7864,10 @@ fn handle_request_with_cancel(
                 ));
             }
             let mut tools = vec![status_tool_def(), fetch_result_tool_def()];
-            if code_mode_enabled() {
+            if host.code_mode_enabled() {
                 tools.push(run_script_tool_def());
             }
-            append_routine_tool_defs(&mut tools, reg.allow_routine_writes);
+            append_routine_tool_defs(host, &mut tools, reg.allow_routine_writes);
             // The confirm tool is advertised only while confirmation is on.
             if reg.confirm_destructive {
                 tools.push(confirm_tool_def());
@@ -8400,7 +8348,7 @@ fn handle_request_with_cancel(
             // round-trip; intermediate results never enter model context. Opt-in, and needs
             // the shareable router (router_arc) to build the script's call binding.
             if name == "toolport_run_script" {
-                if !code_mode_enabled() {
+                if !host.code_mode_enabled() {
                     return Some(success(
                         id,
                         json!({
@@ -8457,7 +8405,7 @@ fn handle_request_with_cancel(
                 name.as_str(),
                 "toolport_save_routine" | "toolport_list_routines" | "toolport_run_routine"
             ) {
-                if !code_mode_enabled() {
+                if !host.code_mode_enabled() {
                     return Some(success(
                         id,
                         routine_error(
@@ -8469,6 +8417,7 @@ fn handle_request_with_cancel(
                     "toolport_save_routine" => {
                         let fallback = CandidateRegistry::default();
                         save_routine_promotion_dispatch(
+                            host,
                             reg,
                             candidates.unwrap_or(&fallback),
                             client,
@@ -8498,7 +8447,7 @@ fn handle_request_with_cancel(
             // `flattened_routine_tool_defs`). Rewrap the call and run it through the
             // exact same governed dispatch as an explicit `toolport_run_routine`.
             if name.starts_with(ROUTINE_TOOL_PREFIX) && !name.contains("__") {
-                if !code_mode_enabled() {
+                if !host.code_mode_enabled() {
                     return Some(success(
                         id,
                         routine_error(
@@ -8582,8 +8531,8 @@ fn handle_request_with_cancel(
             }
             let result = match (advisor, advisor_arguments) {
                 (Some(advisor), Some(arguments)) => advise_after_direct_call(
-                    reg, router, cached, client, allowed, candidates, advisor, &name, arguments,
-                    result,
+                    host, reg, router, cached, client, allowed, candidates, advisor, &name,
+                    arguments, result,
                 ),
                 _ => result,
             };
@@ -10921,7 +10870,7 @@ fn watch_tick(
             != new_reg.allow_routine_writes;
         // Refresh code mode from the freshly-loaded registry so a Settings toggle takes
         // effect without restarting the client (same live-refresh path as discovery mode).
-        set_code_mode_flag(new_reg.code_mode);
+        host.set_code_mode(new_reg.code_mode);
         // A team-metadata-only rewrite (usage watermark, sync version/etag, role) from
         // the desktop sync loop changes nothing the router depends on. Update the stored
         // copy but skip the rebuild, so a routine sync never re-spawns every stdio server
@@ -11196,6 +11145,15 @@ struct HostState {
     /// [`preserve_collapsed_servers_guarded`]. The streak belongs to the host's one
     /// router, so one host means one map.
     rebuild_shrink_streaks: Mutex<HashMap<String, u8>>,
+    /// The live "code mode" flag (SOU-397 policy), synced from the registry's `code_mode`
+    /// at boot ([`seed_code_mode_after_registry_load`]) and by the registry watcher on every
+    /// reload, the same live-refresh path as discovery mode.
+    ///
+    /// Host policy, not session state: it is the registry's switch plus a process env
+    /// override, so every session on one host sees the same value and a second host must not
+    /// read the first one's. Read via [`HostState::code_mode_enabled`], set via
+    /// [`HostState::set_code_mode`].
+    code_mode: AtomicBool,
     /// Whether the last quarantine-store read failed. [`effective_quarantine`] owns it:
     /// it stores `true` (and warns once per failing streak) when the store cannot be
     /// read, and stores `false` again as soon as a read succeeds.
@@ -11240,6 +11198,25 @@ impl HostState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         preserve_collapsed_servers(new_tools, previous, &mut streaks)
+    }
+
+    /// Gate for server-side "code mode" (the `toolport_run_script` meta-tool).
+    ///
+    /// Policy (SOU-397): **on by default** via the registry's `code_mode` field (Settings
+    /// switch, synced into this host's flag). Kill switch: turn Settings off. Code mode runs
+    /// agent-supplied JS and is not a security boundary; each host call still passes the same
+    /// scope / human-approval gates as `toolport_call_tool`. `TOOLPORT_CODE_MODE=1` (or legacy
+    /// `CONDUIT_CODE_MODE`) still force-enables for power users and tests. When off, `run_script`
+    /// is neither advertised nor dispatched.
+    fn code_mode_enabled(&self) -> bool {
+        let env_forced = conduit_lib::brand::env_flag("TOOLPORT_CODE_MODE", "CONDUIT_CODE_MODE");
+        env_forced || self.code_mode.load(Ordering::Relaxed)
+    }
+
+    /// Set this host's code-mode flag: the registry load at boot, the registry watcher on
+    /// every reload, and a test that drives the switch.
+    fn set_code_mode(&self, enabled: bool) {
+        self.code_mode.store(enabled, Ordering::Relaxed);
     }
 }
 
@@ -13263,6 +13240,7 @@ fn process_request(
         return handle_resource_subscription(state, &router, req, allowed, cancel.as_ref(), method);
     }
     handle_request_with_cancel(
+        state,
         req,
         &reg,
         &router,
@@ -13501,10 +13479,10 @@ fn http_tool_defs(
             call_tool_def(),
             fetch_result_tool_def(),
         ];
-        if code_mode_enabled() {
+        if state.code_mode_enabled() {
             tools.push(run_script_tool_def());
         }
-        append_routine_tool_defs(&mut tools, allow_routine_writes);
+        append_routine_tool_defs(state, &mut tools, allow_routine_writes);
         if allow_agent {
             tools.push(enable_server_tool_def());
             tools.push(disable_server_tool_def());
@@ -13527,6 +13505,7 @@ fn http_tool_defs(
         });
         drop(router);
         grouped_tool_defs(
+            state,
             allow_agent,
             allow_routine_writes,
             confirm_destructive,
@@ -13534,10 +13513,10 @@ fn http_tool_defs(
         )
     } else {
         let mut tools = vec![status_tool_def(), fetch_result_tool_def()];
-        if code_mode_enabled() {
+        if state.code_mode_enabled() {
             tools.push(run_script_tool_def());
         }
-        append_routine_tool_defs(&mut tools, allow_routine_writes);
+        append_routine_tool_defs(state, &mut tools, allow_routine_writes);
         tools.extend(catalog());
         tools
     }
@@ -16216,7 +16195,14 @@ fn main() {
     // fallback to `Registry::default()`, and an Ok whose contents came from a
     // backup or stood in for a file that could not be read. Only a load that
     // actually saw the configured state may be read as "no clients".
-    let (loaded, registry_loaded) = match registry::load_resolved_with_source() {
+    let load_outcome = registry::load_resolved_with_source();
+    // The host's code-mode flag starts from this load *outcome*, not from the registry value
+    // it falls back to: `Registry::default()` has `code_mode: true`, so seeding from the
+    // error fallback would silently re-enable code mode after a corrupt registry (WS2-5).
+    // The watcher already fails safe by not touching the flag when a reload fails.
+    let code_mode_seed =
+        seed_code_mode_after_registry_load(load_outcome.as_ref().map(|(r, _)| r).map_err(|_| ()));
+    let (loaded, registry_loaded) = match load_outcome {
         Ok((r, source)) => {
             glog(&format!(
                 "load_resolved OK ({source:?}): {} servers total, {} enabled (active={})",
@@ -16224,11 +16210,6 @@ fn main() {
                 r.enabled_servers().len(),
                 r.active_profile_id()
             ));
-            // Seed code mode only on a successful load. Registry::default() has
-            // code_mode: true, so seeding from the error fallback would silently
-            // re-enable code mode after a corrupt registry (WS2-5). The watcher
-            // already fails safe by not updating the flag on reload failure.
-            seed_code_mode_after_registry_load(Ok(&r));
             if !source.is_authoritative() {
                 eprintln!(
                     "toolport-gateway: registry was recovered or could not be read ({source:?}); \
@@ -16249,7 +16230,6 @@ fn main() {
                  Fix or recreate the registry to restore full functionality."
             );
             glog(&format!("load_resolved ERR: {e}"));
-            seed_code_mode_after_registry_load(Err(()));
             (registry::Registry::default(), false)
         }
     };
@@ -16351,6 +16331,7 @@ fn main() {
         last_activity_ms: AtomicU64::new(0),
         rebuild_shrink_streaks: Mutex::new(HashMap::new()),
         quarantine_read_failed: AtomicBool::new(false),
+        code_mode: AtomicBool::new(code_mode_seed),
     });
     glog(&format!(
         "loaded tool cache: {} tools",
@@ -16778,9 +16759,7 @@ mod tests {
     ///
     /// Hold one whenever a test can reach [`audit`] or [`searchtrace::record`]. Fields drop
     /// in declaration order after the `Drop` impl runs, so the override is released before
-    /// the lock and the next test never inherits it. When a test also needs `CodeModeGuard`,
-    /// take this first: every such test in this module locks ENV_LOCK before CODE_MODE, and
-    /// the reverse order would invert the two.
+    /// the lock and the next test never inherits it.
     struct DataDirTestEnv {
         dir: std::path::PathBuf,
         _data_dir: conduit_lib::registry::DataDirOverride,
@@ -17345,11 +17324,13 @@ mod tests {
     fn a_bad_tools_call_is_a_tool_error_not_a_protocol_error() {
         let _data_env =
             DataDirTestEnv::new("a_bad_tools_call_is_a_tool_error_not_a_protocol_error");
+        let host = dispatch_host(false);
         // SEP-1303 (SBS-452): input/routing failures on tools/call must come back as
         // tool execution errors so the model can read them and self-correct. A
         // JSON-RPC error is invisible to the model and ends the turn instead.
         let reg = Registry::default();
         let resp = handle_request(
+            &host,
             &json!({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
                 "params": { "name": "nosuch__tool", "arguments": { "x": 1 } }
@@ -19818,8 +19799,8 @@ mod tests {
         // without it, this test's override drop mid-way through a parallel test redirected
         // that test's routine writes into the developer's REAL data directory.
         let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let _code_mode = CodeModeGuard::acquire();
-        set_code_mode_flag(true);
+        let host = dispatch_host(false);
+        host.set_code_mode(true);
         let dir = std::env::temp_dir().join(format!(
             "toolport-code-run-candidate-{}",
             routines::generate_id().unwrap()
@@ -19871,6 +19852,7 @@ mod tests {
         let (broker, requests) =
             spawn_approval_broker(&dir, approval::ApprovalDecision::Approved, None);
         let promoted = save_routine_promotion_dispatch(
+            &host,
             &reg,
             &candidates,
             None,
@@ -20418,14 +20400,11 @@ mod tests {
         );
     }
 
-    /// Kill switch path: when the live flag is off, dispatch refuses
+    /// Kill switch path: when this host's flag is off, dispatch refuses
     /// `toolport_run_script`. Production seeds the flag from the registry at boot.
     #[test]
     fn run_script_is_refused_when_code_mode_disabled() {
-        // WS2-6: drive the live atomic. Serialize so parallel tests cannot leave
-        // CODE_MODE stuck true (and so tools/list counts stay stable).
-        let _guard = CodeModeGuard::acquire();
-        set_code_mode_flag(false);
+        let host = dispatch_host(false);
         let mut reg = Registry::default();
         reg.code_mode = false;
         let router = routed_router("s", "tool");
@@ -20436,6 +20415,7 @@ mod tests {
             "params": { "name": "toolport_run_script", "arguments": { "script": "return 1;" } }
         });
         let resp = handle_request(
+            &host,
             &req,
             &reg,
             &router,
@@ -20455,13 +20435,59 @@ mod tests {
             .contains("code mode is disabled"));
     }
 
-    /// WS2-6: live CODE_MODE atomic gates `handle_request_with_cancel` (the
+    /// P1.3: the code-mode flag belongs to the host, so one host's switch cannot decide
+    /// what another host advertises.
+    ///
+    /// Teeth: with the flag back on a process static, both lists come from the one value and
+    /// one of these assertions fails. It also covers the WS2-6 flake class the old global
+    /// had, because two hosts here hold different values at the same time with no lock
+    /// between them.
+    #[test]
+    fn code_mode_is_per_host() {
+        let on = dispatch_host(true);
+        let off = dispatch_host(false);
+        let reg = Registry::default();
+        let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+        let advertised = |host: &HostState| -> Vec<String> {
+            let resp = handle_request(
+                host,
+                &req,
+                &reg,
+                &router(),
+                &[],
+                true,
+                None,
+                &SearchGuard::default(),
+                &ConfirmGuard::new(),
+                None,
+                None,
+            )
+            .unwrap();
+            resp["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|t| t["name"].as_str().map(str::to_string))
+                .collect()
+        };
+
+        assert!(
+            advertised(&on).contains(&"toolport_run_script".to_string()),
+            "a host with code mode on must advertise run_script"
+        );
+        assert!(
+            !advertised(&off).contains(&"toolport_run_script".to_string()),
+            "a host with code mode off must not advertise run_script"
+        );
+    }
+
+    /// WS2-6: the host's code-mode flag gates `handle_request_with_cancel` (the
     /// production path that passes a shareable router Arc). Plain `handle_request`
     /// always passes `router_arc: None`, so it cannot assert a successful run.
     #[test]
     fn run_script_respects_live_code_mode_flag() {
         let _data_env = DataDirTestEnv::new("run_script_respects_live_code_mode_flag");
-        let _guard = CodeModeGuard::acquire();
+        let host = dispatch_host(false);
         let reg = Registry::default();
         let router = Arc::new(routed_router("s", "tool"));
         let search_index = CatalogSearchIndex::build(&[]);
@@ -20472,8 +20498,9 @@ mod tests {
             "params": { "name": "toolport_run_script", "arguments": { "script": "return 42;" } }
         });
 
-        set_code_mode_flag(false);
+        host.set_code_mode(false);
         let refused = handle_request_with_cancel(
+            &host,
             &req,
             &reg,
             &router,
@@ -20499,8 +20526,9 @@ mod tests {
             .unwrap()
             .contains("code mode is disabled"));
 
-        set_code_mode_flag(true);
+        host.set_code_mode(true);
         let allowed = handle_request_with_cancel(
+            &host,
             &req,
             &reg,
             &router,
@@ -20552,9 +20580,13 @@ mod tests {
 
     #[test]
     fn routine_write_opt_in_defaults_off_and_controls_advertisement() {
-        let _guard = CodeModeGuard::acquire();
+        // One host for the whole test body: the dispatch wrapper and the HTTP tool list each
+        // read the code-mode flag off the host they are handed, and a process global used to
+        // make those two agree by accident.
+        let state = http_state(true);
+        state.set_code_mode(true);
+        let host = Arc::clone(&state.host);
         let _discovery = DiscoveryModeGuard::acquire();
-        set_code_mode_flag(true);
         let list_req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
         let router = router();
         let listed_names = |listed: &Value| {
@@ -20573,6 +20605,7 @@ mod tests {
             serde_json::from_str(r#"{"version":1,"servers":[],"profiles":[]}"#).unwrap();
         assert!(!legacy.allow_routine_writes);
         let listed = handle_request(
+            &host,
             &list_req,
             &reg,
             &router,
@@ -20599,6 +20632,7 @@ mod tests {
         ] {
             set_discovery_mode(mode);
             let listed = handle_request(
+                &host,
                 &list_req,
                 &enabled,
                 &router,
@@ -20626,7 +20660,6 @@ mod tests {
         }
 
         set_discovery_mode(DiscoveryMode::Lazy);
-        let state = http_state(true);
         *state.registry.lock().unwrap() = enabled;
         let http_names: std::collections::HashSet<String> = http_tool_defs(&state, None, DiscoveryMode::Lazy)
             .iter()
@@ -20652,9 +20685,9 @@ mod tests {
     #[test]
     fn flattened_routine_tools_are_advertised_and_run() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let _code_mode = CodeModeGuard::acquire();
+        let host = dispatch_host(false);
         let _discovery = DiscoveryModeGuard::acquire();
-        set_code_mode_flag(true);
+        host.set_code_mode(true);
         set_discovery_mode(DiscoveryMode::Lazy);
         let dir = std::env::temp_dir().join(format!(
             "toolport-routine-flatten-{}",
@@ -20726,6 +20759,7 @@ mod tests {
         let search_index = CatalogSearchIndex::build(&catalog);
         let list = |req: &Value| {
             handle_request_with_cancel(
+                &host,
                 req,
                 &reg,
                 &router,
@@ -20824,7 +20858,7 @@ mod tests {
             .contains("toolport_list_routines"));
 
         // Code Mode off hides the flattened aliases entirely.
-        set_code_mode_flag(false);
+        host.set_code_mode(false);
         let hidden = list(&json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/list" }));
         assert!(
             !hidden["result"]["tools"]
@@ -20880,8 +20914,8 @@ mod tests {
     fn advisor_fan_out_hint_mints_synthesized_candidate_and_persists_via_approval() {
         // ENV_LOCK serializes the DataDirOverride below (see registry::DataDirOverride).
         let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let _code_mode = CodeModeGuard::acquire();
-        set_code_mode_flag(true);
+        let host = dispatch_host(false);
+        host.set_code_mode(true);
         let dir = std::env::temp_dir().join(format!(
             "toolport-advisor-e2e-{}",
             routines::generate_id().unwrap()
@@ -20898,6 +20932,7 @@ mod tests {
         let search_index = CatalogSearchIndex::build(&catalog);
         let direct = |id: usize, value: &str| {
             handle_request_with_cancel(
+                &host,
                 &json!({
                     "jsonrpc": "2.0", "id": id, "method": "tools/call",
                     "params": { "name": "s__work", "arguments": { "value": value } }
@@ -20970,6 +21005,7 @@ mod tests {
         let (broker, requests) =
             spawn_approval_broker(&dir, approval::ApprovalDecision::Approved, None);
         let promoted = save_routine_promotion_dispatch(
+            &host,
             &reg,
             &candidates,
             None,
@@ -21002,8 +21038,8 @@ mod tests {
     fn advisor_second_burst_publishes_a_suggestion_instead_of_talking_to_the_model() {
         // ENV_LOCK serializes the DataDirOverride below (see registry::DataDirOverride).
         let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let _code_mode = CodeModeGuard::acquire();
-        set_code_mode_flag(true);
+        let host = dispatch_host(false);
+        host.set_code_mode(true);
         let dir = std::env::temp_dir().join(format!(
             "toolport-advisor-strong-{}",
             routines::generate_id().unwrap()
@@ -21019,6 +21055,7 @@ mod tests {
         let candidates = CandidateRegistry::default();
         let observe = |value: &str, is_error: bool| {
             advise_after_direct_call(
+                &host,
                 &reg,
                 &router,
                 &catalog,
@@ -21166,19 +21203,18 @@ mod tests {
 
     #[test]
     fn advisor_stays_silent_without_a_ledger_or_with_code_mode_off() {
-        // ENV_LOCK first, then CodeModeGuard, matching every other test that holds both
-        // (see registry::DataDirOverride). The advisor path can audit via record_candidate
-        // and record_advisor_hint when a parallel test flips CODE_MODE on, so it needs a
-        // scratch data dir as well as the lock.
+        // The advisor path can audit via record_candidate and record_advisor_hint, so this
+        // test needs a scratch data dir and ENV_LOCK (see registry::DataDirOverride).
         let _data_env =
             DataDirTestEnv::new("advisor_stays_silent_without_a_ledger_or_with_code_mode_off");
-        let _code_mode = CodeModeGuard::acquire();
-        set_code_mode_flag(false);
+        let host = dispatch_host(false);
+        host.set_code_mode(false);
         let advisor = AdvisorLedger::default();
         let (router, _calls, catalog) = counting_router(false);
         // Code mode off: the ledger is consulted but never hints at a disabled door.
         for value in ["a", "b", "c", "d"] {
             let result = advise_after_direct_call(
+                &host,
                 &Registry::default(),
                 &router,
                 &catalog,
@@ -21199,8 +21235,8 @@ mod tests {
     fn routine_prefix_does_not_intercept_a_namespaced_downstream_tool() {
         let _data_env =
             DataDirTestEnv::new("routine_prefix_does_not_intercept_a_namespaced_downstream_tool");
-        let _code_mode = CodeModeGuard::acquire();
-        set_code_mode_flag(true);
+        let host = dispatch_host(false);
+        host.set_code_mode(true);
         let calls = Arc::new(AtomicUsize::new(0));
         let downstream = DownstreamServer::connect(
             "toolport_routine_backend".to_string(),
@@ -21215,6 +21251,7 @@ mod tests {
         let router = Arc::new(router);
         let catalog = router.aggregated_tools();
         let response = handle_request(
+            &host,
             &json!({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
                 "params": {
@@ -21240,11 +21277,10 @@ mod tests {
 
     #[test]
     fn guessed_save_routine_is_refused_while_writes_are_disabled() {
-        // Same order as above: ENV_LOCK before CodeModeGuard.
         let _data_env =
             DataDirTestEnv::new("guessed_save_routine_is_refused_while_writes_are_disabled");
-        let _guard = CodeModeGuard::acquire();
-        set_code_mode_flag(true);
+        let host = dispatch_host(false);
+        host.set_code_mode(true);
         let reg = Registry::default();
         let router = router();
         let req = json!({
@@ -21262,6 +21298,7 @@ mod tests {
             }
         });
         let response = handle_request(
+            &host,
             &req,
             &reg,
             &router,
@@ -21339,8 +21376,8 @@ mod tests {
     #[test]
     fn routine_save_denial_timeout_and_unreachable_never_write() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let _code_mode = CodeModeGuard::acquire();
-        set_code_mode_flag(true);
+        let host = dispatch_host(false);
+        host.set_code_mode(true);
 
         for (label, decision) in [
             ("unreachable", None),
@@ -21362,6 +21399,7 @@ mod tests {
                 (handle, requests)
             });
             let result = save_routine_dispatch(
+                &host,
                 &reg,
                 &[],
                 Some("routine-test"),
@@ -21431,8 +21469,8 @@ mod tests {
     #[test]
     fn routine_save_rejects_credentials_in_description_and_schema_without_writing() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let _code_mode = CodeModeGuard::acquire();
-        set_code_mode_flag(true);
+        let host = dispatch_host(false);
+        host.set_code_mode(true);
         let dir = std::env::temp_dir().join(format!(
             "toolport-routine-save-credentials-{}",
             routines::generate_id().unwrap()
@@ -21446,6 +21484,7 @@ mod tests {
         let mut description_credential = routine_save_arguments("SOURCE", "ARGUMENT");
         description_credential["description"] = json!("password = \"abcdefghijklmnop\"");
         let description_result = save_routine_dispatch(
+            &host,
             &reg,
             &[],
             Some("routine-test"),
@@ -21458,8 +21497,14 @@ mod tests {
         let mut schema_credential = routine_save_arguments("SOURCE", "ARGUMENT");
         schema_credential["inputSchema"]["properties"]["value"]["default"] =
             json!("api_key: \"abcdefghijklmnop\"");
-        let schema_result =
-            save_routine_dispatch(&reg, &[], Some("routine-test"), None, &schema_credential);
+        let schema_result = save_routine_dispatch(
+            &host,
+            &reg,
+            &[],
+            Some("routine-test"),
+            None,
+            &schema_credential,
+        );
         assert_eq!(schema_result["isError"], true);
         assert!(schema_result.to_string().contains("credential-like"));
 
@@ -21473,8 +21518,8 @@ mod tests {
     #[test]
     fn approved_routine_save_is_content_bound_idempotent_and_audit_safe() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let _code_mode = CodeModeGuard::acquire();
-        set_code_mode_flag(true);
+        let host = dispatch_host(false);
+        host.set_code_mode(true);
         let dir = std::env::temp_dir().join(format!(
             "toolport-routine-save-approved-{}",
             routines::generate_id().unwrap()
@@ -21489,7 +21534,8 @@ mod tests {
         let save_once = || {
             let (broker, requests) =
                 spawn_approval_broker(&dir, approval::ApprovalDecision::Approved, None);
-            let result = save_routine_dispatch(&reg, &[], Some("routine-test"), None, &arguments);
+            let result =
+                save_routine_dispatch(&host, &reg, &[], Some("routine-test"), None, &arguments);
             let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
             broker.join().unwrap();
             (result, request)
@@ -21546,8 +21592,8 @@ mod tests {
     #[test]
     fn disabling_routine_writes_during_approval_prevents_the_save() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let _code_mode = CodeModeGuard::acquire();
-        set_code_mode_flag(true);
+        let host = dispatch_host(false);
+        host.set_code_mode(true);
         let dir = std::env::temp_dir().join(format!(
             "toolport-routine-save-toggle-{}",
             routines::generate_id().unwrap()
@@ -21573,6 +21619,7 @@ mod tests {
             Some(before_reply),
         );
         let result = save_routine_dispatch(
+            &host,
             &reg,
             &[],
             Some("routine-test"),
@@ -21596,11 +21643,10 @@ mod tests {
     /// the fallback [`Registry::default`] has `code_mode: true`.
     #[test]
     fn code_mode_flag_fails_closed_when_registry_load_fails() {
-        let _guard = CodeModeGuard::acquire();
-        set_code_mode_flag(true);
-
-        // Same helper the boot path uses on Err(load_resolved).
-        seed_code_mode_after_registry_load(Err(()));
+        // The seed rule the boot path applies to a failed load, driven directly: if it
+        // returned true, the host below would advertise and dispatch run_script, which the
+        // assertions reject.
+        let host = dispatch_host(seed_code_mode_after_registry_load(Err(())));
         let reg = Registry::default();
         assert!(
             reg.code_mode,
@@ -21609,6 +21655,7 @@ mod tests {
 
         let list_req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
         let list = handle_request(
+            &host,
             &list_req,
             &reg,
             &router(),
@@ -21655,6 +21702,7 @@ mod tests {
                 "params": { "name": name, "arguments": arguments }
             });
             let call = handle_request(
+                &host,
                 &call_req,
                 &reg,
                 &routed_router("s", "tool"),
@@ -21940,6 +21988,7 @@ mod tests {
             resource_updated_sink,
             rebuild_shrink_streaks: Mutex::new(HashMap::new()),
             quarantine_read_failed: AtomicBool::new(false),
+            code_mode: AtomicBool::new(false),
             mcp_sessions: mcp_sessions.unwrap_or_else(|| Arc::new(Mutex::new(HashMap::new()))),
             daemon_mode: AtomicBool::new(false),
             last_activity_ms: AtomicU64::new(0),
@@ -21985,12 +22034,28 @@ mod tests {
                 last_activity_ms: AtomicU64::new(0),
                 rebuild_shrink_streaks: Mutex::new(HashMap::new()),
                 quarantine_read_failed: AtomicBool::new(false),
+                code_mode: AtomicBool::new(false),
             }),
             profile: Arc::new(Mutex::new(None)),
             stdio_upstream,
             client_id: None,
             env_profile: None,
         }
+    }
+
+    /// A host for a test that dispatches with its own registry/router/catalog locals.
+    ///
+    /// Those locals stay parameters of the dispatch entry points. The host carries the
+    /// host-scoped state the dispatch core reads off it, so a test that needs a code-mode
+    /// value sets it on the host it dispatches with instead of on a process global.
+    ///
+    /// Bind ONE per test body and pass it to every call in that body: a fresh host per call
+    /// would reset the host-scoped state between calls and quietly weaken a test that
+    /// dispatches more than once.
+    fn dispatch_host(code_mode: bool) -> Arc<HostState> {
+        let state = http_state(false);
+        state.set_code_mode(code_mode);
+        Arc::clone(&state.host)
     }
 
     /// Swap the host's live router, the way a rebuild does: the field's identity is
@@ -23385,6 +23450,7 @@ mod tests {
     #[test]
     fn scoped_call_to_out_of_scope_server_is_refused() {
         let _data_env = DataDirTestEnv::new("scoped_call_to_out_of_scope_server_is_refused");
+        let host = dispatch_host(false);
         let reg = Registry::default();
         let allowed: std::collections::HashSet<String> =
             ["vercel".to_string()].into_iter().collect();
@@ -23394,6 +23460,7 @@ mod tests {
             "params": { "name": "resend__send", "arguments": {} }
         });
         let resp = handle_request(
+            &host,
             &req,
             &reg,
             &router(),
@@ -23423,6 +23490,7 @@ mod tests {
             "params": { "name": "vercel__deploy", "arguments": {} }
         });
         let resp_ok = handle_request(
+            &host,
             &req_ok,
             &reg,
             // A routed router so `vercel__deploy` resolves to server `vercel` (in scope)
@@ -25451,12 +25519,14 @@ mod tests {
 
     #[test]
     fn initialize_echoes_protocol_and_advertises_tools() {
+        let host = dispatch_host(false);
         let reg = Registry::default();
         let req = json!({
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": { "protocolVersion": "2025-06-18" }
         });
         let resp = handle_request(
+            &host,
             &req,
             &reg,
             &router(),
@@ -25901,9 +25971,11 @@ mod tests {
 
     /// Dispatch one request with the default test rig.
     fn dispatch(req: &Value) -> Value {
+        let host = dispatch_host(false);
         let reg = Registry::default();
         let router = routed_router("s", "tool");
         handle_request(
+            &host,
             req,
             &reg,
             &router,
@@ -26085,14 +26157,15 @@ mod tests {
 
     #[test]
     fn toolport_extension_reports_active_features_without_gating_core_tools() {
-        let _code_mode = CodeModeGuard::acquire();
-        set_code_mode_flag(true);
+        let host = dispatch_host(false);
+        host.set_code_mode(true);
         let mut reg = Registry::default();
         reg.allow_agent_control = true;
         reg.confirm_destructive = true;
         let router = Router::new();
         let request = modern_req(1, "server/discover", json!({}));
         let response = handle_request(
+            &host,
             &request,
             &reg,
             &router,
@@ -26115,6 +26188,7 @@ mod tests {
 
         reg.human_approval = true;
         let human_gated = handle_request(
+            &host,
             &modern_req(3, "server/discover", json!({})),
             &reg,
             &router,
@@ -26135,6 +26209,7 @@ mod tests {
         // No client extension opt-in is required: the extension describes the
         // existing core tools, which remain the graceful-degradation path.
         let tools = handle_request(
+            &host,
             &modern_req(4, "tools/list", json!({})),
             &reg,
             &router,
@@ -26160,6 +26235,7 @@ mod tests {
 
     #[test]
     fn server_discover_aggregates_only_relayable_extensions_in_scope() {
+        let host = dispatch_host(false);
         struct ExtensionServer;
 
         impl Transport for ExtensionServer {
@@ -26207,6 +26283,7 @@ mod tests {
         );
         let request = modern_req(11, "server/discover", json!({}));
         let response = handle_request(
+            &host,
             &request,
             &reg,
             &router,
@@ -26237,6 +26314,7 @@ mod tests {
 
         let allowed = std::collections::HashSet::from(["other".to_string()]);
         let scoped = handle_request(
+            &host,
             &request,
             &reg,
             &router,
@@ -26376,6 +26454,7 @@ mod tests {
 
     #[test]
     fn lazy_discovery_keeps_ui_linked_tools_only_for_apps_hosts() {
+        let host = dispatch_host(false);
         let reg = Registry::default();
         let mut router = Router::new();
         router.add(
@@ -26386,6 +26465,7 @@ mod tests {
         let confirm = ConfirmGuard::new();
 
         let discovered = handle_request(
+            &host,
             &modern_req(0, "server/discover", json!({})),
             &reg,
             &router,
@@ -26404,6 +26484,7 @@ mod tests {
         );
 
         let apps = handle_request(
+            &host,
             &modern_apps_req(1, "tools/list", json!({})),
             &reg,
             &router,
@@ -26436,6 +26517,7 @@ mod tests {
         );
 
         let ordinary = handle_request(
+            &host,
             &modern_req(2, "tools/list", json!({})),
             &reg,
             &router,
@@ -26463,6 +26545,7 @@ mod tests {
             }
         });
         let wrong_mime = handle_request(
+            &host,
             &wrong_mime,
             &reg,
             &router,
@@ -26488,6 +26571,7 @@ mod tests {
     fn app_only_tools_stay_out_of_model_facing_gateway_paths() {
         let _data_env =
             DataDirTestEnv::new("app_only_tools_stay_out_of_model_facing_gateway_paths");
+        let host = dispatch_host(false);
         let reg = Registry::default();
         let mut router = Router::new();
         router.add(
@@ -26498,6 +26582,7 @@ mod tests {
         let confirm = ConfirmGuard::new();
 
         let ordinary_full = handle_request(
+            &host,
             &modern_req(10, "tools/list", json!({})),
             &reg,
             &router,
@@ -26517,6 +26602,7 @@ mod tests {
             .all(|tool| tool["name"] != "apps__app_only"));
 
         let apps_full = handle_request(
+            &host,
             &modern_apps_req(11, "tools/list", json!({})),
             &reg,
             &router,
@@ -26536,6 +26622,7 @@ mod tests {
             .any(|tool| tool["name"] == "apps__app_only"));
 
         let searched = handle_request(
+            &host,
             &modern_apps_req(
                 12,
                 "tools/call",
@@ -26558,6 +26645,7 @@ mod tests {
         assert!(!searched.to_string().contains("apps__app_only"));
 
         let nested = handle_request(
+            &host,
             &modern_apps_req(
                 13,
                 "tools/call",
@@ -26584,6 +26672,7 @@ mod tests {
             .contains("available only to its MCP App"));
 
         let direct = handle_request(
+            &host,
             &modern_apps_req(
                 14,
                 "tools/call",
@@ -26605,6 +26694,7 @@ mod tests {
 
     #[test]
     fn negotiated_mcp_app_html_passes_through_without_content_defense_rewrite() {
+        let host = dispatch_host(false);
         let reg = Registry::default();
         assert!(
             reg.content_defense_effective(),
@@ -26615,6 +26705,7 @@ mod tests {
             DownstreamServer::connect("apps".into(), Box::new(McpAppsServer::default())).unwrap(),
         );
         let response = handle_request(
+            &host,
             &modern_apps_req(
                 3,
                 "resources/read",
@@ -26642,6 +26733,7 @@ mod tests {
         );
 
         let ordinary = handle_request(
+            &host,
             &modern_req(
                 4,
                 "resources/read",
@@ -26711,6 +26803,7 @@ mod tests {
 
     #[test]
     fn modern_cacheable_results_preserve_hints_and_scoping_fails_private() {
+        let host = dispatch_host(false);
         let reg = Registry::default();
         let router = cache_router();
         let guard = SearchGuard::default();
@@ -26729,6 +26822,7 @@ mod tests {
 
         for (index, (method, params, max_ttl)) in cases.into_iter().enumerate() {
             let response = handle_request(
+                &host,
                 &modern_req(index as i64 + 10, method, params),
                 &reg,
                 &router,
@@ -26751,6 +26845,7 @@ mod tests {
         }
 
         let scoped = handle_request(
+            &host,
             &modern_req(20, "tools/list", json!({})),
             &reg,
             &router,
@@ -26766,6 +26861,7 @@ mod tests {
         assert_eq!(scoped["result"]["cacheScope"], "private");
 
         let legacy = handle_request(
+            &host,
             &json!({
                 "jsonrpc": "2.0",
                 "id": 21,
@@ -27477,9 +27573,11 @@ mod tests {
 
     #[test]
     fn notifications_get_no_reply() {
+        let host = dispatch_host(false);
         let reg = Registry::default();
         let note = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
         assert!(handle_request(
+            &host,
             &note,
             &reg,
             &router(),
@@ -27496,9 +27594,11 @@ mod tests {
 
     #[test]
     fn tools_list_always_includes_status() {
+        let host = dispatch_host(false);
         let reg = Registry::default();
         let req = json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/list" });
         let resp = handle_request(
+            &host,
             &req,
             &reg,
             &router(),
@@ -27522,6 +27622,7 @@ mod tests {
 
     #[test]
     fn status_tool_reports_enabled_servers() {
+        let host = dispatch_host(false);
         let mut reg = Registry::default();
         let id = reg.add_server(registry::ServerEntry {
             id: String::new(),
@@ -27548,6 +27649,7 @@ mod tests {
             "params": { "name": "toolport_status", "arguments": {} }
         });
         let resp = handle_request(
+            &host,
             &req,
             &reg,
             &router(),
@@ -27567,9 +27669,11 @@ mod tests {
 
     #[test]
     fn unknown_method_is_jsonrpc_error() {
+        let host = dispatch_host(false);
         let reg = Registry::default();
         let req = json!({ "jsonrpc": "2.0", "id": 9, "method": "frobnicate" });
         let resp = handle_request(
+            &host,
             &req,
             &reg,
             &router(),
@@ -27595,15 +27699,16 @@ mod tests {
 
     #[test]
     fn lazy_tools_list_returns_only_meta_tools() {
-        // Hold CODE_MODE_TEST_LOCK: other tests flip the global atomic, and an
-        // exact tool count of 4 assumes run_script is not advertised.
-        let _guard = CodeModeGuard::acquire();
-        set_code_mode_flag(false);
+        let host = dispatch_host(false);
+        // The exact tool count of 4 assumes run_script is not advertised, and the flag on
+        // the host this test dispatches with is the only thing that decides that.
+        host.set_code_mode(false);
 
         let reg = Registry::default();
         let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
         // Even with a full cached catalog, lazy mode advertises just the meta-tools.
         let resp = handle_request(
+            &host,
             &req,
             &reg,
             &router(),
@@ -27672,11 +27777,13 @@ mod tests {
     /// reach the model verbatim otherwise.
     #[test]
     fn full_tools_list_neutralizes_spoofs_outside_the_description() {
+        let host = dispatch_host(false);
         let _discovery = DiscoveryModeGuard::acquire();
         set_discovery_mode(DiscoveryMode::Full);
         let poisoned = vec![spoofed_tool("resend__send_email")];
         let reg = Registry::default();
         let resp = handle_request(
+            &host,
             &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
             &reg,
             &router(),
@@ -27760,11 +27867,13 @@ mod tests {
     #[test]
     fn legacy_conduit_alias_dispatches_like_toolport() {
         let _data_env = DataDirTestEnv::new("legacy_conduit_alias_dispatches_like_toolport");
+        let host = dispatch_host(false);
         // A tools/call under the OLD conduit_* name must route identically to the
         // renamed toolport_* name, so nothing that still uses the old names breaks.
         let reg = Registry::default();
         let call = |nm: &str| {
             handle_request(
+                &host,
                 &json!({
                     "jsonrpc": "2.0", "id": 1, "method": "tools/call",
                     "params": { "name": nm, "arguments": { "query": "email" } }
@@ -28693,6 +28802,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// P1.3: the code-mode switch is the host's, so the watcher's live refresh has to land
+    /// on the host it was given and on no other.
+    ///
+    /// Teeth: it drives the real writer (the reload path inside `watch_tick`) rather than the
+    /// setter, and asserts a second host keeps the value it was seeded with. A refresh that
+    /// re-globalized the flag, or wrote it to a different host, fails an assertion here.
+    #[test]
+    fn watch_tick_refreshes_code_mode_on_the_host_it_was_given() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("toolport-code-mode-tick-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let registry_trusted = Arc::new(AtomicBool::new(true));
+        let router = Arc::new(Mutex::new(Arc::new(Router::new())));
+        let stdio = test_stdio_session();
+        let cached_tools = Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default())));
+        let profile_slot = Arc::new(Mutex::new(None));
+        let downstream_dirty = Arc::new(AtomicU8::new(0));
+        let client_root = Arc::new(Mutex::new(None));
+        let server_handler: ServerRequestHandler = Arc::new(|_| None);
+        let rebuild_lock = Arc::new(Mutex::new(()));
+        // The Settings switch is OFF on disk, so the reload has something to publish.
+        let on_disk = Registry {
+            code_mode: false,
+            ..Registry::default()
+        };
+        let reg_path = dir.join("registry.json");
+        conduit_lib::registry::save_to(&reg_path, &on_disk).unwrap();
+        let mut state = WatchLoopState {
+            last_mtime: None,
+            last_relevant: json!({}),
+            last_routines_mtime: None,
+        };
+
+        let watch_host = host_from_parts(
+            Arc::clone(&registry),
+            Arc::clone(&registry_trusted),
+            Arc::clone(&router),
+            Arc::clone(&cached_tools),
+            Arc::clone(&downstream_dirty),
+            Arc::clone(&server_handler),
+            Arc::clone(&rebuild_lock),
+            None,
+            None,
+        );
+        let other_host = host_from_parts(
+            Arc::clone(&registry),
+            Arc::clone(&registry_trusted),
+            Arc::clone(&router),
+            Arc::clone(&cached_tools),
+            Arc::clone(&downstream_dirty),
+            Arc::clone(&server_handler),
+            Arc::clone(&rebuild_lock),
+            None,
+            None,
+        );
+        // Both start ON, so the reload has to turn exactly one of them off.
+        watch_host.set_code_mode(true);
+        other_host.set_code_mode(true);
+
+        let _ = watch_tick(
+            &reg_path,
+            &stdio,
+            &profile_slot,
+            None,
+            None,
+            false,
+            &client_root,
+            None,
+            &mut state,
+            &watch_host,
+        );
+
+        assert!(
+            !watch_host.code_mode_enabled(),
+            "the reload must publish the on-disk code-mode switch to this host"
+        );
+        assert!(
+            other_host.code_mode_enabled(),
+            "a reload must not touch another host's code-mode flag"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// SBS-900: the watcher swaps the live registry on ANY `Ok`, and `Ok` covers a
     /// recovery from a backup. `save_to` snapshots the PRE-write content, so the
     /// save that registered the FIRST http client is exactly the one whose backup
@@ -28912,7 +29108,6 @@ mod tests {
     #[test]
     fn routine_write_toggle_refreshes_tools_without_rebuilding_the_router() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let _code_mode = CodeModeGuard::acquire();
         let dir = std::env::temp_dir().join(format!(
             "toolport-routine-watch-{}",
             routines::generate_id().unwrap()
@@ -29479,6 +29674,7 @@ mod tests {
 
     #[test]
     fn search_query_bounds_are_enforced_before_ranking() {
+        let host = dispatch_host(false);
         assert!(validate_search_query(&"x".repeat(MAX_SEARCH_QUERY_CHARS)).is_ok());
         let char_limit_error =
             validate_search_query(&"x".repeat(MAX_SEARCH_QUERY_CHARS + 1)).unwrap_err();
@@ -29495,6 +29691,7 @@ mod tests {
 
         let call = |query: &str| {
             handle_request(
+                &host,
                 &search_req(query),
                 &Registry::default(),
                 &router(),
@@ -29531,12 +29728,14 @@ mod tests {
     #[test]
     fn search_tool_call_returns_matches() {
         let _data_env = DataDirTestEnv::new("search_tool_call_returns_matches");
+        let host = dispatch_host(false);
         let reg = Registry::default();
         let req = json!({
             "jsonrpc": "2.0", "id": 5, "method": "tools/call",
             "params": { "name": "toolport_search_tools", "arguments": { "query": "charges" } }
         });
         let resp = handle_request(
+            &host,
             &req,
             &reg,
             &router(),
@@ -29585,6 +29784,7 @@ mod tests {
     #[test]
     fn search_neutralizes_pinned_prerequisite_definitions() {
         let _data_env = DataDirTestEnv::new("search_neutralizes_pinned_prerequisite_definitions");
+        let host = dispatch_host(false);
         let mut reg = Registry::default();
         reg.set_tool_pinned("evil", "prereq", true);
         let router = routed_router("evil", "prereq");
@@ -29600,6 +29800,7 @@ mod tests {
             }),
         ];
         let resp = handle_request(
+            &host,
             &search_req("charges"),
             &reg,
             &router,
@@ -29637,12 +29838,14 @@ mod tests {
     fn search_no_matches_explains_the_exhaustive_escape_hatch() {
         let _data_env =
             DataDirTestEnv::new("search_no_matches_explains_the_exhaustive_escape_hatch");
+        let host = dispatch_host(false);
         let reg = Registry::default();
         let req = json!({
             "jsonrpc": "2.0", "id": 7, "method": "tools/call",
             "params": { "name": "toolport_search_tools", "arguments": { "query": "zzznotarealtoolzzz" } }
         });
         let resp = handle_request(
+            &host,
             &req,
             &reg,
             &router(),
@@ -29668,6 +29871,7 @@ mod tests {
     fn search_empty_scope_does_not_claim_fallback_candidates_exist() {
         let _data_env =
             DataDirTestEnv::new("search_empty_scope_does_not_claim_fallback_candidates_exist");
+        let host = dispatch_host(false);
         let reg = Registry::default();
         let req = json!({
             "jsonrpc": "2.0", "id": 8, "method": "tools/call",
@@ -29677,6 +29881,7 @@ mod tests {
             }
         });
         let resp = handle_request(
+            &host,
             &req,
             &reg,
             &router(),
@@ -29705,7 +29910,9 @@ mod tests {
     }
 
     fn search_text(reg: &Registry, guard: &SearchGuard, query: &str) -> String {
+        let host = dispatch_host(false);
         let resp = handle_request(
+            &host,
             &search_req(query),
             reg,
             &router(),
@@ -29727,6 +29934,7 @@ mod tests {
     #[test]
     fn repeated_same_need_escalates_then_resets() {
         let _data_env = DataDirTestEnv::new("repeated_same_need_escalates_then_resets");
+        let host = dispatch_host(false);
         let reg = Registry::default();
         let guard = SearchGuard::default();
 
@@ -29750,6 +29958,7 @@ mod tests {
             "params": { "name": "toolport_status", "arguments": {} }
         });
         handle_request(
+            &host,
             &status,
             &reg,
             &router(),
@@ -29811,13 +30020,14 @@ mod tests {
 
     #[test]
     fn grouped_mode_advertises_meta_plus_per_server_help() {
+        let host = dispatch_host(false);
         // The catalog: two servers, github with 2 tools, stripe with 1.
         let catalog = vec![
             json!({ "name": "github__create_issue", "description": "Create an issue", "inputSchema": {} }),
             json!({ "name": "github__list_repos", "description": "List repos", "inputSchema": {} }),
             json!({ "name": "stripe__create_charge", "description": "Create a charge", "inputSchema": {} }),
         ];
-        let defs = grouped_tool_defs(false, false, false, &catalog);
+        let defs = grouped_tool_defs(&host, false, false, false, &catalog);
         let names: Vec<&str> = defs
             .iter()
             .filter_map(|t| t.get("name").and_then(|v| v.as_str()))
@@ -29851,8 +30061,9 @@ mod tests {
 
     #[test]
     fn grouped_mode_gates_agent_and_confirm_tools() {
+        let host = dispatch_host(false);
         let catalog = vec![json!({ "name": "s__t", "description": "x", "inputSchema": {} })];
-        let defs = grouped_tool_defs(true, false, true, &catalog);
+        let defs = grouped_tool_defs(&host, true, false, true, &catalog);
         let names: Vec<&str> = defs
             .iter()
             .filter_map(|t| t.get("name").and_then(|v| v.as_str()))
@@ -30440,6 +30651,7 @@ mod tests {
     fn destructive_confirm_preview_shows_the_token_not_the_real_value() {
         let _data_env =
             DataDirTestEnv::new("destructive_confirm_preview_shows_the_token_not_the_real_value");
+        let host = dispatch_host(false);
         let client = None;
         let token = with_pii_session(client, |map| {
             *map = pii::SessionMap::new();
@@ -30458,6 +30670,7 @@ mod tests {
         });
 
         let resp = handle_request(
+            &host,
             &req,
             &reg,
             &router(),
@@ -30490,12 +30703,14 @@ mod tests {
     #[test]
     fn confirm_destructive_intercepts_destructive_call() {
         let _data_env = DataDirTestEnv::new("confirm_destructive_intercepts_destructive_call");
+        let host = dispatch_host(false);
         let reg = registry_with_confirm();
         let req = json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": { "name": "stripe__delete_customer", "arguments": { "id": "cus_123" } }
         });
         let resp = handle_request(
+            &host,
             &req,
             &reg,
             &router(),
@@ -30522,12 +30737,14 @@ mod tests {
     #[test]
     fn confirm_destructive_does_not_intercept_safe_call() {
         let _data_env = DataDirTestEnv::new("confirm_destructive_does_not_intercept_safe_call");
+        let host = dispatch_host(false);
         let reg = registry_with_confirm();
         let req = json!({
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
             "params": { "name": "stripe__list_charges", "arguments": {} }
         });
         let resp = handle_request(
+            &host,
             &req,
             &reg,
             &router(),
@@ -30552,12 +30769,14 @@ mod tests {
     #[test]
     fn confirm_destructive_off_does_not_intercept() {
         let _data_env = DataDirTestEnv::new("confirm_destructive_off_does_not_intercept");
+        let host = dispatch_host(false);
         let reg = Registry::default(); // confirm_destructive = false
         let req = json!({
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
             "params": { "name": "stripe__delete_customer", "arguments": { "id": "cus_123" } }
         });
         let resp = handle_request(
+            &host,
             &req,
             &reg,
             &router(),
@@ -30581,6 +30800,7 @@ mod tests {
     fn confirm_destructive_cannot_be_bypassed_via_toolport_call_tool() {
         let _data_env =
             DataDirTestEnv::new("confirm_destructive_cannot_be_bypassed_via_toolport_call_tool");
+        let host = dispatch_host(false);
         let reg = registry_with_confirm();
         // Agent tries to call the destructive tool via toolport_call_tool instead
         // of directly — the interceptor should still catch it because
@@ -30596,6 +30816,7 @@ mod tests {
             }
         });
         let resp = handle_request(
+            &host,
             &req,
             &reg,
             &router(),
@@ -30618,12 +30839,14 @@ mod tests {
 
     #[test]
     fn confirm_destructive_invalid_token_fails() {
+        let host = dispatch_host(false);
         let reg = registry_with_confirm();
         let req = json!({
             "jsonrpc": "2.0", "id": 5, "method": "tools/call",
             "params": { "name": "toolport_confirm", "arguments": { "token": "deadbeef" } }
         });
         let resp = handle_request(
+            &host,
             &req,
             &reg,
             &router(),
@@ -30646,12 +30869,14 @@ mod tests {
 
     #[test]
     fn confirm_destructive_empty_token_fails() {
+        let host = dispatch_host(false);
         let reg = registry_with_confirm();
         let req = json!({
             "jsonrpc": "2.0", "id": 6, "method": "tools/call",
             "params": { "name": "toolport_confirm", "arguments": { "token": "" } }
         });
         let resp = handle_request(
+            &host,
             &req,
             &reg,
             &router(),
@@ -30673,9 +30898,11 @@ mod tests {
 
     #[test]
     fn confirm_destructive_tools_list_includes_toolport_confirm() {
+        let host = dispatch_host(false);
         let reg = registry_with_confirm();
         let req = json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/list" });
         let resp = handle_request(
+            &host,
             &req,
             &reg,
             &router(),
@@ -30702,9 +30929,11 @@ mod tests {
 
     #[test]
     fn confirm_destructive_tools_list_excludes_toolport_confirm_when_off() {
+        let host = dispatch_host(false);
         let reg = Registry::default(); // confirm_destructive = false
         let req = json!({ "jsonrpc": "2.0", "id": 8, "method": "tools/list" });
         let resp = handle_request(
+            &host,
             &req,
             &reg,
             &router(),
@@ -30767,6 +30996,7 @@ mod tests {
     fn confirm_destructive_token_is_client_scoped_and_does_not_loop() {
         let _data_env =
             DataDirTestEnv::new("confirm_destructive_token_is_client_scoped_and_does_not_loop");
+        let host = dispatch_host(false);
         // The critical test: a destructive call is intercepted, then confirmed
         // via toolport_confirm. A different client cannot redeem or consume it,
         // and the rightful owner's confirmed call must NOT be re-intercepted.
@@ -30780,6 +31010,7 @@ mod tests {
             "params": { "name": "stripe__delete_customer", "arguments": { "id": "cus_999" } }
         });
         let resp1 = handle_request(
+            &host,
             &req1,
             &reg,
             &router(),
@@ -30805,6 +31036,7 @@ mod tests {
             "params": { "name": "toolport_confirm", "arguments": { "token": token } }
         });
         let resp2 = handle_request(
+            &host,
             &req2,
             &reg,
             &router(),
@@ -30827,6 +31059,7 @@ mod tests {
         // owner can still confirm. This falls through to normal routing and is
         // NOT re-intercepted.
         let resp3 = handle_request(
+            &host,
             &req2,
             &reg,
             &router(),
@@ -30852,6 +31085,7 @@ mod tests {
     #[test]
     fn oversized_tool_call_can_be_fetched() {
         let _data_env = DataDirTestEnv::new("oversized_tool_call_can_be_fetched");
+        let host = dispatch_host(false);
         let body = format!("{}THE_END", "A".repeat(50_000));
 
         let reg = Registry::default();
@@ -30869,6 +31103,7 @@ mod tests {
         });
 
         let resp = handle_request(
+            &host,
             &req,
             &reg,
             &router,
@@ -30925,6 +31160,7 @@ mod tests {
         });
 
         let fetch_resp = handle_request(
+            &host,
             &fetch_req,
             &reg,
             &router,
@@ -30949,6 +31185,7 @@ mod tests {
     fn fetch_result_projection_dispatch_returns_requested_field() {
         let _data_env =
             DataDirTestEnv::new("fetch_result_projection_dispatch_returns_requested_field");
+        let host = dispatch_host(false);
         let body = "A".repeat(50_000);
 
         let reg = Registry::default();
@@ -30965,6 +31202,7 @@ mod tests {
         });
 
         let resp = handle_request(
+            &host,
             &req,
             &reg,
             &router,
@@ -31002,6 +31240,7 @@ mod tests {
         });
 
         let fetch_resp = handle_request(
+            &host,
             &fetch_req,
             &reg,
             &router,
