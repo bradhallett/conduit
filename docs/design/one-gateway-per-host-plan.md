@@ -315,7 +315,7 @@ ownership did not rewrite several hundred lines.
   `discovery_mode()` / `set_discovery_mode()` / `grouped_discovery()`. `HostState` owns a
   `discovery: AtomicU8` read through those same three names as methods, `main` seeds it from
   the same `resolve_discovery_mode()` outcome it used to store into the static, and the
-  watcher publishes on the host it was handed. Seven production reads moved with it
+  watcher publishes on the host it was handed. Six production reads moved with it, plus the test-only wrapper,
   (`enabled_summary`'s status line, which is why that function gained the host parameter,
   `watch_tick`'s compare, the `process_request` arguments in `handle_stdio_request` and
   `main`, and the three `grouped_discovery()` call sites), plus the watcher's set and the
@@ -329,17 +329,19 @@ ownership did not rewrite several hundred lines.
   still has the session store and the routes.
   Coverage limits, stated rather than implied: `main`'s wiring of the resolved mode into the
   host field is not observable from a unit test (nothing calls `main`), the
-  `handle_http_with_headers` fallback and the `process_request` mode arguments are not driven
-  with a non-default host mode, the `enabled_summary` status line is asserted only for the
-  default mode (its fixture needs a full server entry, which the status tests own), and the new
-  tests assume no `TOOLPORT_DISCOVERY` override, which
-  outranks the registry the watcher test's fixture writes.
+  `process_request` mode arguments are not driven with a non-default host mode, and the watcher
+  test derives its expected mode from its own fixture so an ambient `TOOLPORT_DISCOVERY`
+  override cannot fail it. One hazard this increment uncovered and did not fix, because fixing
+  it changes behavior: the HTTP/OpenAPI fallback still reads the boot-frozen `HostState.lazy`
+  while the live value is `HostState::discovery`, so a mode switch after boot reaches stdio and
+  the daemon immediately and the bridge only on restart. That is main's behavior too, and the
+  comment there now says so; collapsing the two fields is its own slice.
 - Remaining: the principal-keyed session store and the
   `PROGRESS_*` dispatch and routes. The session store
   is read deep inside the dispatch core (`execute_call`,
   `handle_request_with_cancel`), which deliberately takes narrow parameters rather than
   the whole state, so moving them means threading a host handle through that core. That
-  threading is wider than it looks: `handle_request` is a test-only wrapper with 62 call
+  threading is wider than it looks: `handle_request` is a test-only wrapper with 63 call
   sites, all of them tests, and `execute_call` is reached through the routine and script
   dispatch helpers, so the slice needs a deliberate decision about how the test helper gets
   its host. The code-mode increment answered it (see below); the rest can reuse the answer.
@@ -420,7 +422,7 @@ attempt should reuse rather than re-derive.
   ownership: `code_mode_is_per_host`, and
   `watch_tick_refreshes_code_mode_on_the_host_it_was_given`. That is a slice, not an edit to
   fold into another change, and the store half is larger again.
-- `handle_request`'s 62 call sites are all tests. That count stood at 61 through the third
+- `handle_request`'s 63 call sites are all tests. That count stood at 61 through the third
   increment and this slice's `code_mode_is_per_host` adds one, so re-measure it rather than
   trusting either number. The `#[cfg(test)]` definition sits outside `mod tests`, which is why
   counting the identifier alone reads one higher (64 here; a first pass on this doc wrote that

@@ -3018,9 +3018,9 @@ fn enabled_summary(
             }
         }
     }
-    // The discovery mode this client is actually resolved to (env > per-client override >
-    // global), so `toolport_status` answers "why am I seeing meta-tools vs the full
-    // catalog?" and confirms a per-client override took effect.
+    // The discovery mode this host is resolved to (env > per-client override > registry), so
+    // `toolport_status` answers "why am I seeing meta-tools vs the full catalog?". The value is
+    // the host's, so it does not reflect a per-client override the caller arrived with.
     out.push_str(&format!(
         "\nDiscovery mode: {}\n",
         host.discovery_mode().as_str()
@@ -3733,7 +3733,7 @@ struct HttpCaller {
     audit_label: Option<String>,
     session_owner: McpSessionOwner,
     /// Per-client discovery override, when `clientDiscovery[<client id>]` sets one
-    /// (#868). `None` means the request uses the host's mode, so one HTTP bridge
+    /// (#868). `None` means the request falls back to the listener's boot `lazy` flag, so one HTTP bridge
     /// can still serve a native-search client the full catalog and a local model
     /// the meta-tools at the same time.
     discovery: Option<DiscoveryMode>,
@@ -14335,8 +14335,9 @@ fn handle_http_with_headers(
     let client_name = caller.and_then(|value| value.audit_label.as_deref());
     let session_owner = caller.map(|value| &value.session_owner);
     // Per-client discovery (#868): a caller whose client set clientDiscovery gets
-    // that mode; every other request keeps the host's mode (including grouped, which
-    // is host-wide by decision).
+    // that mode; every other request keeps the listener's boot-frozen `lazy` flag, so the
+    // bridge stays on the mode resolved at boot even after a live switch (the plan doc lists
+    // that gap; stdio and the daemon read the host's live mode instead).
     let discovery = caller
         .and_then(|value| value.discovery)
         .unwrap_or_else(|| {
@@ -23334,6 +23335,10 @@ mod tests {
         assert!(scoped.contains("bravo"));
         assert!(!scoped.contains("alpha"));
         assert!(!scoped.contains("alpha-cmd"));
+        // The status line reports the mode of the host it is asked about.
+        host.set_discovery_mode(DiscoveryMode::Grouped);
+        let grouped = enabled_summary(&host, &reg, &cached, None, None);
+        assert!(grouped.contains("Discovery mode: grouped"), "{grouped}");
     }
 
     #[test]
@@ -29020,9 +29025,12 @@ mod tests {
             &watch_host,
         );
 
+        // The value the fixture resolves to, computed rather than hardcoded, so an ambient
+        // TOOLPORT_DISCOVERY override cannot fail this test while the publish still lands.
+        let expected = discovery_mode_for(&on_disk, None);
         assert_eq!(
             watch_host.discovery_mode(),
-            DiscoveryMode::Full,
+            expected,
             "the reload must publish the resolved discovery mode to this host"
         );
         assert_eq!(
