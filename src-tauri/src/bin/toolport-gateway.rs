@@ -1654,8 +1654,8 @@ fn disable_server_tool_def() -> Value {
 // implies not-lazy (the lazy resolver only returns true for `=lazy`).
 
 /// The three tool-discovery modes. Resolved from env + the registry (including a
-/// per-client override) and cached in `DISCOVERY_MODE`, which the registry watcher
-/// refreshes on every change so a mode edit applies live.
+/// per-client override) and cached on the host as `HostState::discovery`, which the
+/// registry watcher refreshes on every change so a mode edit applies live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiscoveryMode {
     Lazy,
@@ -29020,9 +29020,9 @@ mod tests {
             &watch_host,
         );
 
-        assert_ne!(
+        assert_eq!(
             watch_host.discovery_mode(),
-            DiscoveryMode::Grouped,
+            DiscoveryMode::Full,
             "the reload must publish the resolved discovery mode to this host"
         );
         assert_eq!(

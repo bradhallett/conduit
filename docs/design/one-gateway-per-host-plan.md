@@ -121,6 +121,11 @@ Still open:
   it and appends to the developer's real dev log.
   `code_mode_flag_fails_closed_when_registry_load_fails` was that test and now holds the same
   scratch guard, so the row stays local whichever way the gate is forced.
+  A third name, found by a reviewer running the suite in isolation: the dev gateway log.
+  `~/.config/Toolport-dev/gateway.log` gains the suite's own fixture lines (tool-catalog and
+  pagination warnings) on every lib run, on this tree and on main alike, so it is pre-existing
+  and broader than either earlier fix. It is not a file the app reads back, but it is the same
+  per-call `conduit_dir()` resolution, and it makes that log useless as a signal.
 - Unrelated and still open: several tests leak their own scratch directories under the temp
   dir, because a panicking test skips its cleanup and a failing run leaves the directory
   behind. A long local session accumulated about 1,900 of them (`toolport-pii-release-*` was
@@ -247,8 +252,8 @@ routing that P1.3 takes.
 
 ### P1.3 HostState
 
-Status: five increments, the fifth landing in this PR (the slice tracker in #910 lists the
-landed slices and catches up when this lands). `HostState` owns the host runtime the gateway already
+Status: five increments, the fifth landing in this PR (the slice tracker in #910 still lists
+three increments and is updated separately). `HostState` owns the host runtime the gateway already
 resolved once per process, and `GatewayState` is now a facade over it: a `Deref` impl keeps
 the host-scoped call sites reading `state.registry`, `state.router`, and friends, so moving
 ownership did not rewrite several hundred lines.
@@ -322,6 +327,13 @@ ownership did not rewrite several hundred lines.
   re-globalizing the value behind the new names fails both, and dropping the watcher's publish
   fails the second alone. This is the second of the two host-policy statics; the dispatch core
   still has the session store and the routes.
+  Coverage limits, stated rather than implied: `main`'s wiring of the resolved mode into the
+  host field is not observable from a unit test (nothing calls `main`), the
+  `handle_http_with_headers` fallback and the `process_request` mode arguments are not driven
+  with a non-default host mode, the `enabled_summary` status line is asserted only for the
+  default mode (its fixture needs a full server entry, which the status tests own), and the new
+  tests assume no `TOOLPORT_DISCOVERY` override, which
+  outranks the registry the watcher test's fixture writes.
 - Remaining: the principal-keyed session store and the
   `PROGRESS_*` dispatch and routes. The session store
   is read deep inside the dispatch core (`execute_call`,
@@ -400,7 +412,7 @@ attempt should reuse rather than re-derive.
   `save_routine_dispatch`, `save_routine_promotion_dispatch`, `advise_after_direct_call`,
   which between them carried 11 production and 11 test call sites) plus `handle_request` and
   `handle_request_with_cancel`. 89 call sites moved in all, 13 production and 76 test, the test
-  wrapper being 61 of them and 62 in the tree now because the new test adds one. 53
+  wrapper being 61 of them and 63 in the tree now. 53
   test bodies build a host they now own; the 18 `CodeModeGuard::acquire()` sites and 19
   `set_code_mode_flag` sites in tests are 21 setter calls on that host now, and three of the
   guard sites came out without a setter (two lean on the value the host is built with, one never
@@ -411,7 +423,7 @@ attempt should reuse rather than re-derive.
 - `handle_request`'s 62 call sites are all tests. That count stood at 61 through the third
   increment and this slice's `code_mode_is_per_host` adds one, so re-measure it rather than
   trusting either number. The `#[cfg(test)]` definition sits outside `mod tests`, which is why
-  counting the identifier alone reads one higher (63 here; a first pass on this doc wrote that
+  counting the identifier alone reads one higher (64 here; a first pass on this doc wrote that
   occurrence count down as the call-site count, hence the old 62), and
   `execute_call` is reached through `run_routine_dispatch`, `execute_script_dispatch`, and
   `execute_script_dispatch_with_candidate`. Threading `host: &HostState` through that chain
