@@ -115,6 +115,12 @@ Still open:
   test-only `DataDirTestEnv` guard (ENV_LOCK plus a scratch override) on every test that
   can reach either writer. Any future per-call `conduit_dir()` resolution needs the same
   treatment, or the leak returns under a third name.
+  The same class has a state-dependent shape, found by a reviewer's sabotage: a test that
+  dispatches a refused `run_script` writes no row while the code-mode gate is off, because the
+  refusal returns before `audit::record_timed`, but force the gate on and the dispatch reaches
+  it and appends to the developer's real dev log.
+  `code_mode_flag_fails_closed_when_registry_load_fails` was that test and now holds the same
+  scratch guard, so the row stays local whichever way the gate is forced.
 - Unrelated and still open: several tests leak their own scratch directories under the temp
   dir, because a panicking test skips its cleanup and a failing run leaves the directory
   behind. A long local session accumulated about 1,900 of them (`toolport-pii-release-*` was
@@ -287,20 +293,24 @@ ownership did not rewrite several hundred lines.
   `seed_code_mode_after_registry_load(loaded) -> bool`, which returns the value the field
   starts from rather than setting one, because the registry load happens above the host
   construction. Eight functions take `host: &HostState` (the six readers plus `handle_request`
-  and `handle_request_with_cancel`), 76 call sites moved with them, and the tests that used to
+  and `handle_request_with_cancel`), 89 call sites moved with them (13 production and 76 test,
+  61 of those the test wrapper), and the tests that used to
   flip a process global now build the host they dispatch with. Two tests pin the ownership: one
   asserts two hosts advertise `toolport_run_script` differently, one drives the watcher's
   reload and asserts a second host's flag is untouched. Both were checked by sabotage, and
   between them each assertion is load-bearing. Worth knowing for the same move next time: the
   migrated off-path assertions cannot detect a gate that is silently always-off (they assert
-  refusal, which a dead gate also produces), so it is the new pair plus
-  `run_script_respects_live_code_mode_flag` that keep the switch honest.
+  refusal, which a dead gate also produces), so the switch is kept honest by the new pair, by
+  `run_script_respects_live_code_mode_flag`, and by the three migrated tests that assert the on
+  path (`flattened_routine_tools_are_advertised_and_run`,
+  `routine_write_opt_in_defaults_off_and_controls_advertisement`, and
+  `immutable_code_run_returns_promotion_candidate_without_retaining_input`).
 - Remaining: `DISCOVERY_MODE`, the principal-keyed session store, and the
   `PROGRESS_*` dispatch and routes. `DISCOVERY_MODE` and the session store
   are read deep inside the dispatch core (`execute_call`,
   `handle_request_with_cancel`), which deliberately takes narrow parameters rather than
   the whole state, so moving them means threading a host handle through that core. That
-  threading is wider than it looks: `handle_request` is a test-only wrapper with 61 call
+  threading is wider than it looks: `handle_request` is a test-only wrapper with 62 call
   sites, all of them tests, and `execute_call` is reached through the routine and script
   dispatch helpers, so the slice needs a deliberate decision about how the test helper gets
   its host. The code-mode increment answered it (see below); the rest can reuse the answer.
@@ -354,8 +364,8 @@ attempt should reuse rather than re-derive.
   field and its readers in one pass, or leave the static alone.
 - The decision, taken for `CODE_MODE` and to be reused here: keep `handle_request` as the test
   wrapper and give it a `host: &HostState` parameter. Retiring it in favour of
-  `handle_request_with_cancel` is the tidier end state but it is a 62-site change to a
-  17-argument call, and nothing is blocked on it. The wrapper keeps its other parameters,
+  `handle_request_with_cancel` is the tidier end state but it is a 62-site change to an
+  18-argument call, and nothing is blocked on it. The wrapper keeps its other parameters,
   which is deliberate: tests pass `lazy`, their own `reg` and `router`, and a profile, and the
   wrapper builds the `CatalogSearchIndex` those need. The host it is handed supplies
   host-scoped state and nothing else, so tests bind one host per body (the `dispatch_host`
@@ -377,10 +387,12 @@ attempt should reuse rather than re-derive.
   (`gateway_capabilities`, `grouped_tool_defs`, `append_routine_tool_defs`,
   `save_routine_dispatch`, `save_routine_promotion_dispatch`, `advise_after_direct_call`,
   which between them carried 11 production and 11 test call sites) plus `handle_request` and
-  `handle_request_with_cancel`. 76 call sites moved in all, 61 of them the test wrapper, which
-  now holds 62 because the new test adds one. 53
-  test bodies build a host they now own, and the 18 `CodeModeGuard::acquire()` sites and 19
-  `set_code_mode_flag` sites in tests became a setter call on that host. Two tests pin the
+  `handle_request_with_cancel`. 89 call sites moved in all, 13 production and 76 test, the test
+  wrapper being 61 of them and 62 in the tree now because the new test adds one. 53
+  test bodies build a host they now own; the 18 `CodeModeGuard::acquire()` sites and 19
+  `set_code_mode_flag` sites in tests are 21 setter calls on that host now, and three of the
+  guard sites came out without a setter (two lean on the value the host is built with, one never
+  set the flag). Two tests pin the
   ownership: `code_mode_is_per_host`, and
   `watch_tick_refreshes_code_mode_on_the_host_it_was_given`. That is a slice, not an edit to
   fold into another change, and the store half is larger again.
@@ -397,7 +409,7 @@ attempt should reuse rather than re-derive.
   whole test, so the fixture-shaped answer is a host built once in the test body and passed
   to every call; a per-call `&http_state(false)` would silently reset the store between
   calls and quietly weaken exactly those tests.
-- Done in this slice: `watch_tick` and `watch_registry` used to take the host _and_ clones of
+- Done in the third increment: `watch_tick` and `watch_registry` used to take the host _and_ clones of
   its own fields (registry, trust flag, router, catalog, dirty flag, server handler,
   session table, resource subscriptions, rebuild lock, `resources/updated` sink), so a
   caller could pair one host with another host's router or cache. Those parameters are gone;
