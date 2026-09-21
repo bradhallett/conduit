@@ -37,6 +37,10 @@ pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const ELECTION_TIMEOUT: Duration = Duration::from_secs(20);
 /// Per-probe network budget for the authenticated handshake.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Descriptor publication and cleanup are short filesystem operations. Keep
+/// their lock separate from election, which is deliberately held across spawn
+/// and readiness polling.
+const DESCRIPTOR_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the fast path keeps re-probing a silent endpoint before giving up
 /// on it. A loaded machine can outrun [`PROBE_TIMEOUT`] while its daemon is
 /// perfectly live, so silence alone is never evidence against the pointer.
@@ -132,12 +136,20 @@ pub fn read_descriptor(path: &Path) -> Option<DaemonDescriptor> {
 /// or corrupt file is always treated as "no daemon", never as an error a caller
 /// has to handle.
 pub fn write_descriptor(path: &Path, descriptor: &DaemonDescriptor) -> Result<(), String> {
+    let _descriptor_lock = registry::lock_at_for(path, DESCRIPTOR_LOCK_TIMEOUT)?;
     let raw = serde_json::to_string(descriptor).map_err(|e| e.to_string())?;
     registry::atomic_write(path, &raw)?;
     restrict_to_owner(path)
 }
 
 pub fn clear_descriptor(path: &Path) {
+    let Ok(_descriptor_lock) = registry::lock_at_for(path, DESCRIPTOR_LOCK_TIMEOUT) else {
+        return;
+    };
+    clear_descriptor_locked(path);
+}
+
+fn clear_descriptor_locked(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
@@ -192,23 +204,22 @@ enum ProbeFailure {
 /// garbage; an answered status or a mangled response says someone else owns
 /// the port; silence alone says nothing either way.
 fn classify_probe_error(error: ureq::Error) -> ProbeFailure {
-    use std::error::Error as _;
     match &error {
         ureq::Error::Status(..) => ProbeFailure::Answered(error.to_string()),
-        ureq::Error::Transport(transport) => match transport.kind() {
-            ureq::ErrorKind::ConnectionFailed
-            | ureq::ErrorKind::InvalidUrl
-            | ureq::ErrorKind::UnknownScheme
-            | ureq::ErrorKind::Dns => ProbeFailure::Unreachable,
-            ureq::ErrorKind::BadStatus | ureq::ErrorKind::BadHeader => {
-                ProbeFailure::Answered(error.to_string())
-            }
-            ureq::ErrorKind::Io => {
-                let io_kind = transport
-                    .source()
-                    .and_then(|source| source.downcast_ref::<std::io::Error>())
-                    .map(|io| io.kind());
-                match io_kind {
+        ureq::Error::Transport(transport) => {
+            let io_kind = transport_io_kind(transport);
+            match transport.kind() {
+                ureq::ErrorKind::ConnectionFailed if is_timeout_io_kind(io_kind) => {
+                    ProbeFailure::Silent
+                }
+                ureq::ErrorKind::ConnectionFailed
+                | ureq::ErrorKind::InvalidUrl
+                | ureq::ErrorKind::UnknownScheme
+                | ureq::ErrorKind::Dns => ProbeFailure::Unreachable,
+                ureq::ErrorKind::BadStatus | ureq::ErrorKind::BadHeader => {
+                    ProbeFailure::Answered(error.to_string())
+                }
+                ureq::ErrorKind::Io => match io_kind {
                     Some(std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {
                         ProbeFailure::Silent
                     }
@@ -218,11 +229,33 @@ fn classify_probe_error(error: ureq::Error) -> ProbeFailure {
                         | std::io::ErrorKind::BrokenPipe,
                     ) => ProbeFailure::Unreachable,
                     _ => ProbeFailure::Silent,
-                }
+                },
+                _ => ProbeFailure::Silent,
             }
-            _ => ProbeFailure::Silent,
-        },
+        }
     }
+}
+
+/// Find an I/O cause anywhere in ureq's transport error chain. Connect
+/// timeouts are wrapped as `ConnectionFailed`, while read timeouts are `Io`;
+/// rendezvous must treat both as silence rather than evidence of a dead daemon.
+fn transport_io_kind(transport: &ureq::Transport) -> Option<std::io::ErrorKind> {
+    use std::error::Error as _;
+    let mut source = transport.source();
+    while let Some(error) = source {
+        if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            return Some(io.kind());
+        }
+        source = error.source();
+    }
+    None
+}
+
+fn is_timeout_io_kind(kind: Option<std::io::ErrorKind>) -> bool {
+    matches!(
+        kind,
+        Some(std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)
+    )
 }
 
 /// One authenticated attempt against `GET /host/identity`, keeping the
@@ -439,9 +472,13 @@ pub fn serve_identity(
     // but only ours. If another daemon has already published over this path,
     // the file is the survivor's, and deleting it would strand every later
     // rendezvous with the wrong daemon.
-    if let Some(current) = read_descriptor(descriptor_path) {
-        if current.token == token && current.endpoint == descriptor.endpoint {
-            clear_descriptor(descriptor_path);
+    if let Ok(_descriptor_lock) =
+        registry::lock_at_for(descriptor_path, DESCRIPTOR_LOCK_TIMEOUT)
+    {
+        if let Some(current) = read_descriptor(descriptor_path) {
+            if current.token == token && current.endpoint == descriptor.endpoint {
+                clear_descriptor_locked(descriptor_path);
+            }
         }
     }
     Ok(())
@@ -552,6 +589,15 @@ mod tests {
         descriptor.token = "not-the-token".to_string();
         assert!(probe_identity(&descriptor).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn connect_timeouts_are_silence_not_evidence_of_a_dead_daemon() {
+        assert!(is_timeout_io_kind(Some(std::io::ErrorKind::TimedOut)));
+        assert!(is_timeout_io_kind(Some(std::io::ErrorKind::WouldBlock)));
+        assert!(!is_timeout_io_kind(Some(
+            std::io::ErrorKind::ConnectionRefused
+        )));
     }
 
     #[test]
