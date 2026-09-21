@@ -1133,16 +1133,19 @@ fn matrix_routing_profiles_cannot_reach_servers_outside_their_scope() {
     );
 
     // And not just hidden: a direct call to an out-of-scope tool is refused.
-    let out_of_scope = names_one
+    let out_of_scope = names_two
         .iter()
-        .find_map(|n| n.starts_with("two__").then(|| n.clone()));
-    if let Some(tool) = out_of_scope {
-        let reply = scoped_one.request("tools/call", json!({ "name": tool, "arguments": {} }));
-        assert!(
-            reply.get("error").is_some(),
-            "an out-of-scope call must not execute: {reply}"
-        );
-    }
+        .find(|name| name.starts_with("two__"))
+        .expect("scope-two exposes its downstream tool")
+        .clone();
+    let reply = scoped_one.request(
+        "tools/call",
+        json!({ "name": out_of_scope, "arguments": {} }),
+    );
+    assert!(
+        reply.get("error").is_some(),
+        "an out-of-scope call must not execute: {reply}"
+    );
 }
 
 #[ignore = "P3.1/P3.3 route session-scoped surfaces (subscriptions, list_changed, and the rest of the matrix's routing rows) only to the originating session; not started (see #910). Run with --ignored once it lands, and remove this attribute in the PR that lands it."]
